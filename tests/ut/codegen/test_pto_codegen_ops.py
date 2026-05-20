@@ -1419,7 +1419,7 @@ class TestTileScatterUpdateCodegen:
     """Tests for tile.scatter_update PTO code generation.
 
     tile.scatter_update(input, index, src) should update the input tile in place.
-    PTO codegen lowers this to nested scf.for loops plus pto.tgetval/pto.textract/pto.tinsert.
+    PTO codegen expands row indices to flattened per-element indices, then uses pto.tscatter.
     """
 
     def _generate_mlir(self, program_cls) -> str:
@@ -1438,8 +1438,8 @@ class TestTileScatterUpdateCodegen:
         single = ir.Program([target], target.name, optimized.span)
         return codegen_instance.generate(single)
 
-    def test_tile_scatter_update_emits_scf_for(self):
-        """tile.scatter_update should generate a scf.for loop over b*s iterations."""
+    def test_tile_scatter_update_emits_tscatter_with_index_build_loops(self):
+        """tile.scatter_update should build flattened indices before pto.tscatter."""
 
         @pl.program
         class Prog:
@@ -1457,16 +1457,25 @@ class TestTileScatterUpdateCodegen:
                 scratch_tile: pl.Tile[[1, 32], pl.FP32] = pl.tile.create(
                     [1, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
+                full_src_tile: pl.Tile[[16, 32], pl.FP32] = pl.tile.create(
+                    [16, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                full_idx_tile: pl.Tile[[16, 32], pl.INT32] = pl.tile.create(
+                    [16, 32], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
+                )
                 result: pl.Tile[[16, 32], pl.FP32] = pl.tile.scatter_update(
-                    input_tile, index_tile, src_tile, scratch_tile, dim=-2
+                    input_tile, index_tile, src_tile, scratch_tile, full_src_tile, full_idx_tile, dim=-2
                 )
                 return pl.store(result, [0, 0], dst_t)
 
         mlir = self._generate_mlir(Prog)
-        assert "scf.for" in mlir, f"scatter_update should generate scf.for loop, got:\n{mlir}"
+        assert "pto.tscatter" in mlir, f"scatter_update should emit pto.tscatter, got:\n{mlir}"
+        assert "scf.for" in mlir, f"scatter_update should build flattened index tile with loops, got:\n{mlir}"
+        assert "pto.tsetval" in mlir, f"scatter_update should materialize scatter indices, got:\n{mlir}"
+        assert "full_idx" in mlir, f"scatter_update should allocate a full identity index tile, got:\n{mlir}"
 
-    def test_tile_scatter_update_emits_row_extract_and_insert(self):
-        """tile.scatter_update should read index scalar, extract src row, and insert row into dst."""
+    def test_tile_scatter_update_avoids_manual_row_extract_and_insert(self):
+        """tile.scatter_update should use tscatter instead of manual row extract/insert."""
 
         @pl.program
         class Prog:
@@ -1484,23 +1493,26 @@ class TestTileScatterUpdateCodegen:
                 scratch_tile: pl.Tile[[1, 32], pl.FP32] = pl.tile.create(
                     [1, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
+                full_src_tile: pl.Tile[[16, 32], pl.FP32] = pl.tile.create(
+                    [16, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                full_idx_tile: pl.Tile[[16, 32], pl.INT32] = pl.tile.create(
+                    [16, 32], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
+                )
                 result: pl.Tile[[16, 32], pl.FP32] = pl.tile.scatter_update(
-                    input_tile, index_tile, src_tile, scratch_tile, dim=-2
+                    input_tile, index_tile, src_tile, scratch_tile, full_src_tile, full_idx_tile, dim=-2
                 )
                 return pl.store(result, [0, 0], dst_t)
 
         mlir = self._generate_mlir(Prog)
-        assert "pto.tgetval" in mlir, f"scatter_update should emit pto.tgetval for index read, got:\n{mlir}"
-        assert "pto.textract" in mlir, (
-            f"scatter_update should emit pto.textract for src row read, got:\n{mlir}"
-        )
-        assert "pto.tinsert" in mlir, (
-            f"scatter_update should emit pto.tinsert for dst row write, got:\n{mlir}"
-        )
-        assert "pto.tsetval" not in mlir, f"scatter_update should not emit scalar row writes, got:\n{mlir}"
+        assert "pto.tscatter" in mlir, f"scatter_update should emit pto.tscatter, got:\n{mlir}"
+        assert "pto.tgetval" in mlir, f"scatter_update should read row indices to expand them, got:\n{mlir}"
+        assert "pto.textract" not in mlir, f"scatter_update should not extract source rows, got:\n{mlir}"
+        assert "pto.tinsert" not in mlir, f"scatter_update should not insert rows manually, got:\n{mlir}"
+        assert "pto.tsetval" in mlir, f"scatter_update should write flattened scatter indices, got:\n{mlir}"
 
     def test_tensor_scatter_update_scratch_has_alloc_addr(self):
-        """tensor.scatter_update lowering should materialize an addressed scratch row tile."""
+        """tensor.scatter_update lowering should keep scratch addressed and emit pto.tscatter."""
 
         @pl.program
         class Prog:
@@ -1516,6 +1528,8 @@ class TestTileScatterUpdateCodegen:
                 return result
 
         mlir = self._generate_mlir(Prog)
+        assert "pto.tscatter" in mlir, f"tensor.scatter_update should emit pto.tscatter, got:\n{mlir}"
+        assert "scf.for" in mlir, f"tensor.scatter_update should build flattened index tile with loops, got:\n{mlir}"
         scatter_allocs = [
             line.strip() for line in mlir.splitlines() if "scatter_row" in line and "pto.alloc_tile" in line
         ]
@@ -1524,8 +1538,8 @@ class TestTileScatterUpdateCodegen:
             f"scatter_row alloc_tile must carry addr operand, got: {scatter_allocs}"
         )
 
-    def test_tile_scatter_update_loop_bound(self):
-        """scf.for upper bound should equal b*s (here 2*4=8)."""
+    def test_tile_scatter_update_materializes_src_shape_loop_bounds(self):
+        """tile.scatter_update should loop over src rows/cols while building tscatter indices."""
 
         @pl.program
         class Prog:
@@ -1543,17 +1557,25 @@ class TestTileScatterUpdateCodegen:
                 scratch_tile: pl.Tile[[1, 32], pl.FP32] = pl.tile.create(
                     [1, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
+                full_src_tile: pl.Tile[[16, 32], pl.FP32] = pl.tile.create(
+                    [16, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                full_idx_tile: pl.Tile[[16, 32], pl.INT32] = pl.tile.create(
+                    [16, 32], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
+                )
                 result: pl.Tile[[16, 32], pl.FP32] = pl.tile.scatter_update(
-                    input_tile, index_tile, src_tile, scratch_tile, dim=-2
+                    input_tile, index_tile, src_tile, scratch_tile, full_src_tile, full_idx_tile, dim=-2
                 )
                 return pl.store(result, [0, 0], dst_t)
 
         mlir = self._generate_mlir(Prog)
-        # b=2, s=4 → b*s=8; constant "8" should appear as loop upper bound
-        assert "8" in mlir, f"Expected loop bound 8 (b*s=2*4) in MLIR:\n{mlir}"
+        assert "pto.tscatter" in mlir, f"scatter_update should emit pto.tscatter, got:\n{mlir}"
+        assert "scf.for" in mlir, f"scatter_update should materialize index-build loops, got:\n{mlir}"
+        assert " to %c8_index " in mlir, f"Expected src-row loop bound 8, got:\n{mlir}"
+        assert " to %c32_index " in mlir, f"Expected src-col loop bound 32, got:\n{mlir}"
 
-    def test_tile_scatter_update_index_cast(self):
-        """arith.index_cast should be emitted to convert i32 index to index type."""
+    def test_tile_scatter_update_emits_index_cast_for_flattened_offsets(self):
+        """tile.scatter_update should cast row indices and flattened offsets for tscatter."""
 
         @pl.program
         class Prog:
@@ -1571,13 +1593,55 @@ class TestTileScatterUpdateCodegen:
                 scratch_tile: pl.Tile[[1, 32], pl.FP32] = pl.tile.create(
                     [1, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
+                full_src_tile: pl.Tile[[16, 32], pl.FP32] = pl.tile.create(
+                    [16, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                full_idx_tile: pl.Tile[[16, 32], pl.INT32] = pl.tile.create(
+                    [16, 32], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
+                )
                 result: pl.Tile[[16, 32], pl.FP32] = pl.tile.scatter_update(
-                    input_tile, index_tile, src_tile, scratch_tile, dim=-2
+                    input_tile, index_tile, src_tile, scratch_tile, full_src_tile, full_idx_tile, dim=-2
                 )
                 return pl.store(result, [0, 0], dst_t)
 
         mlir = self._generate_mlir(Prog)
-        assert "arith.index_cast" in mlir, f"Expected arith.index_cast in MLIR:\n{mlir}"
+        assert "pto.tscatter" in mlir, f"scatter_update should emit pto.tscatter, got:\n{mlir}"
+        assert "arith.index_cast" in mlir, f"scatter_update should emit index_cast for scatter indices, got:\n{mlir}"
+
+    def test_tile_scatter_update_fp16_uses_i16_tscatter_indices(self):
+        """FP16 tscatter requires an i16 flattened index tile."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                input_t: pl.Tensor[[32, 32], pl.FP16],
+                index_t: pl.Tensor[[2, 8], pl.INT32],
+                src_t: pl.Tensor[[16, 32], pl.FP16],
+                dst_t: pl.Tensor[[32, 32], pl.FP16],
+            ) -> pl.Tensor[[32, 32], pl.FP16]:
+                input_tile: pl.Tile[[32, 32], pl.FP16] = pl.load(input_t, [0, 0], [32, 32])
+                index_tile: pl.Tile[[2, 8], pl.INT32] = pl.load(index_t, [0, 0], [2, 8])
+                src_tile: pl.Tile[[16, 32], pl.FP16] = pl.load(src_t, [0, 0], [16, 32])
+                scratch_tile: pl.Tile[[1, 32], pl.FP16] = pl.tile.create(
+                    [1, 32], dtype=pl.FP16, target_memory=pl.MemorySpace.Vec
+                )
+                full_src_tile: pl.Tile[[32, 32], pl.FP16] = pl.tile.create(
+                    [32, 32], dtype=pl.FP16, target_memory=pl.MemorySpace.Vec
+                )
+                full_idx_tile: pl.Tile[[32, 32], pl.INT16] = pl.tile.create(
+                    [32, 32], dtype=pl.INT16, target_memory=pl.MemorySpace.Vec
+                )
+                result: pl.Tile[[32, 32], pl.FP16] = pl.tile.scatter_update(
+                    input_tile, index_tile, src_tile, scratch_tile, full_src_tile, full_idx_tile, dim=-2
+                )
+                return pl.store(result, [0, 0], dst_t)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.tscatter" in mlir, f"scatter_update should emit pto.tscatter, got:\n{mlir}"
+        assert "dtype=i16, rows=32, cols=32" in mlir, f"Expected i16 full index tile, got:\n{mlir}"
+        assert "index to i16" in mlir, f"Expected flattened offsets to be cast to i16, got:\n{mlir}"
 
     def test_tile_scatter_update_is_inplace(self):
         """tile.scatter_update should reuse the input tile buffer instead of copying it."""
@@ -1598,13 +1662,19 @@ class TestTileScatterUpdateCodegen:
                 scratch_tile: pl.Tile[[1, 32], pl.FP32] = pl.tile.create(
                     [1, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
+                full_src_tile: pl.Tile[[16, 32], pl.FP32] = pl.tile.create(
+                    [16, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                full_idx_tile: pl.Tile[[16, 32], pl.INT32] = pl.tile.create(
+                    [16, 32], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
+                )
                 result: pl.Tile[[16, 32], pl.FP32] = pl.tile.scatter_update(
-                    input_tile, index_tile, src_tile, scratch_tile, dim=-2
+                    input_tile, index_tile, src_tile, scratch_tile, full_src_tile, full_idx_tile, dim=-2
                 )
                 return pl.store(result, [0, 0], dst_t)
 
         mlir = self._generate_mlir(Prog)
-        assert "pto.tmov" not in mlir, f"scatter_update should update in place, got:\n{mlir}"
+        assert "pto.tmov" in mlir, f"scatter_update should copy input into full_src before tscatter, got:\n{mlir}"
         assert "result = pto.alloc_tile" not in mlir, (
             f"scatter_update result should alias input tile, got:\n{mlir}"
         )
@@ -1628,8 +1698,14 @@ class TestTileScatterUpdateCodegen:
                 scratch_tile: pl.Tile[[1, 32], pl.FP32] = pl.tile.create(
                     [1, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
+                full_src_tile: pl.Tile[[32, 32], pl.FP32] = pl.tile.create(
+                    [32, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                )
+                full_idx_tile: pl.Tile[[32, 32], pl.INT32] = pl.tile.create(
+                    [32, 32], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
+                )
                 result: pl.Tile[[32, 32], pl.FP32] = pl.tile.scatter_update(
-                    input_tile, index_tile, src_tile, scratch_tile, dim=-2
+                    input_tile, index_tile, src_tile, scratch_tile, full_src_tile, full_idx_tile, dim=-2
                 )
                 return pl.store(result, [0, 0], dst_t)
 

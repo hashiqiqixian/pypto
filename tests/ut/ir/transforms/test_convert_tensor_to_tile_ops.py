@@ -1843,8 +1843,14 @@ class TestScatterUpdateConversion:
                 scatter_row: pl.Tile[[1, 64], pl.FP16] = pl.tile.create(
                     [1, 64], dtype=pl.FP16, target_memory=pl.MemorySpace.Vec
                 )
+                scatter_full_src: pl.Tile[[16, 64], pl.FP16] = pl.tile.create(
+                    [16, 64], dtype=pl.FP16, target_memory=pl.MemorySpace.Vec
+                )
+                scatter_full_idx: pl.Tile[[16, 64], pl.INT16] = pl.tile.create(
+                    [16, 64], dtype=pl.INT16, target_memory=pl.MemorySpace.Vec
+                )
                 result__tile: pl.Tile[[16, 64], pl.FP16] = pl.tile.scatter_update(
-                    buf__tile, -2, index__tile, src__tile, scatter_row
+                    buf__tile, -2, index__tile, src__tile, scatter_row, scatter_full_src, scatter_full_idx
                 )
                 ret0__store: pl.Tensor[[16, 64], pl.FP16] = pl.store(result__tile, [0, 0], ret0__out)
                 return ret0__store
@@ -1910,8 +1916,14 @@ class TestScatterUpdateConversion:
                 scatter_row: pl.Tile[[1, 64], pl.FP16] = pl.tile.create(
                     [1, 64], dtype=pl.FP16, target_memory=pl.MemorySpace.Vec
                 )
+                scatter_full_src: pl.Tile[[16, 64], pl.FP16] = pl.tile.create(
+                    [16, 64], dtype=pl.FP16, target_memory=pl.MemorySpace.Vec
+                )
+                scatter_full_idx: pl.Tile[[16, 64], pl.INT16] = pl.tile.create(
+                    [16, 64], dtype=pl.INT16, target_memory=pl.MemorySpace.Vec
+                )
                 result__tile: pl.Tile[[16, 64], pl.FP16] = pl.tile.scatter_update(
-                    kv_cache__tile, -2, index__tile, src__tile, scatter_row
+                    kv_cache__tile, -2, index__tile, src__tile, scatter_row, scatter_full_src, scatter_full_idx
                 )
                 ret0__store: pl.Tensor[[16, 64], pl.FP16] = pl.store(result__tile, [0, 0], ret0__out)
                 return ret0__store

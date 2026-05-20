@@ -272,6 +272,8 @@ def scatter_update(
     index: Expr | None = None,
     src: Expr | None = None,
     scratch: Expr | None = None,
+    full_src: Expr | None = None,
+    full_idx: Expr | None = None,
     span: Span | None = None,
 ) -> Call:
     """Update tile rows at positions specified by 2D index tile with values from src.
@@ -281,35 +283,54 @@ def scatter_update(
     - 4D: input [blockNum, blockSize, 1, d], src [b, s, 1, d], index [b, s]
 
     Accepts both call forms:
-    - scatter_update(input, dim, index, src, scratch)
-    - scatter_update(input, index, src, scratch, dim=-2)
+    - scatter_update(input, dim, index, src, scratch, full_src, full_idx)
+    - scatter_update(input, index, src, scratch, full_src, full_idx, dim=-2)
 
     Args:
         input: Destination tile (TileType, 2D or 4D)
         dim: Dimension to scatter along (currently only -2 is supported)
         index: 2D index tile [b, s] of integer dtype
         src: Source tile (same rank as input)
-        scratch: [1, d] scratch row tile (Vec memory) used as the per-row staging buffer
+        scratch: [1, d] scratch row tile (Vec memory) used as the legacy per-row staging buffer
+        full_src: Full-size data tile used by semantics-preserving tscatter lowering
+        full_idx: Full-size identity index tile used by semantics-preserving tscatter lowering
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
         Call expression returning a TileType with the same shape/dtype as input
     """
-    if len(args) == 4 and dim is None and index is None and src is None and scratch is None:
-        dim, index, src, scratch = args
-    elif len(args) == 3 and dim is not None and index is None and src is None and scratch is None:
-        index, src, scratch = args
+    if (
+        len(args) == 6
+        and dim is None
+        and index is None
+        and src is None
+        and scratch is None
+        and full_src is None
+        and full_idx is None
+    ):
+        dim, index, src, scratch, full_src, full_idx = args
+    elif (
+        len(args) == 5
+        and dim is not None
+        and index is None
+        and src is None
+        and scratch is None
+        and full_src is None
+        and full_idx is None
+    ):
+        index, src, scratch, full_src, full_idx = args
     elif len(args) == 1 and dim is None and index is not None and src is not None and scratch is not None:
         # (input, dim, index=..., src=..., scratch=...) — dim passed positionally
         dim = args[0]
     elif len(args) != 0:
         raise TypeError(
-            "scatter_update expects (input, dim, index, src, scratch), "
-            "(input, index, src, scratch, dim=...), or (input, dim, index=..., src=..., scratch=...)"
+            "scatter_update expects (input, dim, index, src, scratch, full_src, full_idx), "
+            "(input, index, src, scratch, full_src, full_idx, dim=...), or "
+            "(input, dim, index=..., src=..., scratch=..., full_src=..., full_idx=...)"
         )
 
-    if dim is None or index is None or src is None or scratch is None:
-        raise TypeError("scatter_update requires input, dim, index, src, and scratch")
+    if dim is None or index is None or src is None or scratch is None or full_src is None or full_idx is None:
+        raise TypeError("scatter_update requires input, dim, index, src, scratch, full_src, and full_idx")
 
     actual_span = _get_span_or_capture(span)
     if isinstance(dim, ConstInt):
@@ -325,7 +346,11 @@ def scatter_update(
         raise TypeError(f"src must be Expr, got {type(src)}")
     if not isinstance(scratch, Expr):
         raise TypeError(f"scratch must be Expr, got {type(scratch)}")
-    op_args: list[Expr] = [input, index, src, scratch]
+    if not isinstance(full_src, Expr):
+        raise TypeError(f"full_src must be Expr, got {type(full_src)}")
+    if not isinstance(full_idx, Expr):
+        raise TypeError(f"full_idx must be Expr, got {type(full_idx)}")
+    op_args: list[Expr] = [input, index, src, scratch, full_src, full_idx]
     kwargs: dict[str, Any] = {"dim": dim_val}
     return _ir_core.create_op_call("tile.scatter_update", op_args, kwargs, actual_span)
 

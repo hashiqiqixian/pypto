@@ -1046,20 +1046,29 @@ static std::string MakeMrgSort1CodegenPTO(const std::string& pto_op_name, const 
   return "";
 }
 
-// Helper function for tile.scatter_update:
-// Implements scatter_update as an in-place update on the input tile in Vec memory:
-//   for i in [0, b):
-//     for j in [0, s):
-//       row = index[i, j]
-//       row_tile = pto.textract(src, i*s + j, 0)   // whole [1, d] row
-//       pto.tinsert(row_tile -> input, row, 0)     // write [1, d] row in-place
+static DataType GetTscatterIndexDtype(const DataType& data_dtype) {
+  const size_t data_bits = data_dtype.GetBit();
+  if (data_bits == 32) return DataType::INT32;
+  if (data_bits == 16 || data_bits == 8) return DataType::INT16;
+  CHECK(false) << "tile.scatter_update PTO tscatter lowering supports 8/16/32-bit data, got "
+               << data_dtype.GetBit() << "-bit element";
+  return DataType::INT32;
+}
+
+// Helper function for tile.scatter_update.
 //
-// Using pto.textract / pto.tinsert avoids an inner per-element scalar loop over
-// the feature dim (d), which is the performance-sensitive axis.
+// pto.tscatter uses flattened element indices and does not preserve elements
+// that are not named by its index tile. To keep scatter_update's row-update
+// semantics, the addressed path constructs full tiles:
+//   full_src starts as input, then src rows overwrite index-selected rows.
+//   full_idx is identity over the whole destination tile.
+// Then pto.tscatter(full_src, full_idx) covers every destination element.
+//
 static std::string MakeScatterUpdateCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
-  CHECK(op->args_.size() == 4) << op->op_->name_ << " requires 4 arguments (input, index, src, scratch), got "
-                               << op->args_.size();
+  CHECK(op->args_.size() == 6)
+      << op->op_->name_ << " requires 6 arguments (input, index, src, scratch, full_src, full_idx), got "
+      << op->args_.size();
 
   auto input_type = ir::As<ir::TileType>(op->args_[0]->GetType());
   auto index_type = ir::As<ir::TileType>(op->args_[1]->GetType());
@@ -1069,6 +1078,21 @@ static std::string MakeScatterUpdateCodegenPTO(const CallPtr& op, codegen::Codeg
   CHECK(input_type->shape_.size() == 2 && src_type->shape_.size() == 2)
       << "tile.scatter_update PTO lowering currently supports 2D input/src only, got input rank "
       << input_type->shape_.size() << ", src rank " << src_type->shape_.size();
+  CHECK(index_type->shape_.size() == 2)
+      << "tile.scatter_update PTO lowering currently supports 2D index tile only, got rank "
+      << index_type->shape_.size();
+
+  const int64_t input_cols = codegen.GetConstIntValue(input_type->shape_[1]);
+  const int64_t input_rows = codegen.GetConstIntValue(input_type->shape_[0]);
+  const int64_t index_rows = codegen.GetConstIntValue(index_type->shape_[0]);
+  const int64_t index_cols = codegen.GetConstIntValue(index_type->shape_[1]);
+  const int64_t src_rows = codegen.GetConstIntValue(src_type->shape_[0]);
+  const int64_t src_cols = codegen.GetConstIntValue(src_type->shape_[1]);
+  CHECK(src_rows == index_rows * index_cols)
+      << "tile.scatter_update expects src rows to equal flattened index elements, got src_rows="
+      << src_rows << ", index shape=[" << index_rows << ", " << index_cols << "]";
+  CHECK(src_cols == input_cols) << "tile.scatter_update expects src cols to match input cols, got src_cols="
+                                << src_cols << ", input_cols=" << input_cols;
 
   std::string index_ssa = codegen.GetExprAsCode(op->args_[1]);
   std::string src_ssa = codegen.GetExprAsCode(op->args_[2]);
@@ -1077,21 +1101,9 @@ static std::string MakeScatterUpdateCodegenPTO(const CallPtr& op, codegen::Codeg
   std::string src_type_str = codegen.GetExprTypeAnnotation(op->args_[2]);
 
   std::string input_ssa = codegen.GetExprAsCode(op->args_[0]);
+  std::string input_type_str = codegen.GetExprTypeAnnotation(op->args_[0]);
   std::string dst = codegen.GetCurrentResultTarget();
   std::string dst_type_str = codegen.GetCurrentResultTileBufTypeString();
-
-  // Dimensions: index is [b, s], input is [rows, d], src is [b*s, d].
-  int64_t b_val = codegen.GetConstIntValue(index_type->shape_[0]);
-  int64_t s_val = codegen.GetConstIntValue(index_type->shape_[1]);
-
-  // Emit constants
-  std::string c0 = codegen.GetOrEmitConstant(int64_t{0}, DataType::INDEX);
-  std::string c1 = codegen.GetOrEmitConstant(int64_t{1}, DataType::INDEX);
-  std::string cb = codegen.GetOrEmitConstant(int64_t{b_val}, DataType::INDEX);
-  std::string cs = codegen.GetOrEmitConstant(int64_t{s_val}, DataType::INDEX);
-
-  // Scalar type for the scalar index read
-  std::string index_scalar_type = codegen.GetTypeString(index_type->dtype_);
 
   // scatter_update is marked output_reuses_input(0), so dst aliases input in Vec memory.
   INTERNAL_CHECK(!dst.empty()) << "tile.scatter_update requires a result buffer";
@@ -1099,64 +1111,121 @@ static std::string MakeScatterUpdateCodegenPTO(const CallPtr& op, codegen::Codeg
       << "Internal error: tile.scatter_update result SSA must alias input SSA, got dst=" << dst
       << ", input=" << input_ssa;
 
-  // Caller-allocated [1, d] scratch tile (4th arg) — gives PTO an addressed alloc_tile
-  // for the per-row staging buffer, avoiding ad-hoc codegen-side allocations.
-  std::string row_tile = codegen.GetExprAsCode(op->args_[3]);
-  std::string row_tile_type_str = codegen.GetExprTypeAnnotation(op->args_[3]);
+  DataType scatter_index_dtype = GetTscatterIndexDtype(src_type->dtype_);
+  std::string scatter_index_scalar_type = codegen.GetTypeString(scatter_index_dtype);
+  std::string source_index_scalar_type = codegen.GetTypeString(index_type->dtype_);
 
-  // for i in [0, b)
-  std::string i_var = codegen.NewNamedTemp("i");
-  codegen.Emit("scf.for " + i_var + " = " + c0 + " to " + cb + " step " + c1 + " {");
-  codegen.IncreaseIndent();
+  std::string c0 = codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INDEX);
+  std::string c1 = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+  std::string input_rows_ssa = codegen.GetOrEmitConstant(input_rows, DataType::INDEX);
+  std::string src_rows_ssa = codegen.GetOrEmitConstant(src_rows, DataType::INDEX);
+  std::string src_cols_ssa = codegen.GetOrEmitConstant(src_cols, DataType::INDEX);
+  std::string full_src_ssa = codegen.GetExprAsCode(op->args_[4]);
+  std::string full_idx_ssa = codegen.GetExprAsCode(op->args_[5]);
+  std::string full_src_type_str = codegen.GetExprTypeAnnotation(op->args_[4]);
+  std::string full_idx_type_str = codegen.GetExprTypeAnnotation(op->args_[5]);
+  std::string data_scalar_type = codegen.GetTypeString(src_type->dtype_);
 
-  // for j in [0, s)
-  std::string j_var = codegen.NewNamedTemp("j");
-  codegen.Emit("scf.for " + j_var + " = " + c0 + " to " + cs + " step " + c1 + " {");
-  codegen.IncreaseIndent();
-
-  // idx = i * s + j  — flat offset into index and also src row index (src is [b*s, d]).
-  std::string idx = EmitFlatOffsetSSAFromValues({i_var, j_var}, index_type->shape_, codegen, "idx");
-
-  // row_i32 = index[i, j]  (scalar read from the index tile)
-  std::string row_i32 = codegen.NewNamedTemp("row_i32");
   {
-    std::ostringstream tgetval;
-    tgetval << row_i32 << " = pto.tgetval ins(" << index_ssa << ", " << idx;
-    if (!index_type_str.empty()) tgetval << " : " << index_type_str << ", index";
-    tgetval << ") outs : " << index_scalar_type;
-    codegen.Emit(tgetval.str());
+    std::ostringstream mov;
+    mov << "pto.tmov ins(" << input_ssa;
+    if (!input_type_str.empty()) mov << " : " << input_type_str;
+    mov << ") outs(" << full_src_ssa;
+    if (!full_src_type_str.empty()) mov << " : " << full_src_type_str;
+    mov << ")";
+    codegen.Emit(mov.str());
   }
 
-  std::string row_idx = codegen.NewNamedTemp("row_idx");
-  codegen.Emit(row_idx + " = arith.index_cast " + row_i32 + " : " + index_scalar_type + " to index");
-
-  // row_tile = src[idx, 0 : 1, d]
+  std::string full_row = codegen.NewNamedTemp("scatter_full_row");
+  codegen.Emit("scf.for " + full_row + " = " + c0 + " to " + input_rows_ssa + " step " + c1 + " {");
+  codegen.IncreaseIndent();
+  std::string full_col = codegen.NewNamedTemp("scatter_full_col");
+  codegen.Emit("scf.for " + full_col + " = " + c0 + " to " + src_cols_ssa + " step " + c1 + " {");
+  codegen.IncreaseIndent();
+  std::string full_pos_mul = codegen.NewNamedTemp("scatter_full_pos_mul");
+  codegen.Emit(full_pos_mul + " = arith.muli " + full_row + ", " + src_cols_ssa + " : index");
+  std::string full_pos = codegen.NewNamedTemp("scatter_full_pos");
+  codegen.Emit(full_pos + " = arith.addi " + full_pos_mul + ", " + full_col + " : index");
+  std::string full_pos_cast = codegen.NewNamedTemp("scatter_full_pos_cast");
+  codegen.Emit(full_pos_cast + " = arith.index_cast " + full_pos + " : index to " +
+               scatter_index_scalar_type);
   {
-    std::ostringstream textract;
-    textract << "pto.textract ins(" << src_ssa << ", " << idx << ", " << c0;
-    if (!src_type_str.empty()) textract << " : " << src_type_str << ", index, index";
-    textract << ") outs(" << row_tile;
-    if (!row_tile_type_str.empty()) textract << " : " << row_tile_type_str;
-    textract << ")";
-    codegen.Emit(textract.str());
+    std::ostringstream set_full_index;
+    set_full_index << "pto.tsetval ins(" << full_pos << ", " << full_pos_cast << " : index, "
+                   << scatter_index_scalar_type << ") outs(" << full_idx_ssa << " : "
+                   << full_idx_type_str << ")";
+    codegen.Emit(set_full_index.str());
+  }
+  codegen.DecreaseIndent();
+  codegen.Emit("}");
+  codegen.DecreaseIndent();
+  codegen.Emit("}");
+
+  std::string row = codegen.NewNamedTemp("scatter_row");
+  codegen.Emit("scf.for " + row + " = " + c0 + " to " + src_rows_ssa + " step " + c1 + " {");
+  codegen.IncreaseIndent();
+
+  std::string row_i = codegen.NewNamedTemp("scatter_row_i");
+  {
+    std::ostringstream get_row_index;
+    get_row_index << row_i << " = pto.tgetval ins(" << index_ssa << ", " << row;
+    if (!index_type_str.empty()) {
+      get_row_index << " : " << index_type_str << ", index";
+    } else {
+      get_row_index << " : , index";
+    }
+    get_row_index << ") outs : " << source_index_scalar_type;
+    codegen.Emit(get_row_index.str());
   }
 
-  // dst[row_idx, 0 : 1, d] = row_tile
+  std::string row_idx = codegen.NewNamedTemp("scatter_row_idx");
+  codegen.Emit(row_idx + " = arith.index_cast " + row_i + " : " + source_index_scalar_type + " to index");
+  std::string row_base = codegen.NewNamedTemp("scatter_row_base");
+  codegen.Emit(row_base + " = arith.muli " + row_idx + ", " + src_cols_ssa + " : index");
+
+  std::string col = codegen.NewNamedTemp("scatter_col");
+  codegen.Emit("scf.for " + col + " = " + c0 + " to " + src_cols_ssa + " step " + c1 + " {");
+  codegen.IncreaseIndent();
+
+  std::string dst_pos = codegen.NewNamedTemp("scatter_dst_pos");
+  codegen.Emit(dst_pos + " = arith.addi " + row_base + ", " + col + " : index");
+  std::string src_pos_mul = codegen.NewNamedTemp("scatter_src_pos_mul");
+  codegen.Emit(src_pos_mul + " = arith.muli " + row + ", " + src_cols_ssa + " : index");
+  std::string src_pos = codegen.NewNamedTemp("scatter_src_pos");
+  codegen.Emit(src_pos + " = arith.addi " + src_pos_mul + ", " + col + " : index");
+
+  std::string src_val = codegen.NewNamedTemp("scatter_src_val");
   {
-    std::ostringstream tinsert;
-    tinsert << "pto.tinsert ins(" << row_tile << ", " << row_idx << ", " << c0;
-    if (!row_tile_type_str.empty()) tinsert << " : " << row_tile_type_str << ", index, index";
-    tinsert << ") outs(" << dst;
-    if (!dst_type_str.empty()) tinsert << " : " << dst_type_str;
-    tinsert << ")";
-    codegen.Emit(tinsert.str());
+    std::ostringstream get_src_val;
+    get_src_val << src_val << " = pto.tgetval ins(" << src_ssa << ", " << src_pos;
+    if (!src_type_str.empty()) {
+      get_src_val << " : " << src_type_str << ", index";
+    } else {
+      get_src_val << " : , index";
+    }
+    get_src_val << ") outs : " << data_scalar_type;
+    codegen.Emit(get_src_val.str());
+  }
+  {
+    std::ostringstream set_full_src;
+    set_full_src << "pto.tsetval ins(" << dst_pos << ", " << src_val << " : index, "
+                 << data_scalar_type << ") outs(" << full_src_ssa << " : "
+                 << full_src_type_str << ")";
+    codegen.Emit(set_full_src.str());
   }
 
   codegen.DecreaseIndent();
   codegen.Emit("}");
-
   codegen.DecreaseIndent();
   codegen.Emit("}");
+
+  std::ostringstream tscatter;
+  tscatter << "pto.tscatter ins(" << full_src_ssa << ", " << full_idx_ssa;
+  if (!full_src_type_str.empty()) tscatter << " : " << full_src_type_str << ", " << full_idx_type_str;
+  tscatter << ") outs(" << dst;
+  if (!dst_type_str.empty()) tscatter << " : " << dst_type_str;
+  tscatter << ")";
+  codegen.Emit(tscatter.str());
 
   return "";
 }

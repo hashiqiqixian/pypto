@@ -69,8 +69,15 @@ class TileScatterUpdateFP16Program:
         scratch_tile: pl.Tile[[1, 32], pl.FP16] = pl.tile.create(
             [1, 32], dtype=pl.FP16, target_memory=pl.MemorySpace.Vec
         )
+        full_src_tile: pl.Tile[[32, 32], pl.FP16] = pl.tile.create(
+            [32, 32], dtype=pl.FP16, target_memory=pl.MemorySpace.Vec
+        )
+        full_idx_tile: pl.Tile[[32, 32], pl.INT16] = pl.tile.create(
+            [32, 32], dtype=pl.INT16, target_memory=pl.MemorySpace.Vec
+        )
         result: pl.Tile[[32, 32], pl.FP16] = pl.tile.scatter_update(
-            input_tile, dim=-2, index=index_tile, src=src_tile, scratch=scratch_tile
+            input_tile, dim=-2, index=index_tile, src=src_tile, scratch=scratch_tile,
+            full_src=full_src_tile, full_idx=full_idx_tile
         )
         return pl.store(result, [0, 0], dst_t)
 
@@ -102,8 +109,15 @@ class TileScatterUpdateSingleBatchProgram:
         scratch_tile: pl.Tile[[1, 32], pl.FP32] = pl.tile.create(
             [1, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
         )
+        full_src_tile: pl.Tile[[32, 32], pl.FP32] = pl.tile.create(
+            [32, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+        )
+        full_idx_tile: pl.Tile[[32, 32], pl.INT32] = pl.tile.create(
+            [32, 32], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
+        )
         result: pl.Tile[[32, 32], pl.FP32] = pl.tile.scatter_update(
-            input_tile, dim=-2, index=index_tile, src=src_tile, scratch=scratch_tile
+            input_tile, dim=-2, index=index_tile, src=src_tile, scratch=scratch_tile,
+            full_src=full_src_tile, full_idx=full_idx_tile
         )
         return pl.store(result, [0, 0], dst_t)
 
@@ -135,8 +149,15 @@ class TileScatterUpdateProgram:
         scratch_tile: pl.Tile[[1, 32], pl.FP32] = pl.tile.create(
             [1, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
         )
+        full_src_tile: pl.Tile[[32, 32], pl.FP32] = pl.tile.create(
+            [32, 32], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+        )
+        full_idx_tile: pl.Tile[[32, 32], pl.INT32] = pl.tile.create(
+            [32, 32], dtype=pl.INT32, target_memory=pl.MemorySpace.Vec
+        )
         result: pl.Tile[[32, 32], pl.FP32] = pl.tile.scatter_update(
-            input_tile, dim=-2, index=index_tile, src=src_tile, scratch=scratch_tile
+            input_tile, dim=-2, index=index_tile, src=src_tile, scratch=scratch_tile,
+            full_src=full_src_tile, full_idx=full_idx_tile
         )
         return pl.store(result, [0, 0], dst_t)
 

@@ -327,9 +327,9 @@ void OpConversionRegistry::RegisterMemoryOps() {
         return ConversionResult{op_reg.Create("tensor.assemble", args, kwargs, span)};
       });
 
-  // tensor.scatter_update → tile.create + tile.scatter_update(input, index, src, scratch).
-  // Mirrors the rsqrt high-precision pattern: prologue allocates a [1, d] scratch row tile
-  // via tile.create, which is then passed as the 4th arg to tile.scatter_update.
+  // tensor.scatter_update -> tile.create scratch + tile.create full_src/full_idx +
+  // tile.scatter_update(input, index, src, scratch, full_src, full_idx).
+  // Both temporaries must be explicit IR values so memory planning assigns level3 addrs.
   std::unordered_map<size_t, InputSpaceReq> scatter_update_input_reqs = {
       {0, {MemorySpace::Vec, std::nullopt}},
       {1, {MemorySpace::Vec, std::nullopt}},
@@ -358,6 +358,13 @@ void OpConversionRegistry::RegisterMemoryOps() {
         CHECK(src_tile_type->shape_.size() == 2)
             << "tensor.scatter_update conversion currently supports 2D src tiles, got rank "
             << src_tile_type->shape_.size();
+        auto tscatter_index_dtype = [](DataType data_dtype) {
+          const size_t bits = data_dtype.GetBit();
+          if (bits == 32) return DataType::INT32;
+          if (bits == 16 || bits == 8) return DataType::INT16;
+          CHECK(false) << "tensor.scatter_update conversion: unsupported tscatter data bitwidth " << bits;
+          return DataType::INT32;
+        };
 
         // Allocate the [1, d] scratch row tile that tile.scatter_update needs as its
         // per-row staging buffer. Same dtype + Vec memory as the input.
@@ -373,8 +380,22 @@ void OpConversionRegistry::RegisterMemoryOps() {
         std::vector<StmtPtr> prologue;
         prologue.push_back(std::make_shared<AssignStmt>(scratch_var, create_call, span));
 
+        auto full_src_shape = std::make_shared<MakeTuple>(input_tile_type->shape_, span);
+        std::vector<std::pair<std::string, std::any>> full_src_kwargs = {{"dtype", input_tile_type->dtype_},
+                                                                         {"target_memory", MemorySpace::Vec}};
+        auto full_src_create = op_reg.Create("tile.create", {full_src_shape}, full_src_kwargs, span);
+        auto full_src_var = std::make_shared<Var>("scatter_full_src", full_src_create->GetType(), span);
+        prologue.push_back(std::make_shared<AssignStmt>(full_src_var, full_src_create, span));
+
+        auto full_idx_shape = std::make_shared<MakeTuple>(input_tile_type->shape_, span);
+        std::vector<std::pair<std::string, std::any>> full_idx_kwargs = {
+            {"dtype", tscatter_index_dtype(input_tile_type->dtype_)}, {"target_memory", MemorySpace::Vec}};
+        auto full_idx_create = op_reg.Create("tile.create", {full_idx_shape}, full_idx_kwargs, span);
+        auto full_idx_var = std::make_shared<Var>("scatter_full_idx", full_idx_create->GetType(), span);
+        prologue.push_back(std::make_shared<AssignStmt>(full_idx_var, full_idx_create, span));
+
         auto scatter_call =
-            op_reg.Create("tile.scatter_update", {input, index, src, scratch_var}, kwargs, span);
+            op_reg.Create("tile.scatter_update", {input, index, src, scratch_var, full_src_var, full_idx_var}, kwargs, span);
         return ConversionResult{std::move(prologue), scatter_call};
       },
       std::move(scatter_update_input_reqs));

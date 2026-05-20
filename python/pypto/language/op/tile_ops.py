@@ -434,9 +434,9 @@ def scatter_update(input: Tile, *args: Any, **kwargs: Any) -> Tile:
     Accepts the same flexible call shapes as the IR builder
     ``pypto.ir.op.tile.scatter_update``:
 
-    - ``scatter_update(input, dim, index, src, scratch)``
-    - ``scatter_update(input, index, src, scratch, dim=-2)``
-    - ``scatter_update(input, dim, index=..., src=..., scratch=...)``
+    - ``scatter_update(input, dim, index, src, scratch, full_src, full_idx)``
+    - ``scatter_update(input, index, src, scratch, full_src, full_idx, dim=-2)``
+    - ``scatter_update(input, dim, index=..., src=..., scratch=..., full_src=..., full_idx=...)``
 
     Tile / Scalar wrappers are unwrapped before forwarding so the IR builder
     receives raw ``Expr`` operands.

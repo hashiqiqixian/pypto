@@ -17,6 +17,7 @@
  * slice, reshape and transpose operations.
  */
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <cstdint>
@@ -510,15 +511,26 @@ REGISTER_OP("tile.extract")
       return DeduceTileExtractType(args, kwargs);
     });
 
+static DataType GetScatterUpdateTscatterIndexDtype(const DataType& data_dtype) {
+  const size_t bits = data_dtype.GetBit();
+  if (bits == 32) return DataType::INT32;
+  if (bits == 16 || bits == 8) return DataType::INT16;
+  CHECK(false) << "tile.scatter_update: tscatter index tile supports 8/16/32-bit data, got "
+               << bits << "-bit element";
+  return DataType::INT32;
+}
+
 TypePtr DeduceTileScatterUpdateType(const std::vector<ExprPtr>& args,
                                     const std::vector<std::pair<std::string, std::any>>& kwargs) {
-  // tile.scatter_update(input, index, src, scratch) -> TileType same as input
+  // tile.scatter_update(input, index, src, scratch, full_src, full_idx) -> TileType same as input
   // input:   TileType 2D [rows, d] or 4D [blockNum, blockSize, 1, d]
   // index:   TileType 2D [b, s] of integer dtype
   // src:     TileType 2D [b*s, d] or 4D [b, s, 1, d] (same rank as input)
   // scratch: TileType 2D [1, d] with same dtype as input (caller-allocated row buffer)
-  CHECK(args.size() == 4)
-      << "tile.scatter_update requires exactly 4 arguments (input, index, src, scratch), got " << args.size();
+  CHECK(args.size() == 6)
+      << "tile.scatter_update requires 6 arguments "
+         "(input, index, src, scratch, full_src, full_idx), got "
+      << args.size();
 
   auto input_type = As<TileType>(args[0]->GetType());
   CHECK(input_type) << "tile.scatter_update: input must be TileType, got " << args[0]->GetType()->TypeName();
@@ -554,6 +566,29 @@ TypePtr DeduceTileScatterUpdateType(const std::vector<ExprPtr>& args,
       << "tile.scatter_update: scratch dtype (" << scratch_type->dtype_.ToString()
       << ") must match input dtype (" << input_type->dtype_.ToString() << ")";
 
+  auto full_src_type = As<TileType>(args[4]->GetType());
+  CHECK(full_src_type) << "tile.scatter_update: full_src must be TileType, got "
+                       << args[4]->GetType()->TypeName();
+  CHECK(full_src_type->shape_.size() == input_type->shape_.size())
+      << "tile.scatter_update: full_src rank must match input rank";
+  CHECK(full_src_type->dtype_ == input_type->dtype_)
+      << "tile.scatter_update: full_src dtype must match input dtype";
+  CHECK(std::equal(full_src_type->shape_.begin(), full_src_type->shape_.end(), input_type->shape_.begin(),
+                   AreExprsEqual))
+      << "tile.scatter_update: full_src shape must match input shape";
+
+  auto full_idx_type = As<TileType>(args[5]->GetType());
+  CHECK(full_idx_type) << "tile.scatter_update: full_idx must be TileType, got "
+                       << args[5]->GetType()->TypeName();
+  CHECK(full_idx_type->shape_.size() == input_type->shape_.size())
+      << "tile.scatter_update: full_idx rank must match input rank";
+  CHECK(full_idx_type->dtype_ == GetScatterUpdateTscatterIndexDtype(input_type->dtype_))
+      << "tile.scatter_update: full_idx dtype must match tscatter index rule for input dtype "
+      << input_type->dtype_.ToString() << ", got " << full_idx_type->dtype_.ToString();
+  CHECK(std::equal(full_idx_type->shape_.begin(), full_idx_type->shape_.end(), input_type->shape_.begin(),
+                   AreExprsEqual))
+      << "tile.scatter_update: full_idx shape must match input shape";
+
   for (const auto& [key, val] : kwargs) {
     if (key == "dim") {
       int dim_val = AnyCast<int>(val, "kwarg key: dim");
@@ -580,16 +615,20 @@ REGISTER_OP("tile.scatter_update")
         "Update input tile rows at positions given by 2D index tile with values from src. "
         "Supports 2D input [rows, d] with 2D src [b*s, d], and 4D input [blockNum, blockSize, 1, d] "
         "with 4D src [b, s, 1, d]. Index is always 2D [b, s] of integer dtype. Caller must pass a "
-        "[1, d] scratch tile for the per-row staging buffer.")
+        "[1, d] scratch tile plus full_src/full_idx tiles for semantics-preserving full-tile tscatter lowering.")
     .add_argument("input", "Destination tile (2D [rows, d] or 4D [blockNum, blockSize, 1, d])")
     .add_argument("index", "2D index tile [b, s] of integer dtype")
     .add_argument("src", "Source tile (2D [b*s, d] or 4D [b, s, 1, d])")
     .add_argument("scratch", "Scratch row tile [1, d] with same dtype as input")
+    .add_argument("full_src", "Full-size tscatter source tile [input_rows, input_cols]")
+    .add_argument("full_idx", "Full-size identity tscatter index tile [input_rows, input_cols]")
     .set_attr<int>("dim")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_input_memory(2, MemorySpace::Vec)
     .set_input_memory(3, MemorySpace::Vec)
+    .set_input_memory(4, MemorySpace::Vec)
+    .set_input_memory(5, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
     .set_output_reuses_input(0)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
