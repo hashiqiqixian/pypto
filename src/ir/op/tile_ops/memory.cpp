@@ -93,9 +93,13 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
                           << " requires 4 arguments (tensor, offsets, shapes, valid_shapes), but got "
                           << args.size();
 
-  // First argument must be TensorType
-  auto tensor_type = As<TensorType>(args[0]->GetType());
-  CHECK(tensor_type) << "The operator " << op_name << " requires first argument to be a TensorType, but got "
+  // First argument must be a tensor-shaped source. AsTensorTypeLike accepts
+  // both plain TensorType and DistributedTensorType — the latter lets a kernel
+  // locally load its own window slice (e.g. read back a signal cell after a
+  // pld.system.wait barrier), mirroring tile.store's DistributedTensor dst.
+  auto tensor_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(tensor_type) << "The operator " << op_name
+                     << " requires first argument to be a TensorType or DistributedTensorType, but got "
                      << args[0]->GetType()->TypeName();
 
   // Second argument must be TupleType (offsets)
@@ -224,11 +228,16 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
                        << " requires second argument to be a tuple (offsets), but got "
                        << args[1]->GetType()->TypeName();
 
-  // Third argument must be the output tensor
-  auto output_tensor_type = As<TensorType>(args[2]->GetType());
-  CHECK(output_tensor_type) << "The operator " << op_name
-                            << " requires third argument to be a TensorType, but got "
-                            << args[2]->GetType()->TypeName();
+  // Third argument must be the output tensor. AsTensorTypeLike accepts both
+  // plain TensorType and DistributedTensorType — the latter is needed for the
+  // N6 stage-in pattern where a kernel writes a local tile into its own
+  // window-bound DistributedTensor slice (e.g. ring-shuffle Phase 1 in
+  // tests/st/distributed/test_l3_remote_load.py).
+  auto output_tensor_type = AsTensorTypeLike(args[2]->GetType());
+  CHECK(output_tensor_type)
+      << "The operator " << op_name
+      << " requires third argument to be a TensorType or DistributedTensorType, but got "
+      << args[2]->GetType()->TypeName();
 
   // Optional fourth argument (when 4 args total) must be a shapes tuple
   if (args.size() == 4) {

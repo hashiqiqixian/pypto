@@ -3080,5 +3080,98 @@ class TestTileCiOp:
         assert pl.tile.arange is pl.tile.ci
 
 
+class TestTileStoreDistributedDest:
+    """``tile.store`` accepts ``DistributedTensorType`` as the destination.
+
+    N6 stage-in pattern: a kernel writes a local tile into its own
+    window-bound DistributedTensor slice (e.g. ring-shuffle Phase 1 in
+    tests/st/distributed/test_l3_remote_load.py). The verifier reaches
+    DistributedTensorType through AsTensorTypeLike since
+    DistributedTensorType inherits from TensorType but carries its own
+    ObjectKind — exact-match As<TensorType>() would miss it.
+    """
+
+    def test_pl_store_into_distributed_tensor_parses(self):
+        """``pl.store(tile, [0], dist_tensor)`` parses and types as the dst."""
+        import pypto.language.distributed as pld  # noqa: PLC0415
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def stage_in(
+                self,
+                src: pl.Tensor[[64], pl.FP32],
+                dst: pld.DistributedTensor[[64], pl.FP32],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                local: pl.Tile[[64], pl.FP32] = pl.load(src, [0], [64])
+                return pl.store(local, [0], dst)
+
+        ir_str = str(Program)
+        assert "tile.store" in ir_str
+
+    def test_tile_store_rejects_non_tensor_dst(self):
+        """Regression: a Tile destination is still rejected by the verifier."""
+
+        with pytest.raises(Exception, match="requires third argument to be a TensorType"):
+
+            @pl.program
+            class _Program:
+                @pl.function(type=pl.FunctionType.InCore)
+                def main(
+                    self,
+                    a: pl.Tensor[[128, 128], pl.FP32],
+                ) -> pl.Tensor[[128, 128], pl.FP32]:
+                    tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                    # Wrong: dst must be a (Distributed)TensorType, not a Tile.
+                    return pl.store(tile_a, [0, 0], tile_a)  # pyright: ignore[reportArgumentType]
+
+
+class TestTileLoadDistributedSrc:
+    """``tile.load`` accepts ``DistributedTensorType`` as the source.
+
+    Symmetric to ``tile.store``'s DistributedTensor dst: a kernel locally
+    loads its own window-bound slice (e.g. read back a signal cell after a
+    ``pld.system.wait`` barrier, as in
+    tests/st/distributed/test_l3_notify_wait.py). The verifier reaches
+    DistributedTensorType through AsTensorTypeLike since it inherits from
+    TensorType but carries its own ObjectKind — exact-match As<TensorType>()
+    would miss it.
+    """
+
+    def test_pl_load_from_distributed_tensor_parses(self):
+        """``pl.load(dist_tensor, [0], [64])`` parses and types as a Tile."""
+        import pypto.language.distributed as pld  # noqa: PLC0415
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def read_back(
+                self,
+                src: pld.DistributedTensor[[64], pl.FP32],
+                out: pl.Out[pl.Tensor[[64], pl.FP32]],
+            ) -> pl.Tensor[[64], pl.FP32]:
+                local: pl.Tile[[64], pl.FP32] = pl.load(src, [0], [64])
+                return pl.store(local, [0], out)
+
+        ir_str = str(Program)
+        assert "tile.load" in ir_str
+
+    def test_tile_load_rejects_non_tensor_src(self):
+        """Regression: a non-tensor (Tile) source is still rejected."""
+
+        with pytest.raises(Exception, match="requires first argument to be a TensorType"):
+
+            @pl.program
+            class _Program:
+                @pl.function(type=pl.FunctionType.InCore)
+                def main(
+                    self,
+                    a: pl.Tensor[[128, 128], pl.FP32],
+                ) -> pl.Tensor[[32, 32], pl.FP32]:
+                    tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
+                    # Wrong: load source must be a (Distributed)TensorType, not a Tile.
+                    return pl.load(tile_a, [0, 0], [32, 32])  # pyright: ignore[reportArgumentType, reportReturnType]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

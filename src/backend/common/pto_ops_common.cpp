@@ -40,6 +40,7 @@
 #include "pypto/codegen/pto/pto_type_utils.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -1176,7 +1177,7 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
         << "tile.load fourth argument must be a tuple (valid_shapes)";
   }
 
-  auto tensor_type = As<TensorType>(tensor->GetType());
+  auto tensor_type = AsTensorTypeLike(tensor->GetType());
   INTERNAL_CHECK_SPAN(tensor_type, op->span_) << "tile.load tensor argument must have TensorType";
 
   const size_t ndim = shapes_tuple->elements_.size();
@@ -1235,7 +1236,7 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
   auto output_tensor = AsVarLike(op->args_[2]);
   INTERNAL_CHECK_SPAN(output_tensor, op->span_) << "tile.store output_tensor must be a Var or IterArg";
 
-  auto tensor_type = As<TensorType>(output_tensor->GetType());
+  auto tensor_type = AsTensorTypeLike(output_tensor->GetType());
   INTERNAL_CHECK_SPAN(tensor_type, op->span_) << "tile.store output_tensor must have TensorType";
 
   std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
@@ -2081,6 +2082,328 @@ static const SimpleOpEntry kSimpleOps[] = {
 // clang-format on
 
 // ============================================================================
+// Distributed N6: pld.tile.remote_load / pld.system.notify / pld.system.wait
+// ============================================================================
+
+namespace {
+
+// Lower a tile-op offsets/shape MakeTuple to a vector of MLIR SSA strings (one
+// per dimension). Constants are materialised via GetOrEmitConstant; dynamic
+// dims fall back to GetExprAsCode + EmitCastToIndex when needed.
+std::vector<std::string> LowerTupleToIndexSSA(const ir::MakeTuplePtr& tuple, codegen::PTOCodegen& codegen) {
+  std::vector<std::string> ssa_names;
+  ssa_names.reserve(tuple->elements_.size());
+  for (const auto& elem : tuple->elements_) {
+    if (auto ci = As<ir::ConstInt>(elem)) {
+      ssa_names.push_back(codegen.GetOrEmitConstant(ci->value_, DataType::INDEX));
+    } else {
+      ssa_names.push_back(codegen.EmitCastToIndex(elem, codegen.GetExprAsCode(elem)));
+    }
+  }
+  return ssa_names;
+}
+
+// Resolve a DistributedTensor argument to its parameter Var + matching
+// CommContext SSA. The argument is expected to be a Var directly bound to a
+// function parameter (no aliasing); the verifier on remote_load / notify /
+// wait already requires DistributedTensorType, but additionally checks that
+// the var has a CommContext ptr threaded through the func.func signature.
+struct DistTensorBinding {
+  ir::VarPtr var;
+  std::shared_ptr<const ir::DistributedTensorType> type;
+  std::string local_ptr_ssa;
+  std::string ctx_ssa;
+};
+
+DistTensorBinding ResolveDistTensorBinding(const ExprPtr& arg, codegen::PTOCodegen& codegen,
+                                           const char* op_name) {
+  auto var = AsVarLike(arg);
+  CHECK(var) << op_name << " expects DistributedTensor argument to be a Var-like expression, got "
+             << arg->TypeName();
+  auto dist_type = As<ir::DistributedTensorType>(var->GetType());
+  CHECK(dist_type) << op_name << " expects DistributedTensorType, got " << var->GetType()->TypeName();
+  std::string local_ptr = codegen.GetVarName(var);
+  std::string ctx_ssa = codegen.GetCommCtxSSAFor(var.get());
+  CHECK(!ctx_ssa.empty()) << op_name << " requires a CommContext pointer arg threaded for DistributedTensor '"
+                          << var->name_hint_ << "', but none was found in the function signature";
+  return {var, dist_type, std::move(local_ptr), std::move(ctx_ssa)};
+}
+
+// Emit:
+//   (1) a single ``func.call`` to the per-dtype module-level
+//       ``@CommRemoteOffset_<dtype>`` helper (see
+//       ``PTOCodegen::EmitCommRemoteOffsetHelpers``) — returns the
+//       peer-vs-local **element offset** (``index``);
+//   (2) a ``pto.addptr`` against the local DistributedTensor pointer, and
+//   (3) a ``pto.make_tensor_view`` rooted at the resulting peer pointer.
+//
+// Steps (2) and (3) live at the call site (i.e. inside the user kernel's
+// ``func.func``) for two intertwined PTOAS constraints:
+//
+// * ``pto.addptr`` must feed ``pto.make_tensor_view`` /
+//   ``initialize_l2g2l_pipe(gm_addr)`` / ``load|store_scalar`` *within
+//   the same func.func*. A helper that ended with ``addptr → return``
+//   would only feed ``func.return``, which PTOAS rejects.
+// * ``pto.make_tensor_view`` always lowers to ``memref<…, strided<[?,
+//   ?], offset: ?>>`` when strides are passed as operands, but
+//   ``!pto.tensor_view<…>`` source syntax cannot carry a strided layout
+//   suffix — so the view cannot be returned across a func boundary
+//   either.
+//
+// Both forbidden ops therefore have to live in the user kernel. The
+// helper still pulls its weight: it bundles the CommContext field reads
+// and the byte→element division (which depends on dtype), so multiple
+// remote ops share that work via ``func.call`` without duplicating the
+// scalar arithmetic at each call site.
+//
+// Generated MLIR (2-D example, ``DistributedTensor[[1, 64], FP32]``):
+//
+//   %peer_idx = arith.index_cast %peer : i32 to index
+//   %delems = func.call @CommRemoteOffset_f32(%ctx, %peer_idx)
+//           : (!pto.ptr<i64>, index) -> index
+//   %peer_ptr = pto.addptr %local_ptr, %delems
+//             : !pto.ptr<f32> -> !pto.ptr<f32>
+//   %peer_view = pto.make_tensor_view %peer_ptr,
+//                   shape = [%c1, %c64], strides = [%c64, %c1]
+//                   {layout = #pto.layout<nd>}
+//                   : !pto.tensor_view<?x?xf32>
+struct PeerViewInfo {
+  std::string ssa;
+  std::string view_type_str;
+};
+
+PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& peer_expr,
+                                codegen::PTOCodegen& codegen) {
+  const auto& shape = target.type->shape_;
+  const size_t rank = shape.size();
+  CHECK(rank >= 1) << "DistributedTensor must have rank >= 1 for peer view emission";
+  const std::string dtype_str = codegen.GetTypeString(target.type->dtype_);
+  const std::string ptr_type = "!pto.ptr<" + dtype_str + ">";
+
+  // Peer rank may be any scalar int; the helper takes it as ``index``, so
+  // normalise here. Constants and i32/i64 values flow through
+  // EmitCastToIndex (no-op when already index-typed).
+  std::string peer_ssa = codegen.EmitCastToIndex(peer_expr, codegen.GetExprAsCode(peer_expr));
+
+  // (1) Call the per-dtype offset helper.
+  const std::string func_name = codegen::PTOCodegen::GetCommRemoteOffsetFuncName(target.type->dtype_);
+  std::string delems = codegen.NewTemp();
+  codegen.Emit(delems + " = func.call @" + func_name + "(" + target.ctx_ssa + ", " + peer_ssa +
+               ") : (!pto.ptr<i64>, index) -> index");
+
+  // (2) addptr from the local pointer by the returned element offset.
+  std::string peer_ptr = codegen.NewTemp();
+  codegen.Emit(peer_ptr + " = pto.addptr " + target.local_ptr_ssa + ", " + delems + " : " + ptr_type +
+               " -> " + ptr_type);
+
+  // (3) make_tensor_view at the call site. Same shape/stride emission as
+  // ``EmitMakeTensorViews``: row-major strides, ``{layout = #pto.layout<nd>}``
+  // attribute, dynamic-shape result type (``?x?x…xT``). ``addptr``'s
+  // direct consumer is this ``make_tensor_view`` in the same func →
+  // PTOAS's per-func lowering rule is satisfied.
+  std::vector<std::string> shape_ssa(rank);
+  for (size_t i = 0; i < rank; ++i) {
+    if (auto ci = As<ir::ConstInt>(shape[i])) {
+      shape_ssa[i] = codegen.GetOrEmitConstant(ci->value_, DataType::INDEX);
+    } else {
+      shape_ssa[i] = codegen.EmitCastToIndex(shape[i], codegen.GetExprAsCode(shape[i]));
+    }
+  }
+  std::vector<std::string> stride_ssa(rank);
+  stride_ssa[rank - 1] = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+  for (size_t j = rank - 1; j > 0; --j) {
+    std::string mul = codegen.NewTemp();
+    codegen.Emit(mul + " = arith.muli " + stride_ssa[j] + ", " + shape_ssa[j] + " : index");
+    stride_ssa[j - 1] = mul;
+  }
+
+  std::string peer_view = codegen.NewTemp();
+  std::ostringstream view_type;
+  view_type << "!pto.tensor_view<";
+  for (size_t i = 0; i < rank; ++i) {
+    if (i > 0) view_type << "x";
+    view_type << "?";
+  }
+  view_type << "x" << dtype_str << ">";
+
+  std::ostringstream mv;
+  mv << peer_view << " = pto.make_tensor_view " << peer_ptr << ", shape = [";
+  for (size_t i = 0; i < rank; ++i) {
+    if (i > 0) mv << ", ";
+    mv << shape_ssa[i];
+  }
+  mv << "], strides = [";
+  for (size_t i = 0; i < rank; ++i) {
+    if (i > 0) mv << ", ";
+    mv << stride_ssa[i];
+  }
+  mv << "] {layout = #pto.layout<nd>} : " << view_type.str();
+  codegen.Emit(mv.str());
+
+  return {peer_view, view_type.str()};
+}
+
+}  // namespace
+
+// pld.tile.remote_load(target, peer, offsets, shape) — load a peer's slice of
+// a window-bound DistributedTensor into a local tile. Lowers to:
+//   delems = func.call @CommRemoteOffset_<dtype>(ctx, peer) : ... -> index
+//   peer_ptr = pto.addptr local_ptr, delems
+//   peer_view = pto.make_tensor_view peer_ptr, shape=..., strides=...
+//   pto.partition_view peer_view, offsets=..., sizes=<shape>
+//   pto.tload ins(<pview>) outs(<tile>)
+static std::string MakeRemoteLoadCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+  CHECK(op->args_.size() == 4) << "pld.tile.remote_load requires 4 arguments (target, peer, offsets, "
+                                  "shape), got "
+                               << op->args_.size();
+
+  auto binding = ResolveDistTensorBinding(op->args_[0], codegen, "pld.tile.remote_load");
+  auto offsets_tuple = As<ir::MakeTuple>(op->args_[2]);
+  INTERNAL_CHECK_SPAN(offsets_tuple, op->span_) << "pld.tile.remote_load offsets must be MakeTuple";
+  auto shapes_tuple = As<ir::MakeTuple>(op->args_[3]);
+  INTERNAL_CHECK_SPAN(shapes_tuple, op->span_) << "pld.tile.remote_load shape must be MakeTuple";
+
+  auto peer_view = EmitCommRemoteView(binding, op->args_[1], codegen);
+
+  const std::string dtype_str = codegen.GetTypeString(binding.type->dtype_);
+  const auto& offset_elems = offsets_tuple->elements_;
+  const auto& shape_elems = shapes_tuple->elements_;
+  std::string partition_type = MakePartitionTensorViewType(GetDimStrings(shape_elems), dtype_str);
+  std::string partition_view = EmitPartitionViewPTO(
+      binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str, partition_type,
+      GetExprCodes(offset_elems, codegen), GetSizeCodes(shape_elems, codegen), codegen);
+
+  std::string tile_buf = codegen.GetCurrentResultTarget();
+  INTERNAL_CHECK_SPAN(!tile_buf.empty(), op->span_)
+      << "pld.tile.remote_load requires assignment target (tile_buf)";
+  std::string tile_buf_type = codegen.GetCurrentResultTileBufTypeString();
+
+  std::ostringstream tload;
+  tload << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(" << tile_buf << " : "
+        << tile_buf_type << ")";
+  codegen.Emit(tload.str());
+  return "";
+}
+
+// pld.system.notify(target, peer, offsets, value, *, op) — atomically signal a
+// peer rank's slot in a DistributedTensor signal matrix.
+//   delems = func.call @CommRemoteOffset_<dtype>(ctx, peer) : ... -> index
+//   peer_ptr = pto.addptr local_ptr, delems
+//   peer_view = pto.make_tensor_view peer_ptr, shape=..., strides=...
+//   pto.partition_view peer_view, sizes=[1, ..., 1]
+//   pto.comm.tnotify(<pview>, <value>) {notifyOp = #pto<notify_op (set|atomic_add)>}
+static std::string MakeNotifyCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+  CHECK(op->args_.size() == 4) << "pld.system.notify requires 4 arguments (target, peer, offsets, "
+                                  "value), got "
+                               << op->args_.size();
+
+  auto binding = ResolveDistTensorBinding(op->args_[0], codegen, "pld.system.notify");
+  auto offsets_tuple = As<ir::MakeTuple>(op->args_[2]);
+  INTERNAL_CHECK_SPAN(offsets_tuple, op->span_) << "pld.system.notify offsets must be MakeTuple";
+
+  const int notify_op_int = op->GetKwarg<int>("op", 0);
+  CHECK(notify_op_int == static_cast<int>(ir::NotifyOp::kAtomicAdd) ||
+        notify_op_int == static_cast<int>(ir::NotifyOp::kSet))
+      << "pld.system.notify op kwarg must encode NotifyOp::kAtomicAdd or kSet, got " << notify_op_int;
+  const std::string notify_attr =
+      notify_op_int == static_cast<int>(ir::NotifyOp::kAtomicAdd) ? "atomic_add" : "set";
+
+  auto peer_view = EmitCommRemoteView(binding, op->args_[1], codegen);
+
+  // Notify slot is a single signal cell — partition_view sizes are 1 per dim.
+  const std::string dtype_str = codegen.GetTypeString(binding.type->dtype_);
+  const size_t rank = binding.type->shape_.size();
+  std::vector<std::string> one_dims(rank, "1");
+  std::vector<std::string> one_size_ssa(rank,
+                                        codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX));
+  std::string partition_type = MakePartitionTensorViewType(one_dims, dtype_str);
+  std::string partition_view = EmitPartitionViewPTO(
+      binding.var->name_hint_ + "_peer", peer_view.ssa, peer_view.view_type_str, partition_type,
+      GetExprCodes(offsets_tuple->elements_, codegen), one_size_ssa, codegen);
+
+  // PTOAS contract: tnotify value's MLIR type must match the signal element
+  // type. Emit using the value's own ScalarType — mismatched IR-level dtypes
+  // surface here as a PTOAS verifier diagnostic rather than as silently
+  // garbled DMA.
+  std::string value_ssa = codegen.GetExprAsCode(op->args_[3]);
+  auto value_scalar = As<ir::ScalarType>(op->args_[3]->GetType());
+  CHECK(value_scalar) << "pld.system.notify value must have ScalarType, got "
+                      << op->args_[3]->GetType()->TypeName();
+  std::string value_type = codegen.GetTypeString(value_scalar->dtype_);
+  std::ostringstream tnotify;
+  tnotify << "pto.comm.tnotify(" << partition_view << ", " << value_ssa << " : " << partition_type << ", "
+          << value_type << ") {notifyOp = #pto<notify_op " << notify_attr << ">}";
+  codegen.Emit(tnotify.str());
+  return "";
+}
+
+// pld.system.wait(signal, offsets, expected, *, cmp) — block until local signal
+// slot satisfies cmp against expected. wait is local (no peer arithmetic):
+//   pto.partition_view <local_view>, offsets=..., sizes=[1,..,1]
+//   pto.comm.twait(<pview>, <expected>) {cmp = #pto<wait_cmp (eq|ge)>}
+static std::string MakeWaitCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+  CHECK(op->args_.size() == 3) << "pld.system.wait requires 3 arguments (signal, offsets, expected), got "
+                               << op->args_.size();
+
+  auto signal_var = AsVarLike(op->args_[0]);
+  CHECK(signal_var) << "pld.system.wait signal must be a Var-like expression";
+  auto dist_type = As<ir::DistributedTensorType>(signal_var->GetType());
+  CHECK(dist_type) << "pld.system.wait signal must be DistributedTensorType, got "
+                   << signal_var->GetType()->TypeName();
+
+  auto offsets_tuple = As<ir::MakeTuple>(op->args_[1]);
+  INTERNAL_CHECK_SPAN(offsets_tuple, op->span_) << "pld.system.wait offsets must be MakeTuple";
+
+  const int cmp_int = op->GetKwarg<int>("cmp", 0);
+  CHECK(cmp_int == static_cast<int>(ir::WaitCmp::kEq) || cmp_int == static_cast<int>(ir::WaitCmp::kGe))
+      << "pld.system.wait cmp kwarg must encode WaitCmp::kEq or kGe, got " << cmp_int;
+  const std::string cmp_attr = cmp_int == static_cast<int>(ir::WaitCmp::kEq) ? "eq" : "ge";
+
+  // Reuse the local tensor_view created by EmitMakeTensorViews — wait only
+  // touches the local signal slot.
+  std::string local_view = codegen.GetOrCreateTensorView(signal_var);
+  std::ostringstream local_view_type;
+  local_view_type << "!pto.tensor_view<";
+  const auto& shape = dist_type->shape_;
+  const size_t rank = shape.size();
+  for (size_t i = 0; i < rank; ++i) {
+    if (i > 0) local_view_type << "x";
+    if (auto ci = As<ir::ConstInt>(shape[i])) {
+      local_view_type << ci->value_;
+    } else {
+      local_view_type << "?";
+    }
+  }
+  const std::string dtype_str = codegen.GetTypeString(dist_type->dtype_);
+  local_view_type << "x" << dtype_str << ">";
+
+  std::vector<std::string> one_dims(rank, "1");
+  std::vector<std::string> one_size_ssa(rank,
+                                        codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX));
+  std::string partition_type = MakePartitionTensorViewType(one_dims, dtype_str);
+  std::string partition_view = EmitPartitionViewPTO(
+      signal_var->name_hint_ + "_local", local_view, local_view_type.str(), partition_type,
+      GetExprCodes(offsets_tuple->elements_, codegen), one_size_ssa, codegen);
+
+  // PTOAS contract: twait expected value's MLIR type must match the signal
+  // element type. Emit using the expected value's own ScalarType — see notify
+  // codegen above for the rationale.
+  std::string expected_ssa = codegen.GetExprAsCode(op->args_[2]);
+  auto expected_scalar = As<ir::ScalarType>(op->args_[2]->GetType());
+  CHECK(expected_scalar) << "pld.system.wait expected must have ScalarType, got "
+                         << op->args_[2]->GetType()->TypeName();
+  std::string expected_type = codegen.GetTypeString(expected_scalar->dtype_);
+  std::ostringstream twait;
+  twait << "pto.comm.twait(" << partition_view << ", " << expected_ssa << " : " << partition_type << ", "
+        << expected_type << ") {cmp = #pto<wait_cmp " << cmp_attr << ">}";
+  codegen.Emit(twait.str());
+  return "";
+}
+
+// ============================================================================
 // RegisterPTOOps: Register all standard PTO ops to the given backend
 // ============================================================================
 
@@ -2282,6 +2605,23 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
   reg("tile.store", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeTileStoreCodegenPTO(op, codegen);
   });
+  // Distributed N6 ops — cross-rank tile load + per-rank signal notify/wait.
+  // See MakeRemoteLoadCodegenPTO / MakeNotifyCodegenPTO / MakeWaitCodegenPTO
+  // for the emitted MLIR shape. Cross-rank ops lower to a single
+  // ``func.call @CommRemoteOffset_<dtype>`` against a module-level helper
+  // emitted by PTOCodegen::EmitCommRemoteOffsetHelpers; the helper returns
+  // the peer-vs-local element offset (``index``) and the call site emits
+  // ``pto.addptr`` + ``pto.make_tensor_view`` locally so PTOAS's per-func
+  // "addptr must feed make_tensor_view" check is satisfied. The helper's
+  // byte-offset literals are pinned to ``comm_layout::k*`` constants
+  // (PyPTO compile-time static_asserts catch any CommContext ABI drift).
+  reg("pld.tile.remote_load", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeRemoteLoadCodegenPTO(op, codegen);
+  });
+  reg("pld.system.notify",
+      [](const ir::CallPtr& op, codegen::CodegenBase& codegen) { return MakeNotifyCodegenPTO(op, codegen); });
+  reg("pld.system.wait",
+      [](const ir::CallPtr& op, codegen::CodegenBase& codegen) { return MakeWaitCodegenPTO(op, codegen); });
   reg("tile.transpose", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeTileTransposeCodegenPTO(op, codegen);
   });
