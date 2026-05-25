@@ -524,6 +524,10 @@ void OpConversionRegistry::RegisterMemoryOps() {
       });
 
   // tensor.read → tensor.read (gm_tensor) or tile.read (local_tensor)
+  // ``AsTensorTypeLike`` matches both ``TensorType`` and ``DistributedTensorType``
+  // (a window-bound TensorType subclass). Distributed-tensor reads on the
+  // local rank's slice have identical semantics to a plain GM read — they
+  // ride the same lowered ``tensor.read`` op.
   RegisterCustom(
       "tensor.read",
       [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
@@ -532,7 +536,7 @@ void OpConversionRegistry::RegisterMemoryOps() {
         auto& op_reg = OpRegistry::GetInstance();
         const auto& input = args[0];
 
-        if (As<TensorType>(input->GetType())) {
+        if (AsTensorTypeLike(input->GetType())) {
           if (kwargs.empty()) {
             return ConversionResult{op_reg.Create("tensor.read", args, span)};
           }
@@ -551,6 +555,7 @@ void OpConversionRegistry::RegisterMemoryOps() {
       });
 
   // tensor.write → tensor.write (gm_tensor) or tile.write (local_tensor)
+  // See tensor.read above for the ``AsTensorTypeLike`` rationale.
   RegisterCustom(
       "tensor.write",
       [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
@@ -559,7 +564,7 @@ void OpConversionRegistry::RegisterMemoryOps() {
         auto& op_reg = OpRegistry::GetInstance();
         const auto& dest = args[0];
 
-        if (As<TensorType>(dest->GetType())) {
+        if (AsTensorTypeLike(dest->GetType())) {
           if (kwargs.empty()) {
             return ConversionResult{op_reg.Create("tensor.write", args, span)};
           }
