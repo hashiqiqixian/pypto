@@ -68,9 +68,10 @@ namespace {
 
 TypePtr DeducePutType(const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-  CHECK(args.size() == 3) << "pld.tensor.put requires exactly 3 positional arguments "
-                             "(dst, peer, src), but got "
-                          << args.size();
+  CHECK(args.size() == 3 || args.size() == 6)
+      << "pld.tensor.put requires 3 positional arguments (dst, peer, src) or 6 "
+         "(dst, peer, src, dst_offsets, src_offsets, shape), but got "
+      << args.size();
   for (size_t i = 0; i < args.size(); ++i) {
     CHECK(args[i]) << "pld.tensor.put positional argument #" << i << " must not be null";
   }
@@ -98,15 +99,36 @@ TypePtr DeducePutType(const std::vector<ExprPtr>& args,
   CHECK(!dst_shape.empty()) << "pld.tensor.put requires at least one dimension on dst/src";
   CHECK(dst_shape.size() == src_shape.size()) << "pld.tensor.put dst rank (" << dst_shape.size()
                                               << ") must match src rank (" << src_shape.size() << ")";
-  for (size_t i = 0; i < dst_shape.size(); ++i) {
-    auto d = As<ConstInt>(dst_shape[i]);
-    auto s = As<ConstInt>(src_shape[i]);
-    CHECK(d && s) << "pld.tensor.put requires static (compile-time constant) shapes on dst and src; "
-                     "dimension "
-                  << i << " is dynamic";
-    CHECK(d->value_ > 0) << "pld.tensor.put shape dimension " << i << " must be positive, got " << d->value_;
-    CHECK(d->value_ == s->value_) << "pld.tensor.put dst and src must have the same static shape; dimension "
-                                  << i << " differs (dst=" << d->value_ << ", src=" << s->value_ << ")";
+  if (args.size() == 3) {
+    for (size_t i = 0; i < dst_shape.size(); ++i) {
+      auto d = As<ConstInt>(dst_shape[i]);
+      auto s = As<ConstInt>(src_shape[i]);
+      CHECK(d && s) << "pld.tensor.put requires static (compile-time constant) shapes on dst and src; "
+                       "dimension "
+                    << i << " is dynamic";
+      CHECK(d->value_ > 0) << "pld.tensor.put shape dimension " << i << " must be positive, got " << d->value_;
+      CHECK(d->value_ == s->value_) << "pld.tensor.put dst and src must have the same static shape; dimension "
+                                    << i << " differs (dst=" << d->value_ << ", src=" << s->value_ << ")";
+    }
+  } else {
+    auto dst_offsets = As<MakeTuple>(args[3]);
+    auto src_offsets = As<MakeTuple>(args[4]);
+    auto transfer_shape = As<MakeTuple>(args[5]);
+    CHECK(dst_offsets) << "pld.tensor.put dst_offsets must be a tuple";
+    CHECK(src_offsets) << "pld.tensor.put src_offsets must be a tuple";
+    CHECK(transfer_shape) << "pld.tensor.put shape must be a tuple";
+    CHECK(dst_offsets->elements_.size() == dst_shape.size())
+        << "pld.tensor.put dst_offsets rank must match dst rank";
+    CHECK(src_offsets->elements_.size() == src_shape.size())
+        << "pld.tensor.put src_offsets rank must match src rank";
+    CHECK(transfer_shape->elements_.size() == dst_shape.size())
+        << "pld.tensor.put shape rank must match tensor rank";
+    for (size_t i = 0; i < transfer_shape->elements_.size(); ++i) {
+      auto dim = As<ConstInt>(transfer_shape->elements_[i]);
+      CHECK(dim) << "pld.tensor.put shape dimensions must be static constants";
+      CHECK(dim->value_ > 0) << "pld.tensor.put shape dimension " << i << " must be positive, got "
+                             << dim->value_;
+    }
   }
 
   auto atomic_value = GetRequiredKwarg<int>(kwargs, "atomic", "pld.tensor.put");
@@ -134,7 +156,7 @@ REGISTER_OP("pld.tensor.put")
     .set_op_category("DistributedOp")
     .add_argument("dst", "Remote (peer) window-bound DistributedTensor destination")
     .add_argument("peer", "Peer rank index (ScalarType, integer)")
-    .add_argument("src", "Local window-bound DistributedTensor source (same dtype + static shape as dst)")
+    .add_argument("src", "Local window-bound DistributedTensor source (same dtype as dst)")
     .set_attr<int>("atomic")
     .no_memory_spec()
     .f_deduce_type(DeducePutType);
