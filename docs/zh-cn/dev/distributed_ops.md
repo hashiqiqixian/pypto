@@ -33,8 +33,9 @@ SSA 值而存在。
   不出现在 DSL 表面。因此它是 `pld.tensor.alloc_window_buffer` /
   `pld.tensor.window` 的兄弟,而**不是**产出 tile 的 `remote_load` 的兄弟。
 - **`pld.tensor.put`** 读写 *tensor*（GM）操作数 —— `dst` 和 `src` 都是窗口绑定的
-  `DistributedTensor` 视图,TPUT 中转用的 VEC staging tile 在 codegen 阶段合成,
-  不出现在 DSL 表面。因此它是 `pld.tensor.alloc_window_buffer` /
+  `DistributedTensor` 视图。面向 Python 的算子仍停留在 tensor 层级,随后由
+  `ConvertTensorToTileOps` 在 PTO codegen 之前下降为显式的 `tile.create` staging
+  tile 加 `pld.tile.put`。因此它是 `pld.tensor.alloc_window_buffer` /
   `pld.tensor.window` 的兄弟,而**不是**产出 tile 的 `remote_load` 的兄弟。
 - **`pld.system.notify` / `pld.system.wait`** 驱动按 rank 的信号槽位 —— 纯控制面
   同步,无数据操作数 —— 因此归入 `pld.system`。
@@ -89,17 +90,25 @@ DSL（`python/pypto/language/distributed/op/tile_ops.py`）把 `peer` / `offsets
 
 ```text
 pld.tensor.put(dst, peer, src, *, atomic: int) -> Unknown
+pld.tensor.put(dst, peer, src, dst_offsets, src_offsets, shape, *, atomic: int) -> Unknown
 ```
 
-同步地把本地窗口绑定的 `src` 写入 `peer` rank 的窗口绑定 `dst` 切片。两个操作数
-都是 GM 层级的 `DistributedTensor` 视图；VEC staging tile 在 codegen 时合成
-（`src/backend/common/pto_ops_common.cpp` 中的 `MakePutCodegenPTO`）,不出现在
-DSL 表面。
+同步地把本地窗口绑定的 `src` 写入 `peer` rank 的窗口绑定 `dst` 切片。3 参数形式
+会把整个本地 `src` 切片写入 peer 的 `dst` 切片；6 参数形式会把
+`src[src_offsets : src_offsets + shape]` 写入
+`peer.dst[dst_offsets : dst_offsets + shape]`,也就是 EP dispatch/combine 路由中
+需要的 row/subview put。
+
+两个操作数都是 GM 层级的 `DistributedTensor` 视图。DSL 表面不会暴露 tile 参数；
+`ConvertTensorToTileOps` 会插入一个大小为 `prod(shape)` 的 `tile.create` staging
+tile（3 参数整块形式则使用完整 tensor shape）,并把调用改写为内部
+`pld.tile.put`。
 
 Verifier：`dst` / `src` 必须都是 `DistributedTensorType`；`peer` 必须是
-`ScalarType`；`dst` 与 `src` 必须 element type 相同且形状为相同的**正的静态
-（positive static）**形状（staging VEC 缓冲需要编译期范围）。`atomic` 选择覆盖
-还是原子加（见 `AtomicType`）。
+`ScalarType`；`dst` 与 `src` 必须 element type 和 rank 相同。整块形式还要求二者
+具有相同的**正的静态（positive static）**形状。subregion 形式要求
+`dst_offsets`、`src_offsets`、`shape` 的 rank 与 tensor rank 一致,且 transfer
+shape 的每一维都是正的静态常量。`atomic` 选择覆盖还是原子加（见 `AtomicType`）。
 
 ### `pld.tensor.get`（TGET）
 

@@ -1621,27 +1621,36 @@ void OpConversionRegistry::RegisterDistributedOps() {
       "pld.tensor.put",
       [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
          const Span& span) -> ConversionResult {
-        CHECK(args.size() == 3) << "pld.tensor.put conversion expects 3 args (dst, peer, src), got "
-                                << args.size();
+        CHECK(args.size() == 3 || args.size() == 6)
+            << "pld.tensor.put conversion expects 3 args (dst, peer, src) or 6 "
+               "(dst, peer, src, dst_offsets, src_offsets, shape), got "
+            << args.size();
         auto& op_reg = OpRegistry::GetInstance();
 
         auto dst_type = As<DistributedTensorType>(args[0]->GetType());
         CHECK(dst_type) << "pld.tensor.put conversion: dst must be DistributedTensorType, got "
                         << args[0]->GetType()->TypeName();
-        const auto& shape = dst_type->shape_;
-        CHECK(!shape.empty()) << "pld.tensor.put conversion: dst requires rank >= 1";
+        std::vector<ExprPtr> transfer_shape;
+        if (args.size() == 3) {
+          transfer_shape = dst_type->shape_;
+        } else {
+          auto shape_tuple = As<MakeTuple>(args[5]);
+          CHECK(shape_tuple) << "pld.tensor.put conversion: shape must be MakeTuple";
+          transfer_shape = shape_tuple->elements_;
+        }
+        CHECK(!transfer_shape.empty()) << "pld.tensor.put conversion: transfer shape requires rank >= 1";
 
         // Flatten N-D to [rows, cols]: rows = ∏ leading dims, cols = innermost.
         int64_t cols_val = 0;
         {
-          auto last = As<ConstInt>(shape.back());
-          CHECK(last) << "pld.tensor.put conversion: dst innermost dimension must be ConstInt";
+          auto last = As<ConstInt>(transfer_shape.back());
+          CHECK(last) << "pld.tensor.put conversion: transfer innermost dimension must be ConstInt";
           cols_val = last->value_;
         }
         int64_t rows_val = 1;
-        for (size_t i = 0; i + 1 < shape.size(); ++i) {
-          auto d = As<ConstInt>(shape[i]);
-          CHECK(d) << "pld.tensor.put conversion: dst dimension " << i << " must be ConstInt";
+        for (size_t i = 0; i + 1 < transfer_shape.size(); ++i) {
+          auto d = As<ConstInt>(transfer_shape[i]);
+          CHECK(d) << "pld.tensor.put conversion: transfer dimension " << i << " must be ConstInt";
           rows_val *= d->value_;
         }
         auto rows_expr = std::make_shared<ConstInt>(rows_val, DataType::INDEX, span);
@@ -1655,7 +1664,11 @@ void OpConversionRegistry::RegisterDistributedOps() {
         std::vector<StmtPtr> prologue;
         prologue.push_back(std::make_shared<AssignStmt>(stage_var, create_call, span));
 
-        auto put_call = op_reg.Create("pld.tile.put", {args[0], args[1], args[2], stage_var}, kwargs, span);
+        std::vector<ExprPtr> tile_put_args = {args[0], args[1], args[2], stage_var};
+        if (args.size() == 6) {
+          tile_put_args.insert(tile_put_args.end(), args.begin() + 3, args.end());
+        }
+        auto put_call = op_reg.Create("pld.tile.put", tile_put_args, kwargs, span);
         return ConversionResult{std::move(prologue), put_call};
       });
 }

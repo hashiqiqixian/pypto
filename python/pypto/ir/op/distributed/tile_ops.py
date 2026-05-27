@@ -61,16 +61,28 @@ def put(
     peer: int | Expr,
     src: Expr,
     stage: Expr,
-    atomic: AtomicType,
+    dst_offsets: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    src_offsets: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    atomic: AtomicType = AtomicType.None_,
     *,
     span: Span | None = None,
 ) -> Call:
     """Build a ``pld.tile.put(dst, peer, src, stage)`` Call (post-conversion form)."""
     actual_span = _get_span_or_capture(span, frame_offset=1)
     peer_expr = _normalize_expr(peer, actual_span, int_dtype=DataType.INT32)
-    return _ir_core.create_op_call(
-        "pld.tile.put", [dst, peer_expr, src, stage], {"atomic": int(atomic)}, actual_span
-    )
+    args: list[Expr] = [dst, peer_expr, src, stage]
+    if (dst_offsets is None) != (src_offsets is None) or (dst_offsets is None) != (shape is None):
+        raise ValueError("pld.tile.put dst_offsets, src_offsets, and shape must be provided together")
+    if dst_offsets is not None and src_offsets is not None and shape is not None:
+        args.extend(
+            [
+                _to_make_tuple(dst_offsets, actual_span),
+                _to_make_tuple(src_offsets, actual_span),
+                _to_make_tuple(shape, actual_span),
+            ]
+        )
+    return _ir_core.create_op_call("pld.tile.put", args, {"atomic": int(atomic)}, actual_span)
 
 
 __all__ = ["remote_load", "put"]

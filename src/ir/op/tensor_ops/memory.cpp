@@ -157,10 +157,13 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
       << "tensor.slice requires 3-5 arguments (input, shape, offset[, valid_shape[, drop_dims]]), but got "
       << args.size();
 
-  // First argument must be TensorType
+  // First argument must be TensorType. DistributedTensorType is intentionally
+  // a precise ObjectKind, so check it explicitly and preserve it on the result.
+  auto dist_tensor_type = As<DistributedTensorType>(args[0]->GetType());
   auto tensor_type = As<TensorType>(args[0]->GetType());
-  CHECK(tensor_type) << "tensor.slice requires first argument to be a TensorType, but got "
-                     << args[0]->GetType()->TypeName();
+  CHECK(tensor_type || dist_tensor_type) << "tensor.slice requires first argument to be a TensorType, but got "
+                                        << args[0]->GetType()->TypeName();
+  const auto& input_dtype = dist_tensor_type ? dist_tensor_type->dtype_ : tensor_type->dtype_;
 
   // Second argument must be TupleType (shape)
   auto shape_tuple_type = As<TupleType>(args[1]->GetType());
@@ -249,19 +252,29 @@ TypePtr DeduceTensorSliceType(const std::vector<ExprPtr>& args,
     }
   }
 
-  // View preserves dtype but has new shape (which can have different rank than input).
-  // If valid_shape is provided or pad_value is set, build a TensorView.
+  auto make_result_type = [&](std::optional<TensorView> tensor_view) -> TypePtr {
+    if (dist_tensor_type) {
+      return std::make_shared<DistributedTensorType>(new_shape, input_dtype, std::nullopt, std::move(tensor_view),
+                                                     dist_tensor_type->window_buffer_);
+    }
+    if (tensor_view.has_value()) {
+      return std::make_shared<TensorType>(new_shape, input_dtype, std::nullopt, std::move(tensor_view));
+    }
+    return std::make_shared<TensorType>(new_shape, input_dtype);
+  };
+
+  // View preserves dtype and DistributedTensor identity but has new shape
+  // (which can have different rank than input). If valid_shape is provided or
+  // pad_value is set, build a TensorView.
   if (has_valid_shape) {
     TensorView tensor_view({}, TensorLayout::ND, valid_shape, pad_value);
-    return std::make_shared<TensorType>(new_shape, tensor_type->dtype_, std::nullopt,
-                                        std::make_optional(std::move(tensor_view)));
+    return make_result_type(std::make_optional(std::move(tensor_view)));
   }
   if (pad_value != PadValue::null) {
     TensorView tensor_view(std::vector<ExprPtr>{}, TensorLayout::ND, std::vector<ExprPtr>{}, pad_value);
-    return std::make_shared<TensorType>(new_shape, tensor_type->dtype_, std::nullopt,
-                                        std::make_optional(std::move(tensor_view)));
+    return make_result_type(std::make_optional(std::move(tensor_view)));
   }
-  return std::make_shared<TensorType>(new_shape, tensor_type->dtype_);
+  return make_result_type(std::nullopt);
 }
 
 TypePtr DeduceTensorFillpadType(const std::vector<ExprPtr>& args,

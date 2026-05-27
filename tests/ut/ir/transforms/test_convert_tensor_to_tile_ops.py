@@ -443,6 +443,52 @@ class TestConvertTensorToTileOps:
         assert stage_type.dtype == pl.FP16
         assert stage_type.memory_space == MemorySpace.Vec
 
+    def test_put_subregion_emits_transfer_sized_stage_and_offsets(self):
+        """Subregion pld.tensor.put keeps offsets and sizes through tile conversion."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                dst: pld.DistributedTensor[[16, 64], pl.FP16],
+                src: pld.DistributedTensor[[8, 64], pl.FP16],
+                peer: pl.Scalar[pl.INT32],
+            ):
+                pld.tensor.put(
+                    dst,
+                    peer=peer,
+                    src=src,
+                    dst_offsets=[3, 0],
+                    src_offsets=[1, 0],
+                    shape=[1, 64],
+                    atomic=pld.AtomicType.None_,
+                )
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        kernel = After.get_function("kernel")
+        assert kernel is not None, "kernel function missing after conversion"
+
+        assert _find_first_call_to(kernel, "pld.tensor.put") is None
+        put_call = _find_first_call_to(kernel, "pld.tile.put")
+        assert put_call is not None, "expected pld.tile.put after conversion"
+        assert len(put_call.args) == 7
+
+        stage_arg = put_call.args[3]
+        assert isinstance(stage_arg, ir.Var)
+        stage_type = stage_arg.type
+        assert isinstance(stage_type, ir.TileType)
+        shape_vals: list[int] = []
+        for d in stage_type.shape:
+            assert isinstance(d, ir.ConstInt)
+            shape_vals.append(d.value)
+        assert shape_vals == [1, 64]
+        assert stage_type.dtype == pl.FP16
+        assert stage_type.memory_space == MemorySpace.Vec
+
+        for tuple_arg in put_call.args[4:]:
+            assert isinstance(tuple_arg, ir.MakeTuple)
+
     def test_rsqrt_high_precision_conversion(self):
         """tensor.rsqrt(high_precision=True) allocates a tmp tile and lowers to 2-arg tile.rsqrt."""
         in_specs: list[InSpec] = [("x", [64], DataType.FP32)]

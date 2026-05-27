@@ -92,5 +92,40 @@ def test_put_round_trips_through_printer_and_parser():
     ir.assert_structural_equal(P, reparsed)
 
 
+def test_put_accepts_sliced_distributed_tensor_operands():
+    """EP-style row traffic can be expressed as sliced DistributedTensor puts."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            dst: pld.DistributedTensor[[2, 64], pl.FP32],
+            src: pld.DistributedTensor[[2, 64], pl.FP32],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            dst_row = dst[1:2, 0:64]
+            src_row = src[1:2, 0:64]
+            pld.tensor.put(dst_row, peer=peer, src=src_row, atomic=pld.AtomicType.None_)
+
+    func = _get_func(P, "kernel")
+    put_calls = [
+        stmt.expr
+        for stmt in _iter_stmts(func.body)
+        if isinstance(stmt, ir.EvalStmt)
+        and isinstance(stmt.expr, ir.Call)
+        and stmt.expr.op.name == "pld.tensor.put"
+    ]
+    assert len(put_calls) == 1
+    call = put_calls[0]
+    assert len(call.args) == 3
+    assert isinstance(call.args[0], ir.Call)
+    assert call.args[0].op.name == "tensor.slice"
+    assert isinstance(call.args[0].type, ir.DistributedTensorType)
+    assert isinstance(call.args[2], ir.Call)
+    assert call.args[2].op.name == "tensor.slice"
+    assert isinstance(call.args[2].type, ir.DistributedTensorType)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

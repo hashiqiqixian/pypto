@@ -5604,7 +5604,7 @@ class ASTParser:
 
         if isinstance(value_type, ir.TupleType):
             return self._parse_tuple_subscript(subscript, value_expr, span)
-        if isinstance(value_type, ir.TensorType):
+        if isinstance(value_type, (ir.DistributedTensorType, ir.TensorType)):
             return self._parse_tensor_subscript(subscript, value_expr, value_type, span)
         if isinstance(value_type, ir.TileType):
             return self._parse_tile_subscript(subscript, value_expr, value_type, span)

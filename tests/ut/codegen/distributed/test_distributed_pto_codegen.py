@@ -457,6 +457,38 @@ def test_put_atomic_add_variant():
     assert "!pto.partition_tensor_view<128xf32>" in mlir_add
 
 
+def test_put_subregion_uses_offset_partition_views():
+    """offset put lowers dst/src subregions to matching partition views."""
+
+    @pl.program
+    class PSubregion:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            dst: pld.DistributedTensor[[16, 64], pl.FP16],
+            src: pld.DistributedTensor[[8, 64], pl.FP16],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            pld.tensor.put(
+                dst,
+                peer=peer,
+                src=src,
+                dst_offsets=[3, 0],
+                src_offsets=[1, 0],
+                shape=[1, 64],
+                atomic=pld.AtomicType.None_,
+            )
+
+    mlir = _generate_mlir(PSubregion)
+    tput_line = next(line for line in mlir.splitlines() if "pto.comm.tput(" in line)
+    partition_lines = [line for line in mlir.splitlines() if "pto.partition_view" in line]
+    assert tput_line.count("!pto.partition_tensor_view<1x64xf16>") == 2
+    assert any("offsets = [%c3" in line and "%c0" in line for line in partition_lines)
+    assert any("offsets = [%c1" in line and "%c0" in line for line in partition_lines)
+    assert mlir.count("pto.barrier <PIPE_ALL>") == 2
+    assert "!pto.tile_buf<loc=vec" in mlir
+
+
 def test_get_emits_comm_tget_with_staging_tile():
     """get codegen emits pto.comm.tget with a VEC staging tile."""
 

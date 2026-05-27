@@ -31,7 +31,7 @@ from collections.abc import Callable
 from typing import Any
 
 from pypto.ir.utils import use_parser_span
-from pypto.language.distributed.typing import CommCtx
+from pypto.language.distributed.typing import CommCtx, DistributedTensor
 from pypto.language.typing import Array, Ptr, Scalar, Tensor, Tile
 from pypto.pypto_core import ir
 
@@ -67,6 +67,8 @@ def _wrap_arg(arg: Any) -> Any:
     if isinstance(arg, (ir.ConstInt, ir.ConstFloat)):
         return arg
     t = arg.type
+    if isinstance(t, ir.DistributedTensorType):
+        return DistributedTensor(expr=arg)
     if isinstance(t, ir.TensorType):
         return Tensor(expr=arg)
     if isinstance(t, ir.TileType):
@@ -92,7 +94,7 @@ def _unwrap_result(value: Any) -> Any:
     expects the bare Call so it can rebind ``_tuple_tmp`` and re-emit the
     ``TupleGetItemExpr``s; here we recover that Call.
     """
-    if isinstance(value, (Tensor, Tile, Scalar, Array, Ptr, CommCtx)):
+    if isinstance(value, (Tensor, Tile, Scalar, Array, Ptr, CommCtx, DistributedTensor)):
         return value.unwrap()
     if isinstance(value, tuple) and value and all(isinstance(v, (Tensor, Tile, Scalar)) for v in value):
         unwrapped = tuple(v.unwrap() for v in value)

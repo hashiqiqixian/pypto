@@ -36,9 +36,10 @@ The namespace encodes the IR level the op lives at, not an arbitrary grouping:
   surface. It is therefore a sibling of `pld.tensor.alloc_window_buffer` /
   `pld.tensor.window`, **not** of the tile-producing `remote_load`.
 - **`pld.tensor.put`** reads and writes *tensor* (GM) operands — both `dst` and
-  `src` are window-bound `DistributedTensor` views and the VEC staging tile
-  that TPUT bounces through is synthesised at codegen, never on the DSL
-  surface. It is therefore a sibling of `pld.tensor.alloc_window_buffer` /
+  `src` are window-bound `DistributedTensor` views. The Python-facing op stays
+  at tensor level, then `ConvertTensorToTileOps` lowers it to an explicit
+  `tile.create` staging tile plus `pld.tile.put` before PTO codegen. It is
+  therefore a sibling of `pld.tensor.alloc_window_buffer` /
   `pld.tensor.window`, **not** of the tile-producing `remote_load`.
 - **`pld.system.notify` / `pld.system.wait`** drive the per-rank signal slot —
   pure control-plane synchronisation with no data operand — so they live in
@@ -97,18 +98,27 @@ positional, matching `tile.load`.
 
 ```text
 pld.tensor.put(dst, peer, src, *, atomic: int) -> Unknown
+pld.tensor.put(dst, peer, src, dst_offsets, src_offsets, shape, *, atomic: int) -> Unknown
 ```
 
 Synchronously writes the local window-bound `src` into the `peer` rank's slice
-of the window-bound `dst`. Both operands are GM-level `DistributedTensor`
-views; the VEC staging tile is synthesised at codegen
-(`MakePutCodegenPTO` in `src/backend/common/pto_ops_common.cpp`) and never
-appears on the DSL surface.
+of the window-bound `dst`. The 3-argument form writes the whole local `src`
+slice into the peer `dst` slice. The 6-argument form writes
+`src[src_offsets : src_offsets + shape]` into
+`peer.dst[dst_offsets : dst_offsets + shape]`, which is the row/subview put
+needed by EP dispatch/combine style routing.
+
+Both operands are GM-level `DistributedTensor` views. The tensor-level op does
+not expose a tile argument in the DSL; `ConvertTensorToTileOps` inserts a
+`tile.create` staging tile sized to `prod(shape)` (or the full tensor shape for
+the 3-argument form) and rewrites the call to the internal `pld.tile.put`.
 
 Verifier: `dst` / `src` must both be `DistributedTensorType`; `peer` must be a
-`ScalarType`; `dst` and `src` must share element type and identical **positive
-static** shape (the staging VEC buffer needs compile-time extents). `atomic`
-selects overwrite vs atomic-add (see `AtomicType`).
+`ScalarType`; `dst` and `src` must share element type and rank. The full-slice
+form also requires identical **positive static** shapes. The subregion form
+requires `dst_offsets`, `src_offsets`, and `shape` to have the same rank as the
+tensors, and every transfer-shape dimension must be a positive static constant.
+`atomic` selects overwrite vs atomic-add (see `AtomicType`).
 
 ### `pld.tensor.get` (TGET)
 
