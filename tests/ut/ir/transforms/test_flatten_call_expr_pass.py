@@ -401,6 +401,39 @@ class TestFlattenCallInForRange:
         After = passes.flatten_call_expr()(Before)
         ir.assert_structural_equal(After, NormalizeIR(Expected))
 
+    def test_nested_call_in_single_eval_for_body(self):
+        """Nested calls in a single-statement loop body stay inside the loop."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[64, 64], pl.FP32], output: pl.Tensor[[64, 64], pl.FP32]
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                for _i in pl.range(10):
+                    pl.tile.store(
+                        pl.tile.load(a, offsets=[0, 0], shapes=[32, 32]),
+                        offsets=[0, 0],
+                        output_tensor=output,
+                    )
+                return output
+
+        @pl.program
+        class Expected:
+            @pl.function
+            def main(
+                self, a: pl.Tensor[[64, 64], pl.FP32], output: pl.Tensor[[64, 64], pl.FP32]
+            ) -> pl.Tensor[[64, 64], pl.FP32]:
+                for _i in pl.range(10):
+                    t__tmp_v0: pl.Tile[[32, 32], pl.FP32] = pl.tile.load(
+                        a, offsets=[0, 0], shapes=[32, 32]
+                    )
+                    pl.tile.store(t__tmp_v0, offsets=[0, 0], output_tensor=output)
+                return output
+
+        After = passes.flatten_call_expr()(Before)
+        ir.assert_structural_equal(After, NormalizeIR(Expected))
+
 
 class TestFlattenComplexNesting:
     """Tests for complex nesting scenarios."""

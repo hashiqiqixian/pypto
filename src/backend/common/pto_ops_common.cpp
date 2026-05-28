@@ -1245,6 +1245,14 @@ static std::string MakePrintCodegenPTO(const std::string& pto_op_name, const Cal
   return "";
 }
 
+static std::string MakeBarrierCodegenPTO(const std::string& pipe_name, const CallPtr& op,
+                                         codegen::CodegenBase& codegen_base) {
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+  CHECK(op->args_.empty()) << op->op_->name_ << " takes no arguments, got " << op->args_.size();
+  codegen.Emit("pto.barrier <" + pipe_name + ">");
+  return "";
+}
+
 // tile.load: emit pto.subview + pto.tload
 static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
@@ -3010,6 +3018,15 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
   });
   reg("tile.store", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeTileStoreCodegenPTO(op, codegen);
+  });
+  reg("system.bar_v", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeBarrierCodegenPTO("PIPE_V", op, codegen);
+  });
+  reg("system.bar_m", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeBarrierCodegenPTO("PIPE_M", op, codegen);
+  });
+  reg("system.bar_all", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeBarrierCodegenPTO("PIPE_ALL", op, codegen);
   });
   // Distributed N6 ops — cross-rank tile load + per-rank signal notify/wait +
   // synchronous bulk get/put. See MakeRemoteLoadCodegenPTO /

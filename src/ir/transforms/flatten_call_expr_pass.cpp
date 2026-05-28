@@ -123,6 +123,21 @@ class FlattenCallExprMutator : public IRMutator {
   int temp_var_counter_ = 0;
   std::vector<StmtPtr> pending_stmts_;
 
+  StmtPtr PrependPendingToBody(const StmtPtr& body, const Span& span) {
+    if (pending_stmts_.empty()) {
+      return body;
+    }
+
+    std::vector<StmtPtr> stmts;
+    stmts.reserve(pending_stmts_.size() + 1);
+    for (const auto& pending : pending_stmts_) {
+      stmts.push_back(pending);
+    }
+    stmts.push_back(body);
+    pending_stmts_.clear();
+    return SeqStmts::Flatten(std::move(stmts), span);
+  }
+
   /**
    * @brief Generate a unique temporary variable name
    */
@@ -245,12 +260,14 @@ StmtPtr FlattenCallExprMutator::VisitStmt_(const IfStmtPtr& op) {
   // Process then branch (after normalization, body is SeqStmts which handles its own pending)
   pending_stmts_.clear();
   auto new_then = VisitStmt(op->then_body_);
+  new_then = PrependPendingToBody(new_then, op->then_body_->span_);
 
   // Process else branch
   pending_stmts_.clear();
   std::optional<StmtPtr> new_else;
   if (op->else_body_.has_value()) {
     new_else = VisitStmt(op->else_body_.value());
+    new_else = PrependPendingToBody(new_else.value(), op->else_body_.value()->span_);
   }
 
   // Restore condition pending for parent to handle
@@ -287,6 +304,7 @@ StmtPtr FlattenCallExprMutator::VisitStmt_(const ForStmtPtr& op) {
   // Process body (after normalization, body is SeqStmts which handles its own pending)
   pending_stmts_.clear();
   auto new_body = VisitStmt(op->body_);
+  new_body = PrependPendingToBody(new_body, op->body_->span_);
 
   // Restore range pending for parent to handle
   pending_stmts_ = range_pending;
@@ -315,6 +333,7 @@ StmtPtr FlattenCallExprMutator::VisitStmt_(const WhileStmtPtr& op) {
   // Process body (after normalization, body is SeqStmts which handles its own pending)
   pending_stmts_.clear();
   auto new_body = VisitStmt(op->body_);
+  new_body = PrependPendingToBody(new_body, op->body_->span_);
 
   // Restore condition pending for parent to handle
   pending_stmts_ = condition_pending;

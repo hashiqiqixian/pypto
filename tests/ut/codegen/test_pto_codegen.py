@@ -225,6 +225,24 @@ def test_pto_codegen_basic_mlir_structure():
     assert "}" in mlir_code
 
 
+def test_pto_codegen_system_barriers():
+    """System barrier DSL ops lower to PTO pipe barriers."""
+
+    @pl.program
+    class BarrierProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def test_func(self):
+            pl.system.bar_v()
+            pl.system.bar_m()
+            pl.system.bar_all()
+
+    mlir_code = _generate_default_mlir(BarrierProgram)
+
+    assert "pto.barrier <PIPE_V>" in mlir_code
+    assert "pto.barrier <PIPE_M>" in mlir_code
+    assert "pto.barrier <PIPE_ALL>" in mlir_code
+
+
 def test_pto_codegen_tensor_parameters():
     """Test that tensor parameters generate correct make_tensor_view."""
 
