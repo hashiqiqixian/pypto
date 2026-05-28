@@ -282,8 +282,13 @@ int DistributedCodegen::EmitCommDomainAllocations() {
     slot_nbytes.push_back(GetExprAsCode(slot->size_));
   }
 
-  // window_size = sum of all slot byte expressions. Parenthesise each summand
-  // to keep operator precedence safe under any sub-expression shape.
+  // window_size = sum of all slot byte expressions, with a 4 KiB floor.
+  // The HCCL/STARS communication window is a runtime allocation unit, not just
+  // the logical payload bytes. The hand-written L3 allreduce keeps this same
+  // floor to avoid minimum-window-size quirks on hardware; generated PyPTO
+  // domains should follow that contract while preserving each slot's exact
+  // CommBufferSpec nbytes below.
+  constexpr int64_t kMinCommWindowBytes = 4 * 1024;
   std::ostringstream window_size_expr;
   if (slot_nbytes.empty()) {
     window_size_expr << "0";
@@ -298,7 +303,8 @@ int DistributedCodegen::EmitCommDomainAllocations() {
   emitter_.IncreaseIndent();
   emitter_.EmitLine(std::string("name=\"") + domain_name + "\",");
   emitter_.EmitLine("workers=" + workers.str() + ",");
-  emitter_.EmitLine("window_size=" + window_size_expr.str() + ",");
+  emitter_.EmitLine("window_size=max(" + window_size_expr.str() + ", " + std::to_string(kMinCommWindowBytes) +
+                    "),");
   emitter_.EmitLine("buffers=[");
   emitter_.IncreaseIndent();
   for (size_t i = 0; i < group->slots_.size(); ++i) {

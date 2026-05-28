@@ -25,6 +25,8 @@ Plus regressions:
 
 * ``pld.system.world_size()`` lowers to the ``world_size`` kwarg in any expr
   context (e.g. ``pl.range(...)``).
+* Communication-domain ``window_size`` is floored to 4 KiB, matching the
+  hand-written runtime L3 allreduce's minimum-window guard.
 * Comm-less L3 dispatch (no ``device=``) still emits ``submit_next_level(...,
   config)`` without the ``worker=`` kwarg AND without an ``allocate_domain``
   wrapper, preserving binary compatibility with existing L3 demos.
@@ -223,9 +225,9 @@ def test_comm_group_program_emits_allocate_domain_with_block():
     # the alloc) lowers to `workers=[*range(world_size)]` — resolved at
     # orch_fn time against the runner-bound `world_size` kwarg.
     assert re.search(r"workers=\[\*range\(world_size\)\],", code), code
-    # window_size is the sum of all slot nbytes expressions, each parenthesised.
-    # Single slot of 256 bytes → `window_size=(256),`.
-    assert re.search(r"window_size=\(256\),", code), code  # 64 * 4
+    # window_size is the parenthesised sum of slot nbytes expressions, wrapped
+    # in the runtime's 4 KiB minimum communication-window allocation.
+    assert re.search(r"window_size=max\(\(256\), 4096\),", code), code  # 64 * 4
     assert re.search(
         r'CommBufferSpec\(name="data_buf", dtype="opaque", count=256, nbytes=256\),',
         code,
@@ -308,9 +310,10 @@ def test_world_size_lowers_to_kwarg_in_expression_context():
     assert "pld.system.world_size" not in code, code
     # Loop bound: bare `world_size` reference.
     assert re.search(r"for \w+ in range\(.*\bworld_size\b.*\):", code), code
-    # Alloc-size: the CommBufferSpec / window_size args carry a dynamic
-    # `world_size * 4` expression in place of a constant nbytes literal.
-    assert re.search(r"window_size=\(.*\bworld_size\b.*\),", code), code
+    # Alloc-size: the CommBufferSpec args carry the exact dynamic `world_size * 4`
+    # nbytes expression; window_size keeps that expression but applies the 4 KiB
+    # minimum communication-window allocation.
+    assert re.search(r"window_size=max\(\(.*\bworld_size\b.*\), 4096\),", code), code
     assert re.search(r"CommBufferSpec\(.*\bworld_size\b.*\),", code), code
     # The legacy ``len(contexts)`` form must not survive.
     assert "len(contexts)" not in code, code

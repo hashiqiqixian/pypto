@@ -15,9 +15,9 @@ Mirrors the 4-phase pattern of the runtime example's
 * **Phase 1 (stage-in)** — copy local ``inp`` into this rank's slice of the
   window-bound ``data`` buffer (a plain local ``pl.store`` into the
   ``DistributedTensor``).
-* **Phase 2 (barrier)** — each rank ``AtomicAdd``s the peer's ``signal`` cell
-  via ``pld.system.notify`` and ``pld.system.wait``s on its own cell until
-  the peer has staged its slice.
+* **Phase 2 (barrier)** — each rank increments the peer's ``signal`` cell via
+  ``pld.system.notify`` and ``pld.system.wait``s on its own cell until the
+  peer has staged its slice.
 * **Phase 3 (compute)** — ``pl.load`` this rank's own slice into an
   accumulator tile, ``pld.tile.remote_load`` the peer's slice, and
   ``pl.add`` them. For ``nranks=2`` a single peer read is sufficient; the
@@ -65,11 +65,8 @@ def _build_allreduce_program():
             local = pl.load(inp, [0, 0], [1, SIZE])
             _ = pl.store(local, [0, 0], data)
 
-            # Phase 2: barrier — AtomicAdd the peer's signal cell, then
-            # wait for ours to be bumped by the rank that targets us.
-            # AtomicAdd on a single cell is sufficient for a 2-rank ring;
-            # nranks > 2 would size the signal to nranks and let each rank
-            # set a distinct slot (matching kernels/aiv/allreduce_kernel.cpp).
+            # Phase 2: barrier — increment the peer's signal cell, then wait
+            # for ours to be incremented by the rank that targets us.
             pld.system.notify(
                 signal,
                 peer=peer,
