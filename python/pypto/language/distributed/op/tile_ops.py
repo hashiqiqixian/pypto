@@ -74,6 +74,10 @@ def put(
     peer: IntLike,
     src: DistributedTensor,
     stage: Tile,
+    dst_offsets: Sequence[IntLike] | None = None,
+    src_offsets: Sequence[IntLike] | None = None,
+    shape: Sequence[IntLike] | None = None,
+    *,
     atomic: AtomicType = AtomicType.None_,
 ) -> Call:
     """Tile-level form of :func:`pld.tensor.put` with an explicit VEC staging tile.
@@ -88,7 +92,64 @@ def put(
         if not isinstance(expr, Expr) or not isinstance(expr.type, _ir.DistributedTensorType):
             got = _ir.python_print_type(expr.type) if isinstance(expr, Expr) else type(expr).__name__
             raise TypeError(f"pld.tile.put expects a DistributedTensor {role} (window-bound); got {got}")
-    return _ir_tile.put(dst_expr, _unwrap(peer), src_expr, stage_expr, atomic)
+    has_region = dst_offsets is not None or src_offsets is not None or shape is not None
+    if has_region and (dst_offsets is None or src_offsets is None or shape is None):
+        raise ValueError("pld.tile.put dst_offsets, src_offsets, and shape must be provided together")
+    if has_region:
+        assert dst_offsets is not None
+        assert src_offsets is not None
+        assert shape is not None
+        return _ir_tile.put(
+            dst_expr,
+            _unwrap(peer),
+            src_expr,
+            stage_expr,
+            dst_offsets=_normalize_intlike(dst_offsets),
+            src_offsets=_normalize_intlike(src_offsets),
+            shape=_normalize_intlike(shape),
+            atomic=atomic,
+        )
+    return _ir_tile.put(dst_expr, _unwrap(peer), src_expr, stage_expr, atomic=atomic)
 
 
-__all__ = ["remote_load", "put"]
+def get(
+    dst: DistributedTensor,
+    peer: IntLike,
+    src: DistributedTensor,
+    stage: Tile,
+    dst_offsets: Sequence[IntLike] | None = None,
+    src_offsets: Sequence[IntLike] | None = None,
+    shape: Sequence[IntLike] | None = None,
+) -> Call:
+    """Tile-level form of :func:`pld.tensor.get` with an explicit VEC staging tile.
+
+    Emitted by ``ConvertTensorToTileOps``; defined here only so the printer's
+    output roundtrips through the parser. User code calls :func:`pld.tensor.get`.
+    """
+    dst_expr = _unwrap(dst)
+    src_expr = _unwrap(src)
+    stage_expr = _unwrap(stage)
+    for role, expr in (("dst", dst_expr), ("src", src_expr)):
+        if not isinstance(expr, Expr) or not isinstance(expr.type, _ir.DistributedTensorType):
+            got = _ir.python_print_type(expr.type) if isinstance(expr, Expr) else type(expr).__name__
+            raise TypeError(f"pld.tile.get expects a DistributedTensor {role} (window-bound); got {got}")
+    has_region = dst_offsets is not None or src_offsets is not None or shape is not None
+    if has_region and (dst_offsets is None or src_offsets is None or shape is None):
+        raise ValueError("pld.tile.get dst_offsets, src_offsets, and shape must be provided together")
+    if has_region:
+        assert dst_offsets is not None
+        assert src_offsets is not None
+        assert shape is not None
+        return _ir_tile.get(
+            dst_expr,
+            _unwrap(peer),
+            src_expr,
+            stage_expr,
+            dst_offsets=_normalize_intlike(dst_offsets),
+            src_offsets=_normalize_intlike(src_offsets),
+            shape=_normalize_intlike(shape),
+        )
+    return _ir_tile.get(dst_expr, _unwrap(peer), src_expr, stage_expr)
+
+
+__all__ = ["get", "remote_load", "put"]

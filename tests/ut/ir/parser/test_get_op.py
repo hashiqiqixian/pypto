@@ -75,6 +75,44 @@ def test_get_parses_to_side_effect_op():
     assert call.kwargs == {}
 
 
+def test_get_subregion_parses_to_six_arg_op():
+    """``pld.tensor.get`` subregion form parses offsets/shape as positional IR args."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            dst: pld.DistributedTensor[[16, 64], pl.FP16],
+            src: pld.DistributedTensor[[8, 64], pl.FP16],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            pld.tensor.get(
+                dst,
+                peer=peer,
+                src=src,
+                dst_offsets=[3, 0],
+                src_offsets=[1, 0],
+                shape=[1, 64],
+            )
+
+    func = _get_func(P, "kernel")
+    get_calls = [
+        stmt.expr
+        for stmt in _iter_stmts(func.body)
+        if isinstance(stmt, ir.EvalStmt)
+        and isinstance(stmt.expr, ir.Call)
+        and stmt.expr.op.name == "pld.tensor.get"
+    ]
+
+    assert len(get_calls) == 1
+    call = get_calls[0]
+    assert isinstance(call.type, ir.UnknownType)
+    assert len(call.args) == 6
+    assert all(isinstance(arg, ir.MakeTuple) for arg in call.args[3:])
+    assert call.kwargs == {}
+
+
 def test_get_round_trips_through_printer_and_parser():
     """Printed ``pld.tensor.get`` IR re-parses to a structurally-equal program."""
 

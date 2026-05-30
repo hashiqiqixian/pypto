@@ -443,6 +443,47 @@ class TestConvertTensorToTileOps:
         assert stage_type.dtype == pl.FP16
         assert stage_type.memory_space == MemorySpace.Vec
 
+    def test_get_emits_tile_create_plus_tile_get(self):
+        """pld.tensor.get lowers to tile.create(stage) + pld.tile.get(dst, peer, src, stage)."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                dst: pld.DistributedTensor[[16, 64], pl.FP16],
+                src: pld.DistributedTensor[[16, 64], pl.FP16],
+                peer: pl.Scalar[pl.INT32],
+            ):
+                pld.tensor.get(dst, peer=peer, src=src)
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        kernel = After.get_function("kernel")
+        assert kernel is not None, "kernel function missing after conversion"
+
+        assert _find_first_call_to(kernel, "pld.tensor.get") is None, (
+            "pld.tensor.get must be lowered to pld.tile.get by ConvertTensorToTileOps"
+        )
+
+        assert _find_first_call_to(kernel, "tile.create") is not None
+        get_call = _find_first_call_to(kernel, "pld.tile.get")
+        assert get_call is not None, "expected pld.tile.get after conversion"
+
+        assert len(get_call.args) == 4
+        stage_arg = get_call.args[3]
+        assert isinstance(stage_arg, ir.Var)
+        assert stage_arg.name_hint == "tget_stage"
+
+        stage_type = stage_arg.type
+        assert isinstance(stage_type, ir.TileType)
+        shape_vals: list[int] = []
+        for d in stage_type.shape:
+            assert isinstance(d, ir.ConstInt)
+            shape_vals.append(d.value)
+        assert shape_vals == [16, 64]
+        assert stage_type.dtype == pl.FP16
+        assert stage_type.memory_space == MemorySpace.Vec
+
     def test_rsqrt_high_precision_conversion(self):
         """tensor.rsqrt(high_precision=True) allocates a tmp tile and lowers to 2-arg tile.rsqrt."""
         in_specs: list[InSpec] = [("x", [64], DataType.FP32)]
