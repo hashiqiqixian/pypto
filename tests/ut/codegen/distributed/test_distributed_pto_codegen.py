@@ -556,6 +556,29 @@ def test_put_subregion_uses_offset_partition_views():
     assert "!pto.tile_buf<loc=vec" in mlir
 
 
+def test_distributed_codegen_registers_system_barriers():
+    """Shared PTO op registration covers system barriers in distributed kernels."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            data: pld.DistributedTensor[[16, 64], pl.FP16],
+            out: pl.Tensor[[16, 64], pl.FP16],
+        ):
+            tile = pl.load(data, [0, 0], [1, 64])
+            pl.store(tile, [0, 0], out)
+            pl.system.bar_v()
+            pl.system.bar_m()
+            pl.system.bar_all()
+
+    mlir = _generate_mlir(P)
+    assert "pto.barrier <PIPE_V>" in mlir
+    assert "pto.barrier <PIPE_M>" in mlir
+    assert "pto.barrier <PIPE_ALL>" in mlir
+
+
 def test_get_emits_comm_tget_with_staging_tile():
     """get codegen emits pto.comm.tget with a VEC staging tile."""
 

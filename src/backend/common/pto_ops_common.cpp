@@ -142,6 +142,15 @@ static std::vector<std::string> GetExprCodes(const std::vector<ir::ExprPtr>& exp
   return codes;
 }
 
+static std::string MakeSystemBarrierCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base,
+                                               std::string_view pipe) {
+  INTERNAL_CHECK_SPAN(op->args_.empty(), op->span_)
+      << op->op_->name_ << " expects no arguments, got " << op->args_.size();
+  auto& codegen = dynamic_cast<codegen::PTOCodegen&>(codegen_base);
+  codegen.Emit(std::string("pto.barrier <") + std::string(pipe) + ">");
+  return "";
+}
+
 // Convert statically-known dimensions to plain integer strings for MLIR types.
 static std::vector<std::string> GetStaticDimStrings(const std::vector<ir::ExprPtr>& exprs,
                                                     codegen::PTOCodegen& codegen) {
@@ -3057,6 +3066,15 @@ void RegisterPTOOps(Backend& backend, const std::unordered_set<std::string>& exc
   });
   reg("tile.store", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeTileStoreCodegenPTO(op, codegen);
+  });
+  reg("system.bar_v", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeSystemBarrierCodegenPTO(op, codegen, "PIPE_V");
+  });
+  reg("system.bar_m", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeSystemBarrierCodegenPTO(op, codegen, "PIPE_M");
+  });
+  reg("system.bar_all", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+    return MakeSystemBarrierCodegenPTO(op, codegen, "PIPE_ALL");
   });
   // Distributed N6 ops — cross-rank tile load + per-rank signal notify/wait +
   // synchronous bulk get/put. See MakeRemoteLoadCodegenPTO /

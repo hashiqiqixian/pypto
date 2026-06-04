@@ -19,7 +19,7 @@ direction at every cross-rank op.
 
 * **dispatch**: histogram → publish ``send_counts`` via TNOTIFY(AtomicAdd) +
   count_done barrier (per-src signal cells) → prefix_sum → ``payload_push``
-  3-channel push (x BF16 / w FP32 / idx INT32) into peer's
+  3-channel tile TPUT push (x BF16 / w FP32 / idx INT32) into peer's
   ``recv_x``/``recv_w``/``recv_idx`` keyed by ``(local_expert, slot)`` →
   data_done barrier → ``stage_out`` window → host-backed
   ``recv_x_out`` / ``recv_w_out`` / ``recv_idx_out``.
@@ -27,18 +27,16 @@ direction at every cross-rank op.
   recv_w_out[..., 0])`` with the BF16 round-trip preserved; reads the staged
   host outputs (not the window), mirroring the runtime kernel's argument
   list.
-* **combine**: TPUT-style push of ``recv_y[idx_lin, :]`` to peer's
+* **combine**: tile TPUT push of ``recv_y[idx_lin, :]`` to peer's
   ``routed_y_buf[r, :]`` where ``r = t * TOPK + k`` from ``recv_idx_out``,
   then combine_done barrier (per-src signal cells), then FP32 reduce_sum
   along TOPK into ``routed_y``.
 
 **Iteration style — 1:1 with runtime.** Every loop uses ``pl.range`` (runtime
 ``for (int i = 0; i < N; ++i)``) instead of ``pl.unroll``. The runtime kernel
-does no compile-time unrolling — neither do we. The natural ``(t, k)``
-traversal in payload_push is equivalent to the runtime's sorted route table:
-``cursor`` is per-bucket so within-bucket ``(t, k)`` lex order (stable in
-either scheme) is all that determines slot assignment, and we skip the
-explicit insertion sort.
+does no compile-time unrolling — neither do we. The payload push builds the
+same route table, applies the same stable insertion-sort ordering by
+``(dst, loc_e)``, then scans the sorted route table.
 
 **Per-src signal cells — 1:1 with runtime.** Every barrier signal
 (``count_done`` / ``data_done`` / ``combine_done``) is sized ``[N_RANKS, 1]``;
@@ -50,8 +48,9 @@ generalizes to ``N_RANKS > 2``.
 **Stage-out — 1:1 with runtime.** The dispatch kernel emits four host-backed
 outputs: ``recv_x_out [L*R, D] BF16``, ``recv_w_out [L, R] FP32``,
 ``recv_idx_out [L, R] INT32``, and ``recv_count_out [L, 1] INT32``. Per-row
-1xD tile copies for x; scalar GM reads of column 0 for w / idx (the wide
-window was filled as ``[value, 0, …, 0]`` so column 0 is the real payload).
+1xD tile copies for x; per-expert row-sum compaction for w. The idx wide
+window is filled as ``[route_id, 0, …, 0]`` and staged from column 0 because
+the current device path does not preserve INT32 row_sum results.
 Downstream kernels read from the staged outputs, not the window.
 """
 
@@ -125,13 +124,45 @@ def _build_ep_dispatch_combine_program():
                 for e in pl.range(L):
                     send_counts[d * L + e] = 0
 
+            route_dst = pl.array.create(N_ROUTES, pl.INT32)
+            route_loc_e = pl.array.create(N_ROUTES, pl.INT32)
+            route_r = pl.array.create(N_ROUTES, pl.INT32)
             for t in pl.range(T):
                 for k in pl.range(TOPK):
+                    route_idx = t * TOPK + k
                     eid = pl.read(indices, [t, k])
                     d = eid // L
                     e = eid - d * L
                     cur = send_counts[d * L + e]
                     send_counts[d * L + e] = cur + 1
+                    route_dst[route_idx] = d
+                    route_loc_e[route_idx] = e
+                    route_r[route_idx] = pl.cast(route_idx, pl.INT32)
+
+            for i in pl.range(1, N_ROUTES):
+                kd = route_dst[i]
+                kl = route_loc_e[i]
+                kr = route_r[i]
+                insert_pos = i
+                found: pl.Scalar[pl.BOOL] = False
+                for scan in pl.range(i):
+                    cd = route_dst[scan]
+                    cl = route_loc_e[scan]
+                    greater = (cd > kd) or ((cd == kd) and (cl > kl))
+                    if greater and not found:
+                        insert_pos = scan
+                        found = True
+
+                for shift in pl.range(i):
+                    src_pos = i - 1 - shift
+                    if src_pos >= insert_pos:
+                        route_dst[src_pos + 1] = route_dst[src_pos]
+                        route_loc_e[src_pos + 1] = route_loc_e[src_pos]
+                        route_r[src_pos + 1] = route_r[src_pos]
+
+                route_dst[insert_pos] = kd
+                route_loc_e[insert_pos] = kl
+                route_r[insert_pos] = kr
 
             # ---------- publish: TNOTIFY(AtomicAdd) send_counts to peers ----
             # Each rank publishes its full [N_RANKS, L] send_counts row to
@@ -190,39 +221,53 @@ def _build_ep_dispatch_combine_program():
                     acc = acc + pl.read(pub_counts, [s * N_RANKS + my_rank, e])
                 pl.write(recv_count_out, [e, 0], acc)
 
-            # ---------- payload_push: natural (t, k) iteration ----------
-            # Equivalent to runtime's sorted route-table scan: cursor is
-            # per-bucket so within-bucket (t, k) lex order (preserved by
-            # either scheme) is all that determines slot assignment.
+            # ---------- payload_push: sorted route-table scan ----------
             cursor = pl.array.create(N_RANKS * L, pl.INT32)
             for d in pl.range(N_RANKS):
                 for e in pl.range(L):
                     cursor[d * L + e] = 0
 
-            for t in pl.range(T):
-                for k in pl.range(TOPK):
-                    eid = pl.read(indices, [t, k])
-                    dst = eid // L
-                    loc_e = eid - dst * L
-                    bucket = dst * L + loc_e
-                    cur_val = cursor[bucket]
-                    slot_off = my_slot_at_dst[bucket]
-                    slot = slot_off + cur_val
-                    row = loc_e * R + slot
-                    cursor[bucket] = cur_val + 1
-                    r_route = t * TOPK + k
+            for route_i in pl.range(N_ROUTES):
+                dst = route_dst[route_i]
+                loc_e = route_loc_e[route_i]
+                route_id = route_r[route_i]
+                route_idx = pl.cast(route_id, pl.INDEX)
+                t = route_idx // TOPK
+                bucket = dst * L + loc_e
+                cur_val = cursor[bucket]
+                slot_off = my_slot_at_dst[bucket]
+                slot = slot_off + cur_val
+                row = loc_e * R + slot
+                cursor[bucket] = cur_val + 1
 
-                    # Channel 1: x BF16 [1, D]
-                    x_tile = pl.load(x_norm, [t, 0], [1, D])
-                    pld.tile.remote_store(x_tile, target=recv_x, peer=dst, offsets=[row, 0])
+                # Channel 1: x BF16 [1, D]
+                x_tile = pl.load(x_norm, [t, 0], [1, D])
+                pld.tile.remote_store(
+                    x_tile,
+                    target=recv_x,
+                    peer=dst,
+                    offsets=[row, 0],
+                )
 
-                    # Channel 2: w FP32 [1, W_PAD]
-                    w_tile = pl.load(w_padded, [r_route, 0], [1, W_PAD])
-                    pld.tile.remote_store(w_tile, target=recv_w, peer=dst, offsets=[row, 0])
+                # Channel 2: w FP32 [1, W_PAD]
+                w_tile = pl.load(w_padded, [route_idx, 0], [1, W_PAD])
+                pld.tile.remote_store(
+                    w_tile,
+                    target=recv_w,
+                    peer=dst,
+                    offsets=[row, 0],
+                )
 
-                    # Channel 3: idx INT32 [1, IDX_PAD]
-                    idx_tile = pl.load(idx_padded, [r_route, 0], [1, IDX_PAD])
-                    pld.tile.remote_store(idx_tile, target=recv_idx, peer=dst, offsets=[row, 0])
+                # Channel 3: idx INT32 [1, IDX_PAD]
+                idx_tile = pl.load(idx_padded, [route_idx, 0], [1, IDX_PAD])
+                pld.tile.remote_store(
+                    idx_tile,
+                    target=recv_idx,
+                    peer=dst,
+                    offsets=[row, 0],
+                )
+
+            pl.system.bar_all()
 
             # ---------- data_done barrier — per-src signal cells ----------
             for peer in pl.range(N_RANKS):
@@ -258,19 +303,24 @@ def _build_ep_dispatch_combine_program():
             # the runtime's TROWSUM stage_out for the weight channel.
             for e in pl.range(L):
                 w_wide: pl.Tile[[R, W_PAD], pl.FP32] = pl.load(recv_w, [e * R, 0], [R, W_PAD])
-                tmp: pl.Tile[[R, 1], pl.FP32] = pl.tile.create(
+                w_tmp: pl.Tile[[R, 1], pl.FP32] = pl.tile.create(
                     [R, 1], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
-                w_sum: pl.Tile[[R, 1], pl.FP32] = pl.tile.row_sum(w_wide, tmp)
+                w_sum: pl.Tile[[R, 1], pl.FP32] = pl.tile.row_sum(w_wide, w_tmp)
                 w_row: pl.Tile[[1, R], pl.FP32] = pl.tile.reshape(w_sum, [1, R])
                 pl.store(w_row, [e, 0], recv_w_out)
 
-            # recv_idx_out: scalar copy of column 0 (matches dispatch.cpp's
-            # fallback path, which avoids INT32 TROWSUM hangs on a2a3).
+            pl.system.bar_all()
+
+            # recv_idx_out: the sender writes [route_id, 0, ..., 0], so column
+            # 0 carries the compact value. Use scalar reads here because the
+            # current device path does not preserve INT32 row_sum results.
             for e in pl.range(L):
                 for slot in pl.range(R):
-                    r_val = pl.read(recv_idx, [e * R + slot, 0])
-                    pl.write(recv_idx_out, [e, slot], r_val)
+                    idx_val = pl.read(recv_idx, [e * R + slot, 0])
+                    pl.write(recv_idx_out, [e, slot], idx_val)
+
+            pl.system.bar_all()
 
             return recv_x_out, recv_w_out, recv_idx_out, recv_count_out
 
@@ -332,9 +382,17 @@ def _build_ep_dispatch_combine_program():
                     src_off_idx = pl.cast(src_off, pl.INDEX)
                     for row in pl.range(n):
                         idx_lin = e * R + src_off_idx + row
-                        r_route = pl.read(recv_idx_out, [e, src_off_idx + row])
+                        route_id = pl.read(recv_idx_out, [e, src_off_idx + row])
+                        route_idx = pl.cast(route_id, pl.INDEX)
                         y_tile = pl.load(recv_y, [idx_lin, 0], [1, D])
-                        pld.tile.remote_store(y_tile, target=routed_y_buf, peer=dst, offsets=[r_route, 0])
+                        pld.tile.remote_store(
+                            y_tile,
+                            target=routed_y_buf,
+                            peer=dst,
+                            offsets=[route_idx, 0],
+                        )
+
+            pl.system.bar_all()
 
             # ---------- combine_done barrier — per-src signal cells ----------
             for peer in pl.range(N_RANKS):
