@@ -138,6 +138,8 @@ std::vector<std::pair<std::string, std::any>> ConvertKwargsDict(const nb::dict& 
     } else if (nb::isinstance<AtomicType>(item.second)) {
       // Cast enum to int for storage — pld.tensor.put reads as int
       kwargs.emplace_back(key, static_cast<int>(nb::cast<AtomicType>(item.second)));
+    } else if (nb::isinstance<ReduceOp>(item.second)) {
+      kwargs.emplace_back(key, static_cast<int>(nb::cast<ReduceOp>(item.second)));
     } else if (nb::isinstance<PadValue>(item.second)) {
       kwargs.emplace_back(key, nb::cast<PadValue>(item.second));
     } else if (nb::isinstance<LoopOrigin>(item.second)) {
@@ -1323,6 +1325,10 @@ void BindIR(nb::module_& m) {
       "Combine mode for global-memory writes — pld.tensor.put (TPUT) and tile.store (TSTORE)")
       .value("None_", AtomicType::kNone, "Plain store — overwrite the destination")
       .value("Add", AtomicType::kAdd, "Atomically add the source data into the destination");
+
+  nb::enum_<ReduceOp>(ir, "ReduceOp", nb::is_arithmetic(),
+                      "Reduction operation for host-level collectives")
+      .value("Sum", ReduceOp::kSum, "Elementwise sum reduction");
 
   // ScopeStmt - abstract base class for all scope statements (issue #1047).
   auto scope_stmt_class = nb::class_<ScopeStmt, Stmt>(

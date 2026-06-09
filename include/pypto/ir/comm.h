@@ -53,6 +53,19 @@ enum class AtomicType : int {
   kAdd = 1,
 };
 
+enum class ReduceOp : int {
+  kSum = 0,
+};
+
+inline std::string ReduceOpToString(ReduceOp op) {
+  switch (op) {
+    case ReduceOp::kSum:
+      return "Sum";
+    default:
+      throw pypto::TypeError("Unknown ReduceOp: " + std::to_string(static_cast<int>(op)));
+  }
+}
+
 // Convert AtomicType to the matching Python enum member name. The Python
 // member is `None_` (trailing underscore) because `None` is a reserved word —
 // keep this in sync with the `nb::enum_<AtomicType>` binding in

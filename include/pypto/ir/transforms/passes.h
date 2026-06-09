@@ -249,6 +249,16 @@ Pass InlineFunctions();
 Pass CollectCommGroups();
 
 /**
+ * @brief Lower host-level collective ops to compiler-internal builtin chip dispatches.
+ *
+ * Rewrites ``pld.host.allreduce_(data, op=ReduceOp.Sum)`` in HOST orchestrators
+ * into an implicit signal WindowBuffer plus one ``builtin.allreduce`` dispatch
+ * per participating rank. Requires ``CollectCommGroups`` so the data
+ * DistributedTensorType carries its WindowBuffer back-reference.
+ */
+Pass LowerHostCollectives();
+
+/**
  * @brief Create a loop unrolling pass
  *
  * Expands ForStmt nodes with ForKind::Unroll into inlined copies of the loop

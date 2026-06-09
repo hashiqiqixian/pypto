@@ -26,6 +26,7 @@
 #include "pypto/codegen/distributed/distributed_op_registry.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
@@ -638,6 +639,11 @@ void DistributedCodegen::VisitExpr_(const ir::CallPtr& op) {
     return;
   }
 
+  if (op->op_->name_.rfind("builtin.", 0) == 0) {
+    EmitBuiltinDispatch(op);
+    return;
+  }
+
   // tensor.create → orch.alloc() for HOST-level orchestrators
   if (op->op_->name_ == "tensor.create") {
     EmitTensorCreate(op);
@@ -896,6 +902,48 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
   }
 }
 
+void DistributedCodegen::EmitBuiltinDispatch(const ir::CallPtr& call) {
+  INTERNAL_CHECK(call && call->op_) << "EmitBuiltinDispatch requires a non-null Call";
+  INTERNAL_CHECK_SPAN(call->op_->name_ == "builtin.allreduce", call->span_)
+      << "Unsupported builtin dispatch op: " << call->op_->name_;
+
+  std::string rank_expr = ResolveRankExpr(call);
+  INTERNAL_CHECK_SPAN(!rank_expr.empty(), call->span_)
+      << "builtin dispatch calls must carry device= attr";
+
+  std::string ta_var = "_ta_" + std::to_string(task_args_counter_++);
+  emitter_.EmitLine(ta_var + " = TaskArgs()");
+
+  for (size_t i = 0; i < call->args_.size(); ++i) {
+    auto dist_type = ir::As<ir::DistributedTensorType>(call->args_[i]->GetType());
+    INTERNAL_CHECK_SPAN(dist_type, call->span_)
+        << "builtin.allreduce arg " << i << " must be a DistributedTensor";
+    INTERNAL_CHECK_SPAN(dist_type->window_buffer_.has_value(), call->span_)
+        << "DistributedTensorType arg must have window_buffer_ populated by CollectCommGroups";
+    const auto& window_buffer = dist_type->window_buffer_.value();
+    const std::string name = SanitizeName(window_buffer->name_hint_);
+    const std::string shape = FormatShapeTuple(dist_type->shape_);
+    const std::string dtype_enum = "DataType." + DataTypeToSimplerEnum(dist_type->dtype_);
+    const std::string handle_var = HandleVarForGroup(GroupIdxForWindowBuffer(window_buffer));
+    emitter_.EmitLine(ta_var + ".add_tensor(ContinuousTensor.make(data=" + handle_var + "[" + rank_expr +
+                      "].buffer_ptrs[\"" + name + "\"], shapes=" + shape + ", dtype=" + dtype_enum +
+                      ", child_memory=True), TensorArgType.INOUT)");
+  }
+
+  auto data_type = ir::As<ir::DistributedTensorType>(call->args_[0]->GetType());
+  INTERNAL_CHECK_SPAN(data_type && data_type->window_buffer_.has_value(), call->span_)
+      << "builtin.allreduce data arg must have window_buffer_";
+  const std::string device_ctx_handle =
+      HandleVarForGroup(GroupIdxForWindowBuffer(data_type->window_buffer_.value()));
+  emitter_.EmitLine(ta_var + ".add_scalar(world_size)");
+  emitter_.EmitLine(ta_var + ".add_scalar(" + device_ctx_handle + "[" + rank_expr + "].device_ctx)");
+
+  const std::string variant = BuiltinCallableVariant(call);
+  emitter_.EmitLine("_keep.append(" + ta_var + ")");
+  emitter_.EmitLine("orch.submit_next_level(callables[\"" + variant + "\"], " + ta_var +
+                    ", config, worker=" + rank_expr + ")");
+}
+
 void DistributedCodegen::EmitDistIntrinsic(const ir::CallPtr& call) {
   const auto& op_name = call->op_->name_;
 
@@ -1080,6 +1128,20 @@ std::string DistributedCodegen::DataTypeToSimplerEnum(const DataType& dtype) {
   if (dtype == DataType::BOOL) return "BOOL";
   CHECK(false) << "Unsupported DistributedTensor dtype for simpler.DataType mapping: " << dtype.ToString();
   return "FLOAT32";
+}
+
+std::string DistributedCodegen::BuiltinCallableVariant(const ir::CallPtr& call) {
+  INTERNAL_CHECK(call && call->op_) << "BuiltinCallableVariant requires a non-null Call";
+  if (call->op_->name_ == "builtin.allreduce") {
+    const int op = call->GetKwarg<int>("op");
+    const DataType dtype = call->GetKwarg<DataType>("dtype");
+    INTERNAL_CHECK(op == static_cast<int>(ir::ReduceOp::kSum))
+        << "builtin.allreduce only supports ReduceOp.Sum";
+    INTERNAL_CHECK(dtype == DataType::FP32) << "builtin.allreduce only supports FP32";
+    return "builtin.allreduce__sum__fp32";
+  }
+  INTERNAL_CHECK(false) << "Unsupported builtin op: " << call->op_->name_;
+  return "";
 }
 
 std::string DistributedCodegen::ResolveRankExpr(const ir::CallPtr& call) const {

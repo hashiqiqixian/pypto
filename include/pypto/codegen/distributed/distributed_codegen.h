@@ -138,6 +138,7 @@ class DistributedCodegen : public CodegenBase {
 
   // Call-site lowering
   void EmitCallToWorker(const ir::CallPtr& call, const ir::FunctionPtr& callee);
+  void EmitBuiltinDispatch(const ir::CallPtr& call);
   /**
    * @brief Emit a same-level worker / next-level orchestrator call if @p expr
    *        is one. Returns true if it emitted; false if @p expr is not a
@@ -201,6 +202,7 @@ class DistributedCodegen : public CodegenBase {
   /// DistributedTensor formal emission when constructing
   /// ``ContinuousTensor.make(..., dtype=DataType.FLOAT32, child_memory=True)``.
   [[nodiscard]] static std::string DataTypeToSimplerEnum(const DataType& dtype);
+  [[nodiscard]] static std::string BuiltinCallableVariant(const ir::CallPtr& call);
 
   /// Resolve a dispatch call's ``device=`` attr to a Python rank expression.
   /// Returns the empty string if the call carries no ``device=`` attr (the

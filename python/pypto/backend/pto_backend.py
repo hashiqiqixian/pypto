@@ -39,6 +39,7 @@ from pypto.pypto_core import ir as _ir_core
 logger = logging.getLogger(__name__)
 
 _PTOAS_RELEASE_URL = "https://github.com/zhangstevenunity/PTOAS/releases"
+_BUILTIN_ALLREDUCE_VARIANT = "builtin.allreduce__sum__fp32"
 
 
 class PartialCodegenError(RuntimeError):
@@ -777,6 +778,36 @@ class _CallCollector(_ir_core.IRVisitor):
         super().visit_call(op)
 
 
+class _BuiltinCallCollector(_ir_core.IRVisitor):
+    """Collect compiler-internal builtin call variants reachable in a program."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.variants: set[str] = set()
+
+    def visit_call(self, op: _ir_core.Call) -> None:
+        op_ref = op.op
+        op_name = getattr(op_ref, "name", "")
+        if op_name == "builtin.allreduce":
+            kwargs = getattr(op, "kwargs", {}) or {}
+            reduce_op = kwargs.get("op")
+            dtype = kwargs.get("dtype")
+            if reduce_op is None or dtype is None:
+                raise ValueError("builtin.allreduce requires op and dtype kwargs after lowering")
+            if int(reduce_op) != int(_ir_core.ReduceOp.Sum) or dtype != _ir_core.DataType.FP32:
+                raise ValueError("builtin.allreduce currently supports only ReduceOp.Sum with FP32")
+            self.variants.add(_BUILTIN_ALLREDUCE_VARIANT)
+        super().visit_call(op)
+
+
+def _collect_builtin_variants(program: _ir_core.Program) -> set[str]:
+    collector = _BuiltinCallCollector()
+    for func in program.functions.values():
+        if func.body is not None:
+            collector.visit_stmt(func.body)
+    return collector.variants
+
+
 def _extract_group_member_names(
     group_func: _ir_core.Function,
 ) -> list[str]:
@@ -1142,6 +1173,12 @@ def _generate_with_distributed(
             for path, content in chip_files.items():
                 result_files[f"next_levels/{func.name}/{path}"] = content
 
+    # 2b. Compiler-internal builtin chip callables. These are materialized under
+    # next_levels/<variant>/ so the normal distributed runtime registration path
+    # can treat them exactly like user chip orchestrations.
+    for variant in sorted(_collect_builtin_variants(transformed_program)):
+        result_files.update(_emit_builtin_next_level(variant))
+
     # 3. HOST SubWorker functions → sub_workers/{name}.py
     # Only HOST-level (Linqu level >= 3) SubWorkers carry an InlineStmt body
     # captured by the decorator. Lower-level role=SubWorker kernels (e.g. CHIP
@@ -1156,6 +1193,213 @@ def _generate_with_distributed(
             result_files[f"sub_workers/{func.name}.py"] = _emit_sub_worker_module(func)
 
     return result_files
+
+
+def _emit_builtin_next_level(variant: str) -> dict[str, str]:
+    if variant != _BUILTIN_ALLREDUCE_VARIANT:
+        raise ValueError(f"Unsupported builtin variant: {variant}")
+    prefix = f"next_levels/{variant}"
+    return {
+        f"{prefix}/kernel_config.py": _builtin_allreduce_config(),
+        f"{prefix}/orchestration/builtin_allreduce__sum__fp32.cpp": _builtin_allreduce_orch_cpp(),
+        f"{prefix}/kernels/aiv/builtin_allreduce__sum__fp32.cpp": _builtin_allreduce_kernel_cpp(),
+    }
+
+
+def _builtin_allreduce_config() -> str:
+    return """# Kernel and Orchestration Configuration
+from pathlib import Path
+from simpler.task_interface import ArgDirection as _D
+
+_ROOT_DIR = Path(__file__).parent
+
+RUNTIME_CONFIG = {
+\t"runtime": "tensormap_and_ringbuffer",
+\t"aicpu_thread_num": 4,
+}
+
+ORCHESTRATION = {
+\t"source": str(_ROOT_DIR / "orchestration" / "builtin_allreduce__sum__fp32.cpp"),
+\t"function_name": "builtin_allreduce__sum__fp32_orchestration",
+\t"config_name": "builtin_allreduce__sum__fp32_orchestration_config",
+\t"signature": [_D.INOUT, _D.INOUT],
+}
+
+KERNELS = [
+\t{
+\t\t"func_id": 0,
+\t\t"name": "builtin_allreduce__sum__fp32",
+\t\t"source": str(_ROOT_DIR / "kernels" / "aiv" / "builtin_allreduce__sum__fp32.cpp"),
+\t\t"core_type": "aiv",
+\t\t"signature": [_D.INOUT, _D.INOUT],
+\t},
+]
+"""
+
+
+def _builtin_allreduce_orch_cpp() -> str:
+    return r"""/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <stdint.h>
+
+#include "pto_orchestration_api.h"
+
+extern "C" {
+
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+builtin_allreduce__sum__fp32_orchestration_config(const ChipStorageTaskArgs &orch_args) {
+    (void)orch_args;
+    return PTO2OrchestrationConfig{
+        .expected_arg_count = 4,  // data + signal + nranks + CommContext
+    };
+}
+
+__attribute__((visibility("default"))) void
+builtin_allreduce__sum__fp32_orchestration(const ChipStorageTaskArgs &orch_args) {
+    Tensor data = from_tensor_arg(orch_args.tensor(0));
+    Tensor signal = from_tensor_arg(orch_args.tensor(1));
+
+    Arg params;
+    params.add_inout(data);
+    params.add_inout(signal);
+    params.add_scalar(orch_args.scalar(0));  // nranks
+    params.add_scalar(orch_args.scalar(1));  // data CommContext device pointer
+    rt_submit_aiv_task(0, params);
+}
+
+}  // extern "C"
+"""
+
+
+def _builtin_allreduce_kernel_cpp() -> str:
+    return r"""/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <cstdint>
+#include <pto/pto-inst.hpp>
+#include "pto/comm/comm_types.hpp"
+#include "pto/comm/pto_comm_inst.hpp"
+#include "tensor.h"
+
+#ifndef __gm__
+#define __gm__
+#endif
+
+#ifndef __aicore__
+#define __aicore__ [aicore]
+#endif
+
+static constexpr size_t ALLREDUCE_COUNT = 256;
+static constexpr int kMaxSupportedRanks = 16;
+static constexpr uint32_t COMM_MAX_RANK_NUM = 64;
+
+struct CommContext {
+    uint64_t workSpace;
+    uint64_t workSpaceSize;
+    uint32_t rankId;
+    uint32_t rankNum;
+    uint64_t winSize;
+    uint64_t windowsIn[COMM_MAX_RANK_NUM];
+    uint64_t windowsOut[COMM_MAX_RANK_NUM];
+};
+
+template <typename T>
+AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPtr, int pe) {
+    uint64_t localBase = ctx->windowsIn[ctx->rankId];
+    uint64_t offset = (uint64_t)localPtr - localBase;
+    return (__gm__ T *)(ctx->windowsIn[pe] + offset);
+}
+
+extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *data_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *signal_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    int nranks = static_cast<int>(args[2]);
+    __gm__ CommContext *commCtx = reinterpret_cast<__gm__ CommContext *>(args[3]);
+
+    __gm__ float *data = reinterpret_cast<__gm__ float *>(data_tensor->buffer.addr) + data_tensor->start_offset;
+    __gm__ int32_t *signal =
+        reinterpret_cast<__gm__ int32_t *>(signal_tensor->buffer.addr) + signal_tensor->start_offset;
+
+    using ShapeDyn = pto::Shape<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
+    using StrideDyn = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
+    using Global = pto::GlobalTensor<float, ShapeDyn, StrideDyn, pto::Layout::ND>;
+    using TileData = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
+
+    int my_rank = static_cast<int>(commCtx->rankId);
+
+    uint64_t count = 1;
+    for (uint32_t i = 0; i < data_tensor->ndims; ++i) {
+        count *= data_tensor->shapes[i];
+    }
+    if (nranks <= 0 || nranks > kMaxSupportedRanks || count == 0 || count > ALLREDUCE_COUNT) {
+        pipe_barrier(PIPE_ALL);
+        return;
+    }
+
+    ShapeDyn shape(1, 1, 1, 1, count);
+    StrideDyn stride(count, count, count, count, 1);
+
+    TileData accTile(1, ALLREDUCE_COUNT);
+    TileData recvTile(1, ALLREDUCE_COUNT);
+    TASSIGN(accTile, 0x0);
+    TASSIGN(recvTile, 0x10000);
+
+    Global localG(data, shape, stride);
+
+    for (int peer = 0; peer < nranks; ++peer) {
+        if (peer == my_rank) continue;
+        __gm__ int32_t *remote_signal = CommRemotePtr(commCtx, signal + my_rank, peer);
+        pto::comm::Signal sig(remote_signal);
+        pto::comm::TNOTIFY(sig, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
+    }
+    for (int peer = 0; peer < nranks; ++peer) {
+        if (peer == my_rank) continue;
+        pto::comm::Signal sig(signal + peer);
+        pto::comm::TWAIT(sig, (int32_t)1, pto::comm::WaitCmp::GE);
+    }
+    pipe_barrier(PIPE_ALL);
+
+    TLOAD(accTile, localG);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+    for (int peer = 0; peer < nranks; ++peer) {
+        if (peer == my_rank) continue;
+        __gm__ float *remote_data = CommRemotePtr(commCtx, data, peer);
+        Global remoteG(remote_data, shape, stride);
+        TLOAD(recvTile, remoteG);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+        TADD(accTile, accTile, recvTile);
+        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    }
+
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    TSTORE(localG, accTile);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    pipe_barrier(PIPE_ALL);
+}
+"""
 
 
 def _emit_sub_worker_module(func: _ir_core.Function) -> str:

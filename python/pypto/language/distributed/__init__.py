@@ -34,11 +34,12 @@ plus 2-segment unified-dispatch short form, just like ``pl``):
   ``pypto.pypto_core.ir``.
 """
 
-from pypto.pypto_core.ir import AtomicType, NotifyOp, WaitCmp
+from pypto.pypto_core.ir import AtomicType, NotifyOp, ReduceOp, WaitCmp
 
 from .op import (
     alloc_window_buffer,
     get_comm_ctx,
+    host,
     nranks,
     rank,
     remote_load,
@@ -56,9 +57,11 @@ __all__ = [
     "CommCtx",
     "DistributedTensor",
     "NotifyOp",
+    "ReduceOp",
     "WaitCmp",
     "alloc_window_buffer",
     "get_comm_ctx",
+    "host",
     "nranks",
     "rank",
     "remote_load",

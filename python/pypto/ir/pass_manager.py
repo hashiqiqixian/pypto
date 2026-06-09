@@ -178,6 +178,7 @@ class PassManager:
             # before the final Simplify so any constant folding it does on the
             # collected sizes is applied uniformly.
             ("CollectCommGroups", lambda: passes.collect_comm_groups()),
+            ("LowerHostCollectives", lambda: passes.lower_host_collectives()),
             ("Simplify", lambda: passes.simplify()),
             # Insert explicit AUTO RuntimeScopeStmt nodes (function body + for/if
             # bodies) into Orchestration functions so codegen emits PTO2_SCOPE

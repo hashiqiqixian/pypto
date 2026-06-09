@@ -463,6 +463,25 @@ class OpRegistryEntry {
     return cross_core_role_;
   }
 
+  /// Mark this op as compiler-internal. Parser/front-end paths should reject
+  /// direct user construction; lowering/codegen may still create and consume it.
+  inline OpRegistryEntry& set_internal_only(bool value = true) {
+    is_internal_only_ = value;
+    return *this;
+  }
+
+  [[nodiscard]] bool IsInternalOnly() const { return is_internal_only_; }
+
+  /// Runtime template directory for compiler-internal builtin dispatch ops.
+  /// Stored as metadata so codegen does not infer assets from op names.
+  inline OpRegistryEntry& set_template_dir(std::string template_dir) {
+    CHECK(!template_dir_.has_value()) << "Operator '" << name_ << "' template_dir is already set";
+    template_dir_ = std::move(template_dir);
+    return *this;
+  }
+
+  [[nodiscard]] const std::optional<std::string>& GetTemplateDir() const { return template_dir_; }
+
  private:
   void EnsureMemorySpec() {
     if (!memory_spec_.has_value()) {
@@ -498,6 +517,8 @@ class OpRegistryEntry {
   bool is_inplace_safe_{true};  ///< Whether the op supports in-place execution (src == dst buffer)
   std::optional<core_affinity::CoreAffinity> core_affinity_;     ///< Explicit core-affinity override
   std::optional<core_affinity::CrossCoreRole> cross_core_role_;  ///< Cross-core role (for predicates)
+  bool is_internal_only_{false};                                 ///< User source must not call this op.
+  std::optional<std::string> template_dir_;                      ///< Builtin template directory.
 };
 
 /**

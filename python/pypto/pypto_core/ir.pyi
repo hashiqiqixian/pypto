@@ -2233,6 +2233,12 @@ class AtomicType(enum.IntEnum):
     Add = 1
     """Atomically add the source data into the destination."""
 
+class ReduceOp(enum.IntEnum):
+    """Reduction operation for host-level collectives."""
+
+    Sum = 0
+    """Elementwise sum reduction."""
+
 class ScopeStmt(Stmt):
     """Scope statement: marks a region with specific execution context (abstract base).
 

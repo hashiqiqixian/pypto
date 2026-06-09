@@ -127,6 +127,15 @@ def _assemble_chip_callables(compiled: DistributedCompiledProgram) -> tuple[dict
                 chip_callable, runtime_name, _ = compile_and_assemble(chip_dir, compiled.platform)
                 chip_callables[func.name] = chip_callable
 
+    if next_levels_dir.exists():
+        for chip_dir in sorted(p for p in next_levels_dir.iterdir() if p.is_dir()):
+            if chip_dir.name in chip_callables:
+                continue
+            if not (chip_dir / "kernel_config.py").exists():
+                continue
+            chip_callable, runtime_name, _ = compile_and_assemble(chip_dir, compiled.platform)
+            chip_callables[chip_dir.name] = chip_callable
+
     if not chip_callables:
         raise RuntimeError(f"No chip-level tasks found in {next_levels_dir}")
     return chip_callables, runtime_name

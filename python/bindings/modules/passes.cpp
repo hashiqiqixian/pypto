@@ -494,6 +494,8 @@ void BindPass(nb::module_& m) {
              "DistributedTensorType.window_buffer_ on view Vars, and populate\n"
              "Program.comm_groups_ with the inferred coverage. Runs immediately after\n"
              "InlineFunctions (L2 orch is never inlined into L3).");
+  passes.def("lower_host_collectives", &pass::LowerHostCollectives,
+             "Lower host-level distributed collectives into internal builtin chip dispatches.");
   passes.def("materialize_runtime_scopes", &pass::MaterializeRuntimeScopes,
              "Materialize implicit orchestration scopes as explicit RuntimeScopeStmt nodes.\n\n"
              "For every Orchestration function, inserts AUTO RuntimeScopeStmt (manual_=false)\n"

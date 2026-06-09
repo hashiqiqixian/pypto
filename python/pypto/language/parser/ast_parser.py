@@ -64,7 +64,7 @@ if TYPE_CHECKING:
 # Canonical pld.<category>.<op> middle segments. Kept in sync with the
 # submodules exposed by pypto.language.distributed.op (system_ops / tensor_ops
 # / tile_ops); also surfaced as the hint in _parse_pld_category_op.
-_PLD_CATEGORIES: frozenset[str] = frozenset({"system", "tensor", "tile"})
+_PLD_CATEGORIES: frozenset[str] = frozenset({"system", "tensor", "tile", "host"})
 
 
 def _is_pld_call(node: object, attr_name: str) -> TypeGuard[ast.Call]:
@@ -4923,6 +4923,13 @@ class ASTParser:
 
         # Handle cross-function calls via self.method_name() in @pl.program classes
         if isinstance(func, ast.Attribute):
+            if isinstance(func.value, ast.Name) and func.value.id == "builtin":
+                raise ParserSyntaxError(
+                    "Compiler-internal builtin ops cannot be called from user source",
+                    span=self.span_tracker.get_span(call),
+                    hint="Use the public distributed host API, e.g. pld.host.allreduce_(...)",
+                )
+
             # Check for self.method_name pattern
             if isinstance(func.value, ast.Name) and func.value.id == "self":
                 span = self.span_tracker.get_span(call)
@@ -6475,7 +6482,7 @@ class ASTParser:
 
         - ``alloc_window_buffer``: must be intercepted at assignment-LHS.
           Reaching here means it was used outside that context.
-        - ``world_size``: host-only.
+        - ``world_size`` / host collectives: host-only.
         """
         span = self.span_tracker.get_span(call)
 
@@ -6496,6 +6503,21 @@ class ASTParser:
             if self._func_level != ir.Level.HOST or in_device_scope:
                 raise ParserSyntaxError(
                     "pld.system.world_size() can only be called in HOST orchestration context "
+                    "(not inside InCore / AutoInCore / SPMD scopes); "
+                    f"current function level: {self._func_level}",
+                    span=span,
+                    hint="Use '@pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)' "
+                    "on the enclosing function and call outside any nested device-side scope",
+                )
+
+        if op_name == "allreduce_":
+            in_device_scope = any(
+                self._is_inside_scope(kind)
+                for kind in (ir.ScopeKind.InCore, ir.ScopeKind.AutoInCore, ir.ScopeKind.Spmd)
+            )
+            if self._func_level != ir.Level.HOST or in_device_scope:
+                raise ParserSyntaxError(
+                    "pld.host.allreduce_() can only be called in HOST orchestration context "
                     "(not inside InCore / AutoInCore / SPMD scopes); "
                     f"current function level: {self._func_level}",
                     span=span,
@@ -6535,7 +6557,7 @@ class ASTParser:
             raise InvalidOperationError(
                 f"Unknown distributed category 'pld.{category}'",
                 span=span,
-                hint="Available categories: pld.system, pld.tensor, pld.tile",
+                hint="Available categories: pld.system, pld.tensor, pld.tile, pld.host",
             )
 
         submodule = getattr(_dsl_pld, category)

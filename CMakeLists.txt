@@ -118,6 +118,7 @@ set(PYPTO_SOURCES
     src/ir/op/distributed/put.cpp
     src/ir/op/distributed/get_comm_ctx.cpp
     src/ir/op/distributed/system.cpp
+    src/ir/op/distributed/host_collective.cpp
     src/ir/op/tensor_ops/broadcast.cpp
     src/ir/op/tensor_ops/elementwise.cpp
     src/ir/op/tensor_ops/matmul.cpp
@@ -153,6 +154,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/normalize_return_order_pass.cpp
     src/ir/transforms/convert_tensor_to_tile_ops_pass.cpp
     src/ir/transforms/collect_comm_groups_pass.cpp
+    src/ir/transforms/lower_host_collectives_pass.cpp
     src/ir/transforms/optimize_orch_tensors_pass.cpp
     src/ir/transforms/derive_call_directions_pass.cpp
     src/ir/transforms/expand_manual_phase_fence_pass.cpp

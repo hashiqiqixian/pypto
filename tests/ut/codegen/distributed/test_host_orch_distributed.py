@@ -36,6 +36,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 from pypto import codegen
+from pypto.backend.pto_backend import generate
 from pypto.pypto_core import passes  # match the import path used by ut/conftest.py
 
 SIZE = 64
@@ -58,9 +59,9 @@ def pass_verification_context():
 
 
 def _lower(program) -> str:
-    """Apply ``CollectCommGroups`` (so ``DistributedTensorType.window_buffer_``
-    is populated), then run distributed codegen directly."""
+    """Apply the late distributed lowering passes, then run codegen directly."""
     program = passes.collect_comm_groups()(program)
+    program = passes.lower_host_collectives()(program)
     cg = codegen.DistributedCodegen()
     return cg.generate(program)
 
@@ -116,6 +117,72 @@ def test_dist_tensor_formal_emits_continuous_tensor_make():
     assert re.search(r"\.add_scalar\(__comm_d0\[\w+\]\.device_ctx\)", code), code
     # ``device=r`` → ``worker=r`` kwarg on submit_next_level.
     assert re.search(r"submit_next_level\(callables\[\"chip_orch\"\],.*config, worker=\w+\)", code), code
+
+
+def test_host_allreduce_lowers_to_builtin_dispatch():
+    """``pld.host.allreduce_`` stays a single user op and lowers to the
+    internal per-rank builtin dispatch before host_orch codegen."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
+            return data  # type: ignore[return-value]
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self) -> pl.Tensor[[SIZE], pl.FP32]:
+            data_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.host.allreduce_(data, op=pld.ReduceOp.Sum)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            return data  # type: ignore[return-value]
+
+    code = _lower(Prog)
+
+    assert 'callables["builtin.allreduce__sum__fp32"]' in code, code
+    assert "pld.host.allreduce_" not in code, code
+    assert "TensorArgType.INOUT" in code, code
+    assert 'buffer_ptrs["__allreduce_signal_buf_0"]' in code, code
+    assert re.search(r"\.add_scalar\(world_size\)", code), code
+    assert re.search(r"\.add_scalar\(__comm_d0\[\w+\]\.device_ctx\)", code), code
+    assert re.search(
+        r"submit_next_level\(callables\[\"builtin\.allreduce__sum__fp32\"\],.*config, worker=\w+\)",
+        code,
+    ), code
+
+
+def test_host_allreduce_backend_emits_builtin_next_level(tmp_path):
+    """Backend generation materializes the builtin allreduce chip callable
+    next to user chip orchestrations."""
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], pl.FP32]) -> pl.Tensor[[SIZE], pl.FP32]:
+            return data  # type: ignore[return-value]
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self) -> pl.Tensor[[SIZE], pl.FP32]:
+            data_buf = pld.alloc_window_buffer(SIZE * 4)
+            data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.host.allreduce_(data, op=pld.ReduceOp.Sum)
+            return data  # type: ignore[return-value]
+
+    program = passes.collect_comm_groups()(Prog)
+    program = passes.lower_host_collectives()(program)
+    files = generate(program, str(tmp_path), skip_ptoas=True)
+
+    prefix = "next_levels/builtin.allreduce__sum__fp32"
+    assert f"{prefix}/kernel_config.py" in files
+    assert f"{prefix}/orchestration/builtin_allreduce__sum__fp32.cpp" in files
+    assert f"{prefix}/kernels/aiv/builtin_allreduce__sum__fp32.cpp" in files
+    assert "expected_arg_count = 4" in files[f"{prefix}/orchestration/builtin_allreduce__sum__fp32.cpp"]
+    assert "uint64_t count = 1;" in files[f"{prefix}/kernels/aiv/builtin_allreduce__sum__fp32.cpp"]
 
 
 def test_two_dist_tensor_formals_emit_two_ctx_scalars():

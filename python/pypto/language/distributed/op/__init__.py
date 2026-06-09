@@ -25,6 +25,7 @@ Sub-modules (one per op category):
 * :mod:`.tile_ops` — cross-rank tile ops (``remote_load``, ...).
 """
 
+from . import host_ops as host
 from . import system_ops as system
 from . import tensor_ops as tensor
 from . import tile_ops as tile
@@ -42,6 +43,7 @@ from .unified_ops import (
 __all__ = [
     "alloc_window_buffer",
     "get_comm_ctx",
+    "host",
     "nranks",
     "rank",
     "remote_load",
