@@ -452,7 +452,8 @@ void BindIR(nb::module_& m) {
   // plain Tensors. Otherwise mirrors TensorType's ctor overloads — memref /
   // tensor_view variants are equally valid on the distributed flavour.
   auto dist_tensor_type_class = nb::class_<DistributedTensorType, TensorType>(
-      ir, "DistributedTensorType", "Tensor backed by a per-rank slice of a CommGroup HCCL window buffer");
+      ir, "DistributedTensorType",
+      "Tensor backed by a per-rank slice of a HCCL window buffer carved by a CommDomainScopeStmt");
   dist_tensor_type_class.def(nb::init<const std::vector<ExprPtr>&, DataType>(), nb::arg("shape"),
                              nb::arg("dtype"), "Create a distributed tensor type");
   dist_tensor_type_class.def(nb::init<const std::vector<int64_t>&, DataType>(), nb::arg("shape"),
@@ -542,7 +543,7 @@ void BindIR(nb::module_& m) {
   BindFields<WindowBufferType>(window_buffer_type_class);
 
   // CommCtxType - singleton marker type for pld.get_comm_ctx outputs. The
-  // back-reference to the originating CommGroup lives on the producing op's
+  // back-reference to the enclosing CommDomainScopeStmt lives on the producing op's
   // DistributedTensor argument (via its WindowBuffer back-reference), so the
   // type itself carries no per-instance fields.
   auto comm_ctx_type_class =
@@ -1292,6 +1293,8 @@ void BindIR(nb::module_& m) {
       .value("Hierarchy", ScopeKind::Hierarchy, "Distributed hierarchy scope (uses level/role)")
       .value("Spmd", ScopeKind::Spmd, "SPMD dispatch scope (core_num/sync_start)")
       .value("Runtime", ScopeKind::Runtime, "Runtime orchestration scope (PTO2_SCOPE wrapper)")
+      .value("CommDomain", ScopeKind::CommDomain,
+             "Comm-domain scope (with orch.allocate_domain(...) wrapper for host_orch window buffers)")
       .export_values();
 
   // SplitMode enum
@@ -1438,6 +1441,27 @@ void BindIR(nb::module_& m) {
   runtime_scope_stmt_class.def_prop_ro(
       "attrs",
       [kwargs_to_pydict](const std::shared_ptr<const RuntimeScopeStmt>& self) {
+        return kwargs_to_pydict(self->attrs_);
+      },
+      scope_attrs_doc);
+
+  // CommDomainScopeStmt
+  auto comm_domain_scope_stmt_class = nb::class_<CommDomainScopeStmt, ScopeStmt>(
+      ir, "CommDomainScopeStmt",
+      "CommDomain scope: wraps host_orch use sites of a comm-domain's WindowBuffers. "
+      "Codegen lowers to `with orch.allocate_domain(name=..., workers=..., window_size=..., "
+      "buffers=[...]) as __comm_d<n>:`. Synthesized by MaterializeCommDomainScopes pass; no user DSL "
+      "surface.");
+  comm_domain_scope_stmt_class.def(
+      nb::init<std::vector<int64_t>, std::vector<WindowBufferPtr>, std::string, const StmtPtr&,
+               const Span&>(),
+      nb::arg("devices"), nb::arg("slots"), nb::arg("name_hint") = "", nb::arg("body"), nb::arg("span"),
+      "Create a CommDomain scope statement. ``devices`` empty = all devices (resolved to "
+      "*range(world_size) at codegen).");
+  BindFields<CommDomainScopeStmt>(comm_domain_scope_stmt_class);
+  comm_domain_scope_stmt_class.def_prop_ro(
+      "attrs",
+      [kwargs_to_pydict](const std::shared_ptr<const CommDomainScopeStmt>& self) {
         return kwargs_to_pydict(self->attrs_);
       },
       scope_attrs_doc);
@@ -1650,11 +1674,6 @@ void BindIR(nb::module_& m) {
                     nb::arg("functions"), nb::arg("name"), nb::arg("span"),
                     "Create a program from a list of functions. "
                     "GlobalVar references are created automatically from function names.");
-  program_class.def(
-      nb::init<const std::vector<FunctionPtr>&, std::vector<CommGroupPtr>, const std::string&, const Span&>(),
-      nb::arg("functions"), nb::arg("comm_groups"), nb::arg("name"), nb::arg("span"),
-      "Create a program from a list of functions and CommGroup metadata. "
-      "GlobalVar references are created automatically from function names.");
   program_class.def("get_function", &Program::GetFunction, nb::arg("name"),
                     "Get a function by name, returns None if not found");
   program_class.def("get_global_var", &Program::GetGlobalVar, nb::arg("name"),
@@ -1678,16 +1697,13 @@ void BindIR(nb::module_& m) {
       "Map of GlobalVar references to their corresponding functions, sorted by GlobalVar name");
   program_class.def_ro("name", &Program::name_, "Program name");
   program_class.def_ro("span", &Program::span_, "Source location");
-  program_class.def_ro("comm_groups", &Program::comm_groups_,
-                       "List of CommGroups declared on the program. CommGroups participate "
-                       "in structural equality / hashing through reflection.");
 
-  // WindowBuffer — a specialised Var subclass that carries CommGroup window-buffer
+  // WindowBuffer — a specialised Var subclass that carries window-buffer
   // allocation metadata. Mirrors MemRef's Var-subclass shape; the inherited
   // ``name_hint`` is mirrored from ``name_`` (UsualField, unique-id role).
   auto window_buffer_class = nb::class_<WindowBuffer, Var>(
       ir, "WindowBuffer",
-      "Per-rank CommGroup window-buffer allocation, modelled as a specialised Var. "
+      "Per-rank window-buffer allocation, modelled as a specialised Var. "
       "Its SSA-edge type is the singleton WindowBufferType; the allocation metadata "
       "(name, size, dtype, host-staging flags) lives on the Var subclass directly — "
       "the exact mirror of how MemRef carries (base, byte_offset, size) under MemRefType. "
@@ -1700,16 +1716,6 @@ void BindIR(nb::module_& m) {
                           "runtime-unique identifier flows through the inherited "
                           "Var.name_hint (taken from base.name_hint).");
   BindFields<WindowBuffer>(window_buffer_class);
-
-  auto comm_group_class =
-      nb::class_<CommGroup, IRNode>(ir, "CommGroup",
-                                    "A communication group inferred from pld.alloc_window_buffer ops: a "
-                                    "device-id list (empty = all devices) and a list of WindowBuffer slots "
-                                    "shared by every rank in the group.");
-  comm_group_class.def(nb::init<std::vector<int64_t>, std::vector<WindowBufferPtr>, Span>(),
-                       nb::arg("devices"), nb::arg("slots"), nb::arg("span") = Span::unknown(),
-                       "Create a CommGroup. ``devices`` empty = all devices.");
-  BindFields<CommGroup>(comm_group_class);
 
   // Python-style printer function - unified API for IRNode
   ir.def(

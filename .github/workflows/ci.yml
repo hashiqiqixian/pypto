@@ -256,8 +256,8 @@ jobs:
       ASCEND_HOME_PATH: /usr/local/Ascend/cann-9.0.0
       PTOAS_ROOT: ${{ github.workspace }}/dist-checkout/ptoas-bin
       PTO_ISA_ROOT: ${{ github.workspace }}/dist-checkout/pto-isa
-      PTOAS_VERSION: v0.43
-      PTOAS_SHA256: a7f4e2e67808a36c1491b24a46505105a50aee1d202c0bba25621132b70d806a
+      PTOAS_VERSION: v0.44
+      PTOAS_SHA256: caf5b463b2a574e1c45685ca3cea8bbfb38bc9f7d58e8158141b8b9e2eee133e
       CMAKE_BUILD_PARALLEL_LEVEL: 16
       CMAKE_C_COMPILER_LAUNCHER: ccache
       CMAKE_CXX_COMPILER_LAUNCHER: ccache

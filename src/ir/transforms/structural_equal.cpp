@@ -979,6 +979,7 @@ bool StructuralEqualImpl<AssertMode>::Equal(const IRNodePtr& lhs, const IRNodePt
   EQUAL_DISPATCH(HierarchyScopeStmt)
   EQUAL_DISPATCH(SpmdScopeStmt)
   EQUAL_DISPATCH(RuntimeScopeStmt)
+  EQUAL_DISPATCH(CommDomainScopeStmt)
   EQUAL_DISPATCH_TRANSPARENT(SeqStmts)
   EQUAL_DISPATCH(EvalStmt)
   EQUAL_DISPATCH(BreakStmt)
@@ -987,7 +988,6 @@ bool StructuralEqualImpl<AssertMode>::Equal(const IRNodePtr& lhs, const IRNodePt
   EQUAL_DISPATCH(Function)
   EQUAL_DISPATCH_TRANSPARENT(Program)
   EQUAL_DISPATCH(WindowBuffer)
-  EQUAL_DISPATCH(CommGroup)
 
   throw pypto::TypeError("Unknown IR node type in StructuralEqualImpl::Equal: " + lhs->TypeName());
 }

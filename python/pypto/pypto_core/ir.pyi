@@ -533,7 +533,7 @@ class TensorType(ShapedType):
         """
 
 class DistributedTensorType(TensorType):
-    """Tensor backed by a per-rank slice of a CommGroup HCCL window buffer.
+    """Tensor backed by a per-rank slice of a HCCL window buffer carved by a CommDomainScopeStmt.
 
     Subclass of :class:`TensorType` distinguished only by ``ObjectKind`` so
     that verifiers for cross-rank ops can reject plain :class:`TensorType`
@@ -1084,7 +1084,7 @@ class CommCtxType(Type):
     """Singleton marker type for ``pld.system.get_comm_ctx`` outputs.
 
     Carries no per-instance fields; the back-reference to the originating
-    :class:`CommGroup` is recovered from the producing op's
+    :class:`CommDomainScopeStmt` is recovered from the producing op's
     :class:`DistributedTensorType` argument (via its ``window_buffer_``
     back-reference). Consumed by ``pld.system.rank`` /
     ``pld.system.nranks`` to read scalar fields of the runtime
@@ -2182,6 +2182,10 @@ class ScopeKind(enum.Enum):
     Runtime = 5
     """Runtime orchestration scope (PTO2_SCOPE wrapper, manual on/off)."""
 
+    CommDomain = 6
+    """Comm-domain scope (with orch.allocate_domain(...) wrapper for host_orch
+    window buffers)."""
+
 class SplitMode(enum.Enum):
     """Split mode for cross-core data transfer."""
 
@@ -2361,6 +2365,46 @@ class RuntimeScopeStmt(ScopeStmt):
         span: Span,
     ) -> None:
         """Create a Runtime scope statement."""
+
+class CommDomainScopeStmt(ScopeStmt):
+    """CommDomain scope: wraps host_orch use sites of a comm-domain's WindowBuffers.
+
+    Codegen lowers each instance to a
+    ``with orch.allocate_domain(name=..., workers=..., window_size=...,
+    buffers=[CommBufferSpec(...)]) as __comm_d<n>:`` block at the top of the
+    host orchestration function, then emits ``body`` inside that block.
+
+    Synthesized by the ``MaterializeCommDomainScopes`` pass (formerly
+    ``MaterializeCommDomainScopes``); no user DSL surface. The Python printer is
+    transparent over this stmt — reparse + re-run the pass pipeline restores
+    the scope. ``.pto`` binary round-trip is lossless via reflection.
+    """
+
+    devices: Final[list[int]]
+    """Covered worker indices (ascending). Empty list = all devices
+    (resolved at codegen to ``*range(world_size)``)."""
+
+    slots: Final[list[WindowBuffer]]
+    """WindowBuffer allocations carved out of this scope's window (alloc-order)."""
+
+    def __init__(
+        self,
+        devices: list[int],
+        slots: list[WindowBuffer],
+        name_hint: str = "",
+        *,
+        body: Stmt,
+        span: Span,
+    ) -> None:
+        """Create a CommDomain scope statement.
+
+        Args:
+            devices: Covered worker indices (ascending). Empty = all devices.
+            slots: WindowBuffer allocations (alloc-order).
+            name_hint: Handle name hint (codegen derives ``__comm_d<n>``).
+            body: Inner statement block.
+            span: Source location.
+        """
 
 class SeqStmts(Stmt):
     """Sequence of statements: a sequence of statements."""
@@ -2557,11 +2601,6 @@ class Program(IRNode):
     functions: Final[dict[GlobalVar, Function]]
     """Map of GlobalVar references to their corresponding functions, sorted by GlobalVar name."""
 
-    comm_groups: Final[list[CommGroup]]
-    """CommGroups declared on the program. Participates in structural
-    equality / hashing through reflection."""
-
-    @overload
     def __init__(
         self,
         functions: list[Function],
@@ -2577,16 +2616,6 @@ class Program(IRNode):
             name: Program name (optional)
             span: Source location
         """
-
-    @overload
-    def __init__(
-        self,
-        functions: list[Function],
-        comm_groups: list[CommGroup],
-        name: str,
-        span: Span,
-    ) -> None:
-        """Create a program from a list of functions and CommGroup metadata."""
 
     def get_function(self, name: str) -> Function | None:
         """Get a function by name.
@@ -2636,7 +2665,7 @@ class Program(IRNode):
         """
 
 class WindowBuffer(Var):
-    """Per-rank CommGroup HCCL window-buffer allocation, modelled as a specialised Var.
+    """Per-rank HCCL window-buffer allocation carved by a CommDomainScopeStmt, modelled as a specialised Var.
 
     Mirrors :class:`MemRef`: its SSA-edge type is the singleton
     :class:`WindowBufferType`; allocation metadata (the underlying Ptr Var,
@@ -2675,31 +2704,6 @@ class WindowBuffer(Var):
         span: Span = ...,
     ) -> None:
         """Create a WindowBuffer wrapping the given Ptr ``base`` Var."""
-
-class CommGroup(IRNode):
-    """A communication group inferred for a ``@pl.program``.
-
-    The ``CollectCommGroups`` pass (added in N4) populates
-    ``program.comm_groups`` from ``pld.alloc_window_buffer`` ops and their
-    dispatch coverage. Participates in structural equality / hashing via
-    reflection.
-    """
-
-    devices: Final[list[int]]
-    """Ascending-sorted physical device-id list. **Empty list means "all
-    devices"** (every entry of ``DistributedConfig.device_ids``, resolved by
-    the driver at submit-time)."""
-
-    slots: Final[list[WindowBuffer]]
-    """Allocation slots shared by every rank in the group (alloc-order)."""
-
-    def __init__(
-        self,
-        devices: list[int],
-        slots: list[WindowBuffer],
-        span: Span = ...,
-    ) -> None:
-        """Create a CommGroup. Pass an empty ``devices`` list for "all devices"."""
 
 @overload
 def structural_hash(node: IRNode, enable_auto_mapping: bool = False) -> int: ...
@@ -3801,6 +3805,7 @@ class IRVisitor:
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> None: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> None: ...
     def visit_runtime_scope_stmt(self, op: RuntimeScopeStmt) -> None: ...
+    def visit_comm_domain_scope_stmt(self, op: CommDomainScopeStmt) -> None: ...
     def visit_seq_stmts(self, op: SeqStmts) -> None: ...
     def visit_yield_stmt(self, op: YieldStmt) -> None: ...
     def visit_return_stmt(self, op: ReturnStmt) -> None: ...
@@ -3881,6 +3886,7 @@ class IRMutator:
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> Stmt: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> Stmt: ...
     def visit_runtime_scope_stmt(self, op: RuntimeScopeStmt) -> Stmt: ...
+    def visit_comm_domain_scope_stmt(self, op: CommDomainScopeStmt) -> Stmt: ...
     def visit_seq_stmts(self, op: SeqStmts) -> Stmt: ...
     def visit_yield_stmt(self, op: YieldStmt) -> Stmt: ...
     def visit_return_stmt(self, op: ReturnStmt) -> Stmt: ...

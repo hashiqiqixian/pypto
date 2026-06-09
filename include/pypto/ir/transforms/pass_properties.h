@@ -28,14 +28,17 @@ namespace pass {
 
 inline const PassProperties kInlineFunctionsProperties{.produced = {IRProperty::InlineFunctionsEliminated}};
 
-// -- CollectCommGroups pass (runs at the end of the pipeline, just before -----
+// -- MaterializeCommDomainScopes pass (runs at the end of the pipeline, just before -----
 //    the final Simplify). Nothing between InlineFunctions and here touches
 //    the host_orch alloc/window/dispatch chain (host_orch is never tile-
 //    lowered), so the alloc/view/dispatch sites are still discoverable.
-//    Traces pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r) and
-//    materialises WindowBuffer + Program.comm_groups_.
+//    Traces pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r),
+//    materialises WindowBuffer back-references on every DistributedTensorType view,
+//    and wraps the host_orch body in nested CommDomainScopeStmts (one per
+//    inferred comm domain).
 
-inline const PassProperties kCollectCommGroupsProperties{.produced = {IRProperty::CommGroupsCollected}};
+inline const PassProperties kMaterializeCommDomainScopesProperties{
+    .produced = {IRProperty::CommDomainScopesMaterialized}};
 
 // -- MaterializeRuntimeScopes pass (runs last, after the final Simplify) ------
 //    Inserts explicit AUTO RuntimeScopeStmt nodes for the orchestration function

@@ -170,14 +170,16 @@ class PassManager:
             ("DeriveCallDirections", lambda: passes.derive_call_directions()),
             ("ExpandManualPhaseFence", lambda: passes.expand_manual_phase_fence()),
             # Trace pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r)
-            # in each host_orch and materialise WindowBuffer +
-            # Program.comm_groups_. Runs at the end of the pipeline because
-            # nothing between InlineFunctions and here touches the host_orch
+            # in each host_orch, materialise WindowBuffer back-references on
+            # every DistributedTensorType view, and wrap the host_orch body
+            # in nested CommDomainScopeStmts (one per inferred comm domain).
+            # Runs at the end of the pipeline because nothing between
+            # InlineFunctions and here touches the host_orch
             # alloc/window/dispatch chain (host_orch is never tile-lowered),
             # so the alloc/view/dispatch sites are still discoverable. Runs
             # before the final Simplify so any constant folding it does on the
             # collected sizes is applied uniformly.
-            ("CollectCommGroups", lambda: passes.collect_comm_groups()),
+            ("MaterializeCommDomainScopes", lambda: passes.materialize_comm_domain_scopes()),
             ("Simplify", lambda: passes.simplify()),
             # Insert explicit AUTO RuntimeScopeStmt nodes (function body + for/if
             # bodies) into Orchestration functions so codegen emits PTO2_SCOPE
