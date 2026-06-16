@@ -33,6 +33,15 @@
 namespace pypto {
 namespace codegen {
 
+struct BuiltinNextLevelSpec {
+  std::string op_name;
+  std::string variant;
+  std::string entry_symbol;
+  std::string template_dir;
+  std::string op_cpp;
+  std::string dtype_cpp;
+};
+
 /**
  * @brief Distributed code generator for simpler runtime Python orchestration
  *
@@ -71,6 +80,26 @@ class DistributedCodegen : public CodegenBase {
   /// the fall-through path. Mirrors the manual ``declared_vars_.insert(...)``
   /// performed by in-class emitters such as :func:`EmitTensorCreate`.
   void MarkDeclared(const std::string& var_name) { declared_vars_.insert(var_name); }
+
+  /// Return builtin chip-callable variants requested while emitting the HOST
+  /// orchestrator. Python's backend materializes these specs under
+  /// ``next_levels/<variant>/`` so runtime assembly can keep scanning the
+  /// existing chip-callable layout.
+  [[nodiscard]] const std::vector<BuiltinNextLevelSpec>& GetBuiltinNextLevelSpecs() const {
+    return builtin_next_level_specs_;
+  }
+
+  /// Mark a builtin variant as seen in this codegen run. Returns true only for
+  /// the first sighting, letting registered op handlers de-duplicate
+  /// ``next_levels/<variant>/`` materialization.
+  [[nodiscard]] bool MarkBuiltinEmitted(const std::string& variant);
+
+  /// Record a materializable builtin next-level callable variant.
+  void RecordBuiltinNextLevel(const ir::CallPtr& call, const std::string& variant);
+
+  /// Emit the runtime TaskArgs + submit_next_level path for the lowered
+  /// ``builtin.tensor.allreduce`` op.
+  void EmitBuiltinTensorAllReduceDispatch(const ir::CallPtr& call, const std::string& variant);
 
  protected:
   // Statement visitors
@@ -216,6 +245,10 @@ class DistributedCodegen : public CodegenBase {
   /// dispatch outside its enclosing comm-domain scope.
   [[nodiscard]] ir::CommDomainScopeStmtPtr ScopeForWindowBuffer(const ir::WindowBufferPtr& wb) const;
 
+  /// Resolve HOST-orchestrator DistributedTensor aliases back to the expression
+  /// that carries the materialized WindowBuffer back-reference.
+  [[nodiscard]] ir::ExprPtr ResolveDistributedTensorArg(const ir::ExprPtr& expr) const;
+
   ir::ProgramPtr program_;
   CodeEmitter emitter_;
 
@@ -261,7 +294,14 @@ class DistributedCodegen : public CodegenBase {
   // HOST orchestrator AssignStmt defs, populated before comm-domain emission.
   std::unordered_map<const ir::Var*, ir::ExprPtr> host_orch_var_defs_;
   bool unwrap_hoisted_var_refs_{false};
+
+  std::unordered_set<std::string> emitted_builtin_variants_;
+  std::vector<BuiltinNextLevelSpec> builtin_next_level_specs_;
 };
+
+[[nodiscard]] std::string MangleBuiltinVariant(const std::string& op_name, int reduce_op,
+                                               const DataType& dtype);
+[[nodiscard]] std::string BuiltinEntrySymbol(const std::string& variant);
 
 }  // namespace codegen
 }  // namespace pypto

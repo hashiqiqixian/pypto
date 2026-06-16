@@ -12,6 +12,7 @@
 #include "pypto/codegen/distributed/distributed_codegen.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -26,9 +27,11 @@
 #include "pypto/codegen/distributed/distributed_op_registry.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/stmt.h"
@@ -49,7 +52,46 @@ constexpr const char kCommDomainHandlePrefix[] = "__";
 std::string HandleVarForScope(const ir::CommDomainScopeStmtPtr& scope) {
   return std::string(kCommDomainHandlePrefix) + scope->name_hint_;
 }
+
+std::string ReduceOpSuffix(int reduce_op) {
+  CHECK(reduce_op == static_cast<int>(ir::ReduceOp::kSum))
+      << "builtin.tensor.allreduce variant mangling currently supports only ReduceOp.Sum, got " << reduce_op;
+  return "sum";
+}
+
+std::string ReduceOpCpp(int reduce_op) {
+  CHECK(reduce_op == static_cast<int>(ir::ReduceOp::kSum))
+      << "builtin.tensor.allreduce currently supports only ReduceOp.Sum, got " << reduce_op;
+  return "ReduceOp::kSum";
+}
+
+std::string DataTypeSuffix(const DataType& dtype) {
+  CHECK(dtype == DataType::FP32)
+      << "builtin.tensor.allreduce variant mangling currently supports only FP32, got " << dtype.ToString();
+  return "fp32";
+}
+
+std::string DataTypeCpp(const DataType& dtype) {
+  CHECK(dtype == DataType::FP32)
+      << "builtin.tensor.allreduce template instantiation currently supports only FP32, got "
+      << dtype.ToString();
+  return "float";
+}
 }  // namespace
+
+std::string MangleBuiltinVariant(const std::string& op_name, int reduce_op, const DataType& dtype) {
+  return op_name + "__" + ReduceOpSuffix(reduce_op) + "__" + DataTypeSuffix(dtype);
+}
+
+std::string BuiltinEntrySymbol(const std::string& variant) {
+  std::string result = variant;
+  for (auto& c : result) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') {
+      c = '_';
+    }
+  }
+  return result;
+}
 
 // ========================================================================
 // Public API
@@ -70,6 +112,8 @@ std::string DistributedCodegen::Generate(const ir::ProgramPtr& program) {
   host_orch_var_defs_.clear();
   unwrap_hoisted_var_refs_ = false;
   tuple_element_tensors_.clear();
+  emitted_builtin_variants_.clear();
+  builtin_next_level_specs_.clear();
 
   comm_domain_stack_.clear();
 
@@ -135,6 +179,113 @@ ir::CommDomainScopeStmtPtr DistributedCodegen::ScopeForWindowBuffer(const ir::Wi
                            "(MaterializeCommDomainScopes pass must run before DistributedCodegen, and the "
                            "dispatch must lexically sit inside its enclosing comm-domain scope)";
   return nullptr;  // unreachable
+}
+
+ir::ExprPtr DistributedCodegen::ResolveDistributedTensorArg(const ir::ExprPtr& expr) const {
+  auto dist_type = ir::As<ir::DistributedTensorType>(expr->GetType());
+  if (!dist_type || dist_type->window_buffer_.has_value()) {
+    return expr;
+  }
+
+  auto var = ir::As<ir::Var>(expr);
+  if (!var) {
+    return expr;
+  }
+
+  std::unordered_set<const ir::Var*> visited;
+  const ir::Var* cur = var.get();
+  while (visited.insert(cur).second) {
+    auto it = host_orch_var_defs_.find(cur);
+    if (it == host_orch_var_defs_.end() || !it->second) {
+      break;
+    }
+    auto candidate_type = ir::As<ir::DistributedTensorType>(it->second->GetType());
+    if (candidate_type && candidate_type->window_buffer_.has_value()) {
+      return it->second;
+    }
+    auto next_var = ir::As<ir::Var>(it->second);
+    if (!next_var) {
+      break;
+    }
+    cur = next_var.get();
+  }
+
+  return expr;
+}
+
+bool DistributedCodegen::MarkBuiltinEmitted(const std::string& variant) {
+  return emitted_builtin_variants_.insert(variant).second;
+}
+
+void DistributedCodegen::RecordBuiltinNextLevel(const ir::CallPtr& call, const std::string& variant) {
+  INTERNAL_CHECK(call && call->op_) << "Internal error: builtin next-level record needs a valid Call";
+  const auto& op_name = call->op_->name_;
+  const auto& entry = ir::OpRegistry::GetInstance().GetEntry(op_name);
+  const auto& template_dir = entry.GetTemplateDir();
+  INTERNAL_CHECK_SPAN(template_dir.has_value(), call->span_)
+      << "Internal error: builtin op '" << op_name << "' must declare template_dir";
+
+  const int reduce_op = call->GetAttr<int>("op");
+  const auto dtype = call->GetAttr<DataType>("dtype");
+  BuiltinNextLevelSpec spec;
+  spec.op_name = op_name;
+  spec.variant = variant;
+  spec.entry_symbol = BuiltinEntrySymbol(variant);
+  spec.template_dir = template_dir.value();  // NOLINT(bugprone-unchecked-optional-access)
+  spec.op_cpp = ReduceOpCpp(reduce_op);
+  spec.dtype_cpp = DataTypeCpp(dtype);
+  builtin_next_level_specs_.push_back(std::move(spec));
+}
+
+void DistributedCodegen::EmitBuiltinTensorAllReduceDispatch(const ir::CallPtr& call,
+                                                            const std::string& variant) {
+  INTERNAL_CHECK(call) << "Internal error: builtin.tensor.allreduce dispatch needs a valid Call";
+  INTERNAL_CHECK_SPAN(call->args_.size() == 2, call->span_)
+      << "Internal error: builtin.tensor.allreduce dispatch expects exactly two args";
+
+  const std::string rank_expr = ResolveRankExpr(call);
+  INTERNAL_CHECK_SPAN(!rank_expr.empty(), call->span_)
+      << "Internal error: builtin.tensor.allreduce dispatch must carry device= attr";
+
+  auto data_arg = ResolveDistributedTensorArg(call->args_[0]);
+  auto signal_arg = ResolveDistributedTensorArg(call->args_[1]);
+  auto data_type = ir::As<ir::DistributedTensorType>(data_arg->GetType());
+  auto signal_type = ir::As<ir::DistributedTensorType>(signal_arg->GetType());
+  INTERNAL_CHECK_SPAN(data_type && signal_type, call->span_)
+      << "Internal error: builtin.tensor.allreduce args must be DistributedTensorType";
+  INTERNAL_CHECK_SPAN(data_type->window_buffer_.has_value() && signal_type->window_buffer_.has_value(),
+                      call->span_)
+      << "Internal error: builtin.tensor.allreduce args must have materialized WindowBuffer back-references";
+
+  const auto& data_wb = data_type->window_buffer_.value();
+  const std::string handle_var = HandleVarForScope(ScopeForWindowBuffer(data_wb));
+  const std::string ta_var = "_ta_" + std::to_string(task_args_counter_++);
+  const std::string cfg_var = ta_var + "_config";
+
+  emitter_.EmitLine(ta_var + " = TaskArgs()");
+  for (size_t i = 0; i < call->args_.size(); ++i) {
+    auto arg = ResolveDistributedTensorArg(call->args_[i]);
+    auto dist_type = ir::As<ir::DistributedTensorType>(arg->GetType());
+    INTERNAL_CHECK_SPAN(dist_type && dist_type->window_buffer_.has_value(), call->span_)
+        << "Internal error: builtin.tensor.allreduce arg must have a WindowBuffer";
+    const auto& window_buffer = dist_type->window_buffer_.value();
+    const std::string arg_handle = HandleVarForScope(ScopeForWindowBuffer(window_buffer));
+    const std::string name = SanitizeName(window_buffer->name_hint_);
+    const std::string shape = FormatShapeTuple(dist_type->shape_);
+    const std::string dtype_enum = "DataType." + DataTypeToSimplerEnum(dist_type->dtype_);
+    emitter_.EmitLine(ta_var + ".add_tensor(ContinuousTensor.make(data=" + arg_handle + "[" + rank_expr +
+                      "].buffer_ptrs[\"" + name + "\"], shapes=" + shape + ", dtype=" + dtype_enum +
+                      ", child_memory=True), TensorArgType.INOUT)");
+  }
+
+  emitter_.EmitLine(ta_var + ".add_scalar(" + handle_var + "[" + rank_expr + "].domain_size)");
+  emitter_.EmitLine(ta_var + ".add_scalar(" + handle_var + "[" + rank_expr + "].device_ctx)");
+  emitter_.EmitLine(cfg_var + " = CallConfig()");
+  emitter_.EmitLine(cfg_var + ".block_dim = 1");
+  emitter_.EmitLine(cfg_var + ".aicpu_thread_num = config.aicpu_thread_num");
+  emitter_.EmitLine("_keep.append(" + ta_var + ")");
+  emitter_.EmitLine("orch.submit_next_level(callables[\"" + variant + "\"], " + ta_var + ", " + cfg_var +
+                    ", worker=" + rank_expr + ")");
 }
 
 // ========================================================================
@@ -209,7 +360,7 @@ void DistributedCodegen::EmitImports() {
   // harmless to import for comm-less L3 programs.
   emitter_.EmitLine(
       "from simpler.task_interface import "
-      "CommBufferSpec, ContinuousTensor, DataType, TaskArgs, TensorArgType");
+      "CallConfig, CommBufferSpec, ContinuousTensor, DataType, TaskArgs, TensorArgType");
   emitter_.EmitLine("from pypto.runtime.tensor_arg import make_tensor_arg");
 }
 
@@ -503,6 +654,18 @@ void DistributedCodegen::VisitStmt_(const ir::AssignStmtPtr& op) {
     return;
   }
 
+  const auto value_call = ir::As<ir::Call>(op->value_);
+  const bool distributed_tensor_alias =
+      ir::As<ir::DistributedTensorType>(op->var_->GetType()) &&
+      ir::As<ir::DistributedTensorType>(op->value_->GetType()) &&
+      (!value_call || (value_call->op_ && value_call->op_->name_ == "pld.tensor.window"));
+  if (distributed_tensor_alias) {
+    declared_vars_.insert(var_name);
+    current_target_var_ = "";
+    current_expr_value_ = "";
+    return;
+  }
+
   current_target_var_ = var_name;
   current_expr_value_ = "";
 
@@ -744,7 +907,8 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
     // with ``child_memory=True``. ``As<DistributedTensorType>`` is strict
     // ObjectKind match, so this branch fires only for DistributedTensor —
     // plain TensorType falls through to the existing make_tensor_arg path.
-    if (auto dist_type = ir::As<ir::DistributedTensorType>(call->args_[i]->GetType())) {
+    auto dist_arg = ResolveDistributedTensorArg(call->args_[i]);
+    if (auto dist_type = ir::As<ir::DistributedTensorType>(dist_arg->GetType())) {
       INTERNAL_CHECK_SPAN(!rank_expr.empty(), call->span_)
           << "Call passing DistributedTensor args must carry device= attr "
              "(N3 parser writes attrs[\"device\"] on chip-orch dispatch sites)";
@@ -797,7 +961,8 @@ void DistributedCodegen::EmitCallToWorker(const ir::CallPtr& call, const ir::Fun
   // map as the add_tensor branch above so two DistributedTensors from
   // different CommGroups route to their respective handles.
   for (const auto& arg : call->args_) {
-    auto dist_type = ir::As<ir::DistributedTensorType>(arg->GetType());
+    auto dist_arg = ResolveDistributedTensorArg(arg);
+    auto dist_type = ir::As<ir::DistributedTensorType>(dist_arg->GetType());
     if (!dist_type) continue;
     INTERNAL_CHECK_SPAN(dist_type->window_buffer_.has_value(), call->span_)
         << "DistributedTensorType arg must have window_buffer_ populated by N4 pass";
