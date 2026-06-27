@@ -186,16 +186,21 @@ keyword attributes。
 ### `pld.tensor.allreduce`
 
 ```text
+pld.tensor.allreduce(src, *, op: ReduceOp = ReduceOp.Sum) -> DistributedTensorType(src)
 pld.tensor.allreduce(src, signal, *, op: ReduceOp = ReduceOp.Sum) -> DistributedTensorType(src)
 ```
 
 对所有参与 rank 的窗口绑定 `src` 切片做原地 all-reduce，并返回与 `src`
-相同的类型。用户显式传入窗口绑定的 INT32 `signal` tensor，并保证它为参与 rank
-提供足够的信号槽位；通信域物化会把该 signal buffer 保留在与 `src` 相同的
-comm-domain 中，即使它没有传给用户自定义 chip kernel。public op 当前接受
+相同的类型。host-orchestrator 用户代码可以在 `for` 和 `while` 循环外省略 `signal`；
+comm-domain materialization 阶段会为该 call 插入 private INT32 signal window，
+语义 shape 为 `[world_size, 1]`。该阶段会先插入 standalone `world_size = pld.world_size()` binding，
+再用该变量构造 buffer size 和 window shape。循环内的所有调用都会被拒绝，因为当前 signal 协议只能
+单次使用。显式 `signal` 仍然是 InCore
+lowering 和内部测试使用的形态。通信域物化会把该 signal buffer 保留在与 `src`
+相同的 comm-domain 中，即使它没有传给用户自定义 chip kernel。public op 当前接受
 `ReduceOp.Sum`，并会拒绝预留的 `Max` / `Min` / `Prod` 变体，直到这些
-lowering 落地。host builtin lowering 路径当前仅支持 `Sum` + FP32 变体，并要求
-signal tensor 为 rank-1。
+lowering 落地。host builtin lowering 路径当前支持 `Sum` + FP32 变体，并接受
+rank-1 `[world_size]` 或合成的 rank-2 `[world_size, 1]` signal。
 
 ### `pld.system.notify`（TNOTIFY）
 

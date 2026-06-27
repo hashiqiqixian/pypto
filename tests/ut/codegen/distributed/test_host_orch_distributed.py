@@ -544,12 +544,14 @@ def test_host_allreduce_builtin_variant_is_recorded_once():
         def host_orch(self):
             data_buf = pld.alloc_window_buffer(SIZE * 4)
             signal_buf = pld.alloc_window_buffer(pld.world_size() * 4)
+            signal_buf_1 = pld.alloc_window_buffer(pld.world_size() * 4)
             data = pld.window(data_buf, [SIZE], dtype=pl.FP32)
             signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
+            signal_1 = pld.window(signal_buf_1, [pld.world_size()], dtype=pl.INT32)
             for r in pl.range(pld.world_size()):
                 self.chip_orch(data, device=r)
             pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
-            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            pld.tensor.allreduce(data, signal_1, op=pld.ReduceOp.Sum)
             return 0
 
     generated, cg = _lower_host_collectives(Prog)

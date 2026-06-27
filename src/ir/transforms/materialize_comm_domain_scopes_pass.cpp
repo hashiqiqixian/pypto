@@ -23,14 +23,17 @@
 #include <vector>
 
 #include "pypto/core/error.h"
+#include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/op_registry.h"
 #include "pypto/ir/program.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/base/visitor.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
@@ -43,6 +46,155 @@ namespace pypto {
 namespace ir {
 
 namespace {
+
+[[nodiscard]] bool IsTensorAllReduce(const CallPtr& call) {
+  return call && call->op_ && call->op_->name_ == "pld.tensor.allreduce";
+}
+
+class NameCollector : public IRVisitor {
+ public:
+  std::set<std::string> names;
+
+ protected:
+  void VisitVarLike_(const VarPtr& op) override {
+    if (op && !op->name_hint_.empty()) names.insert(op->name_hint_);
+    IRVisitor::VisitVarLike_(op);
+  }
+};
+
+class ImplicitAllReduceSignalSynthesizer : public IRMutator {
+ public:
+  explicit ImplicitAllReduceSignalSynthesizer(std::set<std::string> used_names)
+      : used_names_(std::move(used_names)) {}
+
+  [[nodiscard]] bool modified() const { return modified_; }
+
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    if (IsTensorAllReduce(op)) {
+      CheckAllReduceCall(op);
+      CHECK_SPAN(op->args_.size() == 2, op->span_)
+          << "pld.tensor.allreduce without an explicit signal must be a standalone assignment or expression "
+             "statement before comm-domain materialization.";
+    }
+    return IRMutator::VisitExpr_(op);
+  }
+
+  StmtPtr VisitStmt_(const AssignStmtPtr& op) override {
+    auto call = As<Call>(op->value_);
+    if (!IsTensorAllReduce(call)) return IRMutator::VisitStmt_(op);
+    CheckAllReduceCall(call);
+    if (call->args_.size() == 2) return IRMutator::VisitStmt_(op);
+
+    auto [prefix, signal] = MakeSignalBinding(call->span_);
+    auto target = VisitExpr(call->args_[0]);
+    auto rewritten_call = MakeAllReduceCall(call, target, signal);
+    auto result = MutableCopy(op);
+    result->value_ = rewritten_call;
+
+    prefix.push_back(result);
+    modified_ = true;
+    return SeqStmts::Flatten(std::move(prefix), op->span_);
+  }
+
+  StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
+    auto call = As<Call>(op->expr_);
+    if (!IsTensorAllReduce(call)) return IRMutator::VisitStmt_(op);
+    CheckAllReduceCall(call);
+    if (call->args_.size() == 2) return IRMutator::VisitStmt_(op);
+
+    auto [prefix, signal] = MakeSignalBinding(call->span_);
+    auto target = VisitExpr(call->args_[0]);
+    auto rewritten_call = MakeAllReduceCall(call, target, signal);
+    std::vector<StmtPtr> stmts = std::move(prefix);
+    stmts.push_back(std::make_shared<EvalStmt>(rewritten_call, op->span_, op->leading_comments_));
+    modified_ = true;
+    return SeqStmts::Flatten(std::move(stmts), op->span_);
+  }
+
+  StmtPtr VisitStmt_(const ForStmtPtr& op) override {
+    ++repeating_scope_depth_;
+    auto result = IRMutator::VisitStmt_(op);
+    --repeating_scope_depth_;
+    return result;
+  }
+
+  StmtPtr VisitStmt_(const WhileStmtPtr& op) override {
+    ++repeating_scope_depth_;
+    auto result = IRMutator::VisitStmt_(op);
+    --repeating_scope_depth_;
+    return result;
+  }
+
+ private:
+  void CheckAllReduceCall(const CallPtr& call) const {
+    CHECK_SPAN(call->args_.size() == 1 || call->args_.size() == 2, call->span_)
+        << "pld.tensor.allreduce expects target[, signal], got " << call->args_.size()
+        << " positional arguments";
+    CHECK_SPAN(repeating_scope_depth_ == 0, call->span_)
+        << "pld.tensor.allreduce is not supported inside a for/while loop. "
+           "The signal protocol is single-use and cannot reuse a signal across dynamic invocations.";
+  }
+
+  struct SignalNames {
+    std::string world_size_name;
+    std::string buf_name;
+    std::string signal_name;
+  };
+
+  [[nodiscard]] SignalNames FreshSignalNames() {
+    while (true) {
+      auto suffix = std::to_string(next_id_++);
+      auto world_size_name = "__allreduce_signal_world_size_" + suffix;
+      auto buf_name = "__allreduce_signal_buf_" + suffix;
+      auto signal_name = "__allreduce_signal_" + suffix;
+      if (used_names_.count(world_size_name) != 0 || used_names_.count(buf_name) != 0 ||
+          used_names_.count(signal_name) != 0) {
+        continue;
+      }
+      used_names_.insert(world_size_name);
+      used_names_.insert(buf_name);
+      used_names_.insert(signal_name);
+      return {world_size_name, buf_name, signal_name};
+    }
+  }
+
+  [[nodiscard]] std::pair<std::vector<StmtPtr>, VarPtr> MakeSignalBinding(const Span& span) {
+    auto names = FreshSignalNames();
+
+    auto world_size_call = OpRegistry::GetInstance().Create("pld.system.world_size", {}, span);
+    auto world_size_var = std::make_shared<Var>(names.world_size_name, world_size_call->GetType(), span);
+    auto world_size_assign = std::make_shared<AssignStmt>(world_size_var, world_size_call, span);
+
+    auto four = std::make_shared<ConstInt>(4, DataType::INT64, span);
+    auto size_bytes = MakeMul(world_size_var, four, span);
+
+    std::vector<std::pair<std::string, std::any>> alloc_kwargs = {{"name", names.buf_name}};
+    auto alloc_call =
+        OpRegistry::GetInstance().Create("pld.tensor.alloc_window_buffer", {size_bytes}, alloc_kwargs, span);
+    auto buf_var = std::make_shared<Var>(names.buf_name, alloc_call->GetType(), span);
+    auto buf_assign = std::make_shared<AssignStmt>(buf_var, alloc_call, span);
+
+    auto one = std::make_shared<ConstInt>(1, DataType::INT64, span);
+    auto signal_shape = std::make_shared<MakeTuple>(std::vector<ExprPtr>{world_size_var, one}, span);
+    std::vector<std::pair<std::string, std::any>> window_kwargs = {{"dtype", DataType::INT32}};
+    auto window_call =
+        OpRegistry::GetInstance().Create("pld.tensor.window", {buf_var, signal_shape}, window_kwargs, span);
+    auto signal_var = std::make_shared<Var>(names.signal_name, window_call->GetType(), span);
+    auto signal_assign = std::make_shared<AssignStmt>(signal_var, window_call, span);
+
+    return {{world_size_assign, buf_assign, signal_assign}, signal_var};
+  }
+
+  [[nodiscard]] CallPtr MakeAllReduceCall(const CallPtr& call, const ExprPtr& target, const ExprPtr& signal) {
+    return OpRegistry::GetInstance().Create("pld.tensor.allreduce", {target, signal}, call->kwargs_,
+                                            call->span_);
+  }
+
+  std::set<std::string> used_names_;
+  int64_t next_id_ = 0;
+  int repeating_scope_depth_ = 0;
+  bool modified_ = false;
+};
 
 /// Device coverage descriptor inferred from a dispatch ``device=`` expression.
 struct DeviceDescriptor {
@@ -367,17 +519,25 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
     return func;
   }
 
+  NameCollector name_collector;
+  name_collector.VisitStmt(func->body_);
+  ImplicitAllReduceSignalSynthesizer signal_synthesizer(std::move(name_collector.names));
+  StmtPtr materialization_body = signal_synthesizer.VisitStmt(func->body_);
+
   AllocAndWindowCollector collector;
-  collector.VisitStmt(func->body_);
+  collector.VisitStmt(materialization_body);
 
   if (collector.allocs.empty()) {
     // No window-buffer allocations in this host_orch — nothing to do.
-    return func;
+    if (!signal_synthesizer.modified()) return func;
+    auto new_func = MutableCopy(func);
+    new_func->body_ = materialization_body;
+    return new_func;
   }
 
   // Phase 2: record device-descriptor evidence from dispatch sites.
   DispatchAnalyzer analyzer(collector.view_to_window, chip_orchs, collector.var_defs);
-  analyzer.VisitStmt(func->body_);
+  analyzer.VisitStmt(materialization_body);
 
   // Host-level collectives do not carry their own device= selector. Their
   // signal buffer is a user-visible window slot, so inherit the data buffer's
@@ -457,7 +617,8 @@ FunctionPtr ProcessHostOrch(const FunctionPtr& func, const std::map<std::string,
   // Phase 7: rewrite host_orch body so every reference to a pld.tensor.window result
   // Var picks up the type-updated copy. The base IRMutator handles all uses;
   // Substitute is the wrapper that does exactly this transformation.
-  StmtPtr new_body = view_subst.empty() ? func->body_ : transform_utils::Substitute(func->body_, view_subst);
+  StmtPtr new_body =
+      view_subst.empty() ? materialization_body : transform_utils::Substitute(materialization_body, view_subst);
 
   // Phase 8: wrap new_body in nested CommDomainScopeStmts. Outer = first
   // declared domain, inner = last. ``name_hint_`` is ``"comm_d<n>"`` so

@@ -28,10 +28,11 @@ namespace pass {
 
 inline const PassProperties kInlineFunctionsProperties{.produced = {IRProperty::InlineFunctionsEliminated}};
 
-// -- MaterializeCommDomainScopes pass (runs at the end of the pipeline, just before -----
-//    the final Simplify). Nothing between InlineFunctions and here touches
-//    the host_orch alloc/window/dispatch chain (host_orch is never tile-
-//    lowered), so the alloc/view/dispatch sites are still discoverable.
+// -- MaterializeCommDomainScopes pass (runs late in the pipeline, after ------
+//    phase-fence expansion and immediately before LowerHostTensorCollectives).
+//    Nothing between InlineFunctions and here removes the host_orch
+//    alloc/window/dispatch chain (host_orch is never tile-lowered), so the
+//    alloc/view/dispatch sites are still discoverable.
 //    Traces pld.tensor.alloc_window_buffer → pld.tensor.window → dispatch(device=r),
 //    materialises WindowBuffer back-references on every DistributedTensorType view,
 //    and wraps the host_orch body in nested CommDomainScopeStmts (one per
@@ -89,14 +90,16 @@ inline const PassProperties kNormalizeStmtStructureProperties{
 
 inline const PassProperties kSimplifyProperties{};
 
-// -- Composite op lowering pass (tile.sin / tile.cos -> primitives, etc.) -----
+// -- Composite op lowering pass (tile.sin / tile.cos / InCore allreduce -> primitives, etc.) -----
 //
-// LowerCompositeOps decomposes composite tile ops into primitive arithmetic
-// ops. Today the only composite ops handled are tile.sin / tile.cos (Cody-Waite
-// range reduction + degree-9 Horner polynomial); future composite ops add a
-// rule to the file-local dispatch table in lower_composite_ops_pass.cpp. The
-// pass operates purely within the existing tile-op vocabulary, so it neither
-// requires nor produces nor invalidates any IRProperty.
+// LowerCompositeOps decomposes composite tile/distributed ops into primitive
+// ops. Today it handles tile.sin / tile.cos (Cody-Waite range reduction +
+// degree-9 Horner polynomial) and explicit-signal InCore pld.tensor.allreduce;
+// host-level allreduce is skipped and lowered later by LowerHostTensorCollectives.
+// Future composite ops add a rule to the file-local dispatch table in
+// lower_composite_ops_pass.cpp. The pass operates within existing op
+// vocabularies, so it neither requires nor produces nor invalidates any
+// IRProperty.
 
 inline const PassProperties kLowerCompositeOpsProperties{};
 

@@ -121,6 +121,18 @@ def _get_comm_domain_scopes(func: ir.Function) -> list[ir.CommDomainScopeStmt]:
     return scopes
 
 
+def _flatten_stmts(stmt: ir.Stmt) -> list[ir.Stmt]:
+    result = [stmt]
+    if isinstance(stmt, ir.SeqStmts):
+        for child in stmt.stmts:
+            result.extend(_flatten_stmts(child))
+    if isinstance(stmt, ir.ScopeStmt):
+        result.extend(_flatten_stmts(stmt.body))
+    if isinstance(stmt, ir.ForStmt):
+        result.extend(_flatten_stmts(stmt.body))
+    return result
+
+
 def _apply(program: ir.Program) -> ir.Program:
     return passes.materialize_comm_domain_scopes()(program)
 
@@ -222,6 +234,113 @@ def test_allreduce_signal_inherits_data_comm_domain():
     scopes = _get_comm_domain_scopes(host)
     assert len(scopes) == 1
     _assert_scope_fields(scopes[0], [], [_expected_slot("data_buf", 1024), _expected_slot("signal_buf", 16)])
+
+
+def test_implicit_allreduce_signal_is_materialized_in_data_comm_domain():
+    """A host allreduce without signal gets a private signal slot in the data domain."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    stmts = _flatten_stmts(host.body)
+    signal_windows = [
+        stmt
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.window"
+        and stmt.var.name_hint.startswith("__allreduce_signal_")
+    ]
+    allreduces = [
+        stmt.value
+        for stmt in stmts
+        if isinstance(stmt, ir.AssignStmt)
+        and isinstance(stmt.value, ir.Call)
+        and stmt.value.op.name == "pld.tensor.allreduce"
+    ]
+
+    assert len(signal_windows) == 1
+    assert len(allreduces) == 1
+    assert len(allreduces[0].args) == 2
+    assert allreduces[0].args[1].name_hint == signal_windows[0].var.name_hint
+
+    signal_type = signal_windows[0].var.type
+    assert isinstance(signal_type, ir.DistributedTensorType)
+    assert len(signal_type.shape) == 2
+    assert isinstance(signal_type.shape[0], ir.Var)
+    assert signal_type.shape[0].name_hint == "__allreduce_signal_world_size_0"
+    assert isinstance(signal_type.shape[1], ir.ConstInt)
+    assert signal_type.shape[1].value == 1
+
+    scopes = _get_comm_domain_scopes(host)
+    assert len(scopes) == 1
+    assert [slot.base.name_hint for slot in scopes[0].slots] == [
+        "data_buf",
+        "__allreduce_signal_buf_0",
+    ]
+
+
+def test_consecutive_implicit_allreduces_get_fresh_signal_slots():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    result = _apply(P)
+    host = _get_func(result, "host_orch")
+    scopes = _get_comm_domain_scopes(host)
+    assert len(scopes) == 1
+    assert [slot.base.name_hint for slot in scopes[0].slots] == [
+        "data_buf",
+        "__allreduce_signal_buf_0",
+        "__allreduce_signal_buf_1",
+    ]
+
+
+def test_implicit_allreduce_in_loop_is_rejected():
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP32]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(1024)
+            data = pld.window(data_buf, [256], dtype=pl.FP32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            for _ in pl.range(2):
+                data = pld.tensor.allreduce(data, op=pld.ReduceOp.Sum)
+            return data
+
+    with pytest.raises(Exception, match="allreduce is not supported inside a for/while loop"):
+        _apply(P)
 
 
 # ---------------------------------------------------------------------------

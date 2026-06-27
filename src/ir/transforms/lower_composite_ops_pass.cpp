@@ -633,10 +633,10 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
 // when the callee name appears here. Adding a new composite op = add a rule
 // function above + one row in ``kRules``; the mutator below needs no change.
 //
-// Today the only rules are ``tile.sin`` / ``tile.cos``. The pass is idempotent
-// provided each rule emits only ops not listed here (the sin/cos recipe emits
-// only ``tile.muls`` / ``tile.adds`` / ``tile.add`` / ``tile.sub`` / ``tile.mul`` /
-// ``tile.cast``).
+// Today the rules are ``tile.sin`` / ``tile.cos`` and explicit-signal InCore
+// ``pld.tensor.allreduce``. Host-level allreduce is skipped here and lowered
+// later by LowerHostTensorCollectives. The pass is idempotent provided each
+// rule emits only ops not listed here.
 //
 // When the table grows past a handful of entries — or a rule wants its own
 // translation unit — promote this back to a standalone registry under

@@ -237,6 +237,15 @@ def test_tensor_allreduce_defaults_to_sum():
     assert call.kwargs["op"] == int(ir.ReduceOp.Sum)
 
 
+def test_tensor_allreduce_accepts_missing_signal_for_later_host_synthesis():
+    span = ir.Span.unknown()
+    src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
+    call = dist_tensor_ops.allreduce(src, op=ir.ReduceOp.Sum, span=span)
+    assert call.type is src.type
+    assert len(call.args) == 1
+    assert call.kwargs["op"] == int(ir.ReduceOp.Sum)
+
+
 def test_tensor_allreduce_accepts_dynamic_shape():
     span = ir.Span.unknown()
     n = ir.Var("n", ir.ScalarType(DataType.INT64), span)

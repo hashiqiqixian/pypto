@@ -162,12 +162,14 @@ def test_host_allreduce_chained_assign_uses_remapped_result_var():
         def host_orch(self):
             data_buf = pld.alloc_window_buffer(1024)
             signal_buf = pld.alloc_window_buffer(16)
+            signal_buf_1 = pld.alloc_window_buffer(16)
             data = pld.window(data_buf, [256], dtype=pl.FP32)
             signal = pld.window(signal_buf, [4], dtype=pl.INT32)
+            signal_1 = pld.window(signal_buf_1, [4], dtype=pl.INT32)
             for r in pl.range(pld.world_size()):
                 self.chip_orch(data, device=r)
             data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
-            data = pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            data = pld.tensor.allreduce(data, signal_1, op=pld.ReduceOp.Sum)
             self.chip_orch(data, device=0)
             return 0
 
