@@ -357,8 +357,8 @@ dispatches before the final `Simplify`.
   `test_l3_tensor_allreduce_intrinsic.py`, `test_l3_host_tensor_allreduce.py`,
   `test_l3_ep_dispatch_combine.py`, `test_l3_notify_wait.py`, and related L3 STs
   under `tests/st/distributed/`. **Put/get canonical e2e contracts** are now
-  enabled: `test_l3_put.py` (ring overwrite, row-offset put, and chunked/pipelined
-  transfers ✅), `test_l3_get.py` (ring read, row-offset get ✅), and
-  `test_l3_remote_store.py` (tile-level subview push ✅). Atomic-add put remains
-  skipped (runtime issue on current stack). All tests use the `pld.system.notify` /
-  `pld.system.wait` handshake pattern established by notify/wait and collective STs.
+  enabled: `test_l3_put.py` (ring overwrite, row-offset put, atomic-add put, and
+  chunked/pipelined transfers ✅), `test_l3_get.py` (ring read, row-offset get ✅),
+  and `test_l3_remote_store.py` (tile-level subview push ✅). All tests use the
+  `pld.system.notify` / `pld.system.wait` handshake pattern established by
+  notify/wait and collective STs.
