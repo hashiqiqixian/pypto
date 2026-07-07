@@ -2584,5 +2584,43 @@ def test_pto_codegen_make_tensor_view_accepts_dynamic_shape_expressions():
     )
 
 
+def test_pto_codegen_tensor_view_aliases_input_base_ptr():
+    """tensor.view creates a view rooted at the input buffer and usable by downstream loads."""
+    span = ir.Span.unknown()
+    src_type = ir.TensorType([8, 16], DataType.FP32)
+    src = ir.Var("src", src_type, span)
+    out = ir.Var("out", src_type, span)
+
+    view_call = ir.op.tensor.view(src, layout=ir.TensorLayout.DN)
+    view_var = ir.Var("src_dn", view_call.type, span)
+    tile_call = ir.op.tile.load(view_var, [0, 0], [16, 8])
+    tile_var = ir.Var("tile", tile_call.type, span)
+    store_call = ir.op.tile.store(tile_var, [0, 0], out)
+    result_var = ir.Var("result", store_call.type, span)
+
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(view_var, view_call, span),
+            ir.AssignStmt(tile_var, tile_call, span),
+            ir.AssignStmt(result_var, store_call, span),
+            ir.ReturnStmt([result_var], span),
+        ],
+        span,
+    )
+    func = ir.Function("kernel", [src, out], [result_var.type], body, span, ir.FunctionType.InCore)
+    program = ir.Program([func], "TensorViewAliasTest", span)
+
+    mlir_code = _generate_mlir(program)
+    lines = _get_mlir_lines(mlir_code)
+    view_line = _single_line(lines, "pto.make_tensor_view %arg0, shape = [%c16_index, %c8_index]")
+    assert "strides = [%c1_index, %c16_index]" in view_line
+    assert "{layout = #pto.layout<dn>}" in view_line
+
+    view_ssa = view_line.split(" = ", 1)[0].strip()
+    assert any(f"pto.partition_view {view_ssa}" in line for line in lines), (
+        f"Expected tile.load to use the tensor.view result {view_ssa}. Got:\n{mlir_code}"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

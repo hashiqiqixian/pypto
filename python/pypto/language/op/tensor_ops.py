@@ -95,7 +95,7 @@ __all__ = [
     "concat",
     "reshape",
     "transpose",
-    "as_layout",
+    "view",
     "scatter_update",
     "set_validshape",
     "sort32",
@@ -1612,31 +1612,30 @@ def transpose(tensor: Tensor, axis1: int, axis2: int) -> Tensor:
     return Tensor(expr=call_expr)
 
 
-def as_layout(tensor: Tensor, layout: TensorLayout) -> Tensor:
-    """Flip a tensor's layout tag over the same physical memory (RFC #1300 §3.3).
+def view(
+    tensor: Tensor,
+    shape: Sequence[IntLike] | None = None,
+    *,
+    layout: TensorLayout | None = None,
+) -> Tensor:
+    """Reinterpret a tensor over the same physical memory.
 
-    .. note::
-        Internal API — intended for compiler-generated code only. It bridges
-        ND ↔ DN views over one physical buffer at orch ↔ InCore call sites. It
-        is wrapped here so DSL-level test programs and tooling can name it with
-        static type-checking; end users should not need it.
-
-    The trailing-two-dim shape swap that accompanies a cross-layout flip is
-    derived from the source — callers do not pass a target shape (RFC §4.2:
-    row-major ``[..., a, b]`` ND ≡ ``[..., b, a]`` DN-packed). For genuine
-    shape changes, use :func:`reshape`.
+    At least one of ``shape`` or ``layout`` must be provided. The result is a
+    zero-copy tensor view with canonical strides derived by the IR type deducer.
 
     Args:
-        tensor: Source tensor. Must be packed canonical or bare — strided
-            sub-views are rejected. Cross-layout flips require rank >= 2.
-        layout: Target ``TensorLayout``. Must not be ``NZ`` (NZ is tile-only
-            and fractal).
+        tensor: Source tensor. Must be packed canonical or bare.
+        shape: Optional target shape. Product must match source product.
+        layout: Optional target ``TensorLayout`` (must not be ``NZ``).
 
     Returns:
-        Tensor wrapping the as_layout operation, carrying the canonical
-        ``(shape, stride, layout)`` triple for the target view.
+        Tensor wrapping the view operation.
     """
-    call_expr = _ir_ops.as_layout(tensor.unwrap(), layout)
+    call_expr = _ir_ops.view(
+        tensor.unwrap(),
+        None if shape is None else _normalize_intlike(shape),
+        layout=layout,
+    )
     return Tensor(expr=call_expr)
 
 

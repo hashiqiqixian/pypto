@@ -7,13 +7,14 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Unit tests for ``tensor.as_layout`` op (RFC #1300, P4).
+"""Unit tests for ``tensor.view`` op (RFC #1300, P4).
 
-The op flips a TensorType's layout tag over the same physical memory; it
-never reshapes (use ``tensor.reshape`` for that). Target shape is mechanically
-derived from the source — callers do not pass a target shape.
+The op reinterprets a TensorType over the same physical memory: it can flip
+the layout tag, reinterpret with a new product-preserving shape, or both.
+``tensor.reshape`` is unaffected; this op covers canonical layout/shape
+reinterpretation, not arbitrary strides.
 
-This file covers ``DeduceTensorAsLayoutType`` (type inference + validity); the
+This file covers ``DeduceTensorViewType`` (type inference + validity); the
 Simplify-pass identity-elimination rule is covered in
 ``tests/ut/ir/transforms/test_simplify_pass.py``.
 """
@@ -43,7 +44,7 @@ def _tensor_var(shape, dtype=DataType.FP32, view=None, name="t"):
 def _result_view(call):
     """Return the TensorView (or None) on the Call's result type."""
     t = call.type
-    assert isinstance(t, ir.TensorType)
+    assert isinstance(t, (ir.TensorType, ir.DistributedTensorType))
     return t.tensor_view
 
 
@@ -64,9 +65,9 @@ def test_bare_nd_to_dn_flips_trailing_dims():
     """Bare ``[N=8, K=4]`` (implicit ND) → DN auto-swaps to ``[K=4, N=8]``
     DN-packed, the §4.2 canonical pair partner."""
     src = _tensor_var([8, 4])
-    call = ir.op.tensor.as_layout(src, ir.TensorLayout.DN)
+    call = ir.op.tensor.view(src, layout=ir.TensorLayout.DN)
 
-    assert call.op.name == "tensor.as_layout"
+    assert call.op.name == ir.get_op("tensor.view").name
     out = call.type
     assert isinstance(out, ir.TensorType)
     assert _values_of(out.shape) == [4, 8]
@@ -81,7 +82,7 @@ def test_dn_packed_to_nd_flips_back():
     """``[K=4, N=8] DN-packed`` → ND auto-swaps back to ``[N=8, K=4] ND``."""
     src_view = ir.TensorView([_const(1), _const(4)], ir.TensorLayout.DN)
     src = _tensor_var([4, 8], view=src_view)
-    call = ir.op.tensor.as_layout(src, ir.TensorLayout.ND)
+    call = ir.op.tensor.view(src, layout=ir.TensorLayout.ND)
 
     out = call.type
     assert isinstance(out, ir.TensorType)
@@ -96,7 +97,7 @@ def test_dn_packed_to_nd_flips_back():
 def test_3d_nd_to_dn_swaps_trailing_pair_only():
     """Outer batch dim is preserved; only the trailing 2 dims swap."""
     src = _tensor_var([2, 4, 8])  # bare ND
-    call = ir.op.tensor.as_layout(src, ir.TensorLayout.DN)
+    call = ir.op.tensor.view(src, layout=ir.TensorLayout.DN)
 
     out = call.type
     assert isinstance(out, ir.TensorType)
@@ -114,11 +115,11 @@ def test_3d_nd_to_dn_swaps_trailing_pair_only():
 
 
 def test_identity_flip_keeps_shape():
-    """``as_layout(x, x.layout)`` produces an identity Call: same shape,
+    """``view(x, x.layout)`` produces an identity Call: same shape,
     same layout (modulo packed-canonical stride materialization). The Call
     survives type inference; the Simplify pass folds it away."""
     src = _tensor_var([8, 4])  # bare ND
-    call = ir.op.tensor.as_layout(src, ir.TensorLayout.ND)
+    call = ir.op.tensor.view(src, layout=ir.TensorLayout.ND)
 
     out = call.type
     assert isinstance(out, ir.TensorType)
@@ -127,6 +128,57 @@ def test_identity_flip_keeps_shape():
     assert view is not None
     assert view.layout == ir.TensorLayout.ND
     assert _values_of(view.stride) == [4, 1]
+
+
+def test_shape_only_reinterprets_with_canonical_stride():
+    """``view(x, shape=[4, 8])`` changes shape and derives packed ND stride."""
+    src = _tensor_var([2, 16])
+    call = ir.op.tensor.view(src, [4, 8])
+
+    out = call.type
+    assert isinstance(out, ir.TensorType)
+    assert _values_of(out.shape) == [4, 8]
+    view = _result_view(call)
+    assert view is not None
+    assert view.layout == ir.TensorLayout.ND
+    assert _values_of(view.stride) == [8, 1]
+
+
+def test_shape_and_layout_reinterprets_with_canonical_layout_stride():
+    """``shape`` and ``layout`` can be combined; stride follows the target layout."""
+    src = _tensor_var([2, 16])
+    call = ir.op.tensor.view(src, [4, 8], layout=ir.TensorLayout.DN)
+
+    out = call.type
+    assert isinstance(out, ir.TensorType)
+    assert _values_of(out.shape) == [4, 8]
+    view = _result_view(call)
+    assert view is not None
+    assert view.layout == ir.TensorLayout.DN
+    assert _values_of(view.stride) == [1, 4]
+
+
+def test_shape_reinterpret_rejects_strided_source():
+    """Shape-changing views are canonical-only and cannot discard parent stride."""
+    src_view = ir.TensorView([_const(16), _const(1)], ir.TensorLayout.ND)
+    src = _tensor_var([4, 8], view=src_view, name="strided")
+    with pytest.raises(ValueError, match="packed source"):
+        ir.op.tensor.view(src, [32])
+
+
+def test_distributed_tensor_kind_is_preserved():
+    """A view of a DistributedTensorType remains distributed."""
+    span = _span()
+    src_type = ir.DistributedTensorType([_const(2), _const(16)], DataType.FP32)
+    src = ir.Var("dt", src_type, span)
+    call = ir.op.tensor.view(src, [32])
+
+    out = call.type
+    assert isinstance(out, ir.DistributedTensorType)
+    assert _values_of(out.shape) == [32]
+    view = _result_view(call)
+    assert view is not None
+    assert _values_of(view.stride) == [1]
 
 
 # ============================================================================
@@ -138,14 +190,14 @@ def test_nz_target_rejected():
     """NZ on TensorType is forbidden (NZ is tile-only / fractal)."""
     src = _tensor_var([8, 4])
     with pytest.raises(ValueError, match="NZ layout is not allowed"):
-        ir.op.tensor.as_layout(src, ir.TensorLayout.NZ)
+        ir.op.tensor.view(src, layout=ir.TensorLayout.NZ)
 
 
 def test_cross_layout_flip_below_rank_2_rejected():
     """ND ↔ DN flip needs at least 2 dims to swap; 1D is rejected."""
     src = _tensor_var([8])
     with pytest.raises(ValueError, match="rank >= 2"):
-        ir.op.tensor.as_layout(src, ir.TensorLayout.DN)
+        ir.op.tensor.view(src, layout=ir.TensorLayout.DN)
 
 
 def test_strided_source_flips_inheriting_stride():
@@ -157,7 +209,7 @@ def test_strided_source_flips_inheriting_stride():
     bug class behind #1212 / #1213)."""
     src_view = ir.TensorView([_const(16), _const(1)], ir.TensorLayout.ND)
     src = _tensor_var([4, 8], view=src_view, name="strided")
-    call = ir.op.tensor.as_layout(src, ir.TensorLayout.DN)
+    call = ir.op.tensor.view(src, layout=ir.TensorLayout.DN)
 
     out = call.type
     assert isinstance(out, ir.TensorType)
@@ -179,7 +231,7 @@ def test_non_canonical_source_rejected():
     src_view = ir.TensorView([_const(16), _const(2)], ir.TensorLayout.ND)
     src = _tensor_var([4, 8], view=src_view, name="malformed")
     with pytest.raises(ValueError, match="not canonical"):
-        ir.op.tensor.as_layout(src, ir.TensorLayout.DN)
+        ir.op.tensor.view(src, layout=ir.TensorLayout.DN)
 
 
 # ============================================================================
@@ -194,7 +246,7 @@ def test_symbolic_shape_flips():
     n_var = ir.Var("N", ir.ScalarType(DataType.INDEX), span)
     k_var = ir.Var("K", ir.ScalarType(DataType.INDEX), span)
     src = _tensor_var([n_var, k_var])
-    call = ir.op.tensor.as_layout(src, ir.TensorLayout.DN)
+    call = ir.op.tensor.view(src, layout=ir.TensorLayout.DN)
 
     out = call.type
     assert isinstance(out, ir.TensorType)
@@ -212,8 +264,8 @@ def test_symbolic_shape_flips():
 
 
 def test_op_registered():
-    """``tensor.as_layout`` must be discoverable through the OpRegistry."""
-    assert ir.is_op_registered("tensor.as_layout")
+    """``tensor.view`` must be discoverable through the OpRegistry."""
+    assert ir.is_op_registered("tensor.view")
 
 
 if __name__ == "__main__":

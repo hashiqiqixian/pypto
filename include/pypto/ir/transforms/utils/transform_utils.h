@@ -117,8 +117,8 @@ inline std::vector<VarPtr> CollectDefVars(const StmtPtr& stmt) {
 inline bool IsComputeTensorOp(const std::string& op_name) {
   if (op_name.compare(0, 7, "tensor.") != 0) return false;
   static const std::unordered_set<std::string> kHostSideOps = {
-      "tensor.create",   "tensor.read", "tensor.write",   "tensor.slice",
-      "tensor.assemble", "tensor.dim",  "tensor.reshape", "tensor.transpose",
+      "tensor.create", "tensor.read",    "tensor.write",     "tensor.slice", "tensor.assemble",
+      "tensor.dim",    "tensor.reshape", "tensor.transpose", "tensor.view",
   };
   return kHostSideOps.count(op_name) == 0;
 }

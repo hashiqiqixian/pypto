@@ -1619,44 +1619,46 @@ def transpose(
     return _ir_core.create_op_call("tensor.transpose", args, {}, actual_span)
 
 
-def as_layout(
+def view(
     tensor: Expr,
-    layout: TensorLayout,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    *,
+    layout: TensorLayout | None = None,
     span: Span | None = None,
 ) -> Call:
-    """Flip ``tensor``'s layout tag over the same physical memory (RFC #1300 §3.3).
+    """Reinterpret ``tensor`` over the same physical memory.
 
-    .. note::
-        Internal API — intended for compiler-generated code only, though a
-        thin DSL wrapper exists at ``pl.tensor.as_layout`` for test programs
-        and tooling. It bridges ND ↔ DN views over the same physical buffer at
-        orch ↔ InCore call sites. The op emits no PTOAS instruction; downstream
-        ``make_tensor_view`` consumes the new view directly.
+    At least one of ``shape`` or ``layout`` must be provided. ``shape`` derives
+    canonical strides for the requested shape; ``layout`` derives the canonical
+    ND/DN layout view and preserves the legacy layout-only behavior.
 
-    The trailing-two-dim shape swap that comes with a cross-layout flip is
-    mechanical (RFC §4.2: row-major ``[..., a, b]`` ND ≡ ``[..., b, a]``
-    DN-packed) and derived from the source — callers don't pass a target
-    shape. For shape changes, use ``tensor.reshape``.
+    Validity (enforced by ``DeduceTensorViewType``):
 
-    Validity (enforced by ``DeduceTensorAsLayoutType``):
-
-    1. ``layout`` must not be ``NZ`` (NZ is tile-only and fractal).
-    2. ``tensor`` must be packed canonical or bare (strided sub-views are
-       rejected — the §4.2 equivalence only holds for packed forms).
-    3. Cross-layout flips require rank ≥ 2.
+    1. If both ``shape`` and ``layout`` are omitted, raises ``ValueError``.
+    2. ``layout`` must not be ``NZ`` (NZ is tile-only and fractal).
+    3. If the source has an explicit stride, shape reinterpret requires a
+       packed source (strided sub-views are rejected).
+    4. Cross-layout flips require rank >= 2.
 
     Args:
-        tensor: Source TensorType (packed canonical or bare).
-        layout: Target ``TensorLayout`` (must not be ``NZ``).
-        span: Optional source span (auto-captured when omitted).
+        tensor: Source tensor.
+        shape: Optional target shape. Product must match source product.
+        layout: Optional target ``TensorLayout`` (must not be ``NZ``).
+        span: Optional source span.
 
     Returns:
-        ``Call`` expression carrying a TensorType with the canonical
-        ``(shape, stride, layout)`` for the target view.
+        ``Call`` expression carrying the reinterpreted TensorType.
     """
+    if shape is None and layout is None:
+        raise ValueError("tensor.view requires at least one of shape or layout")
     actual_span = _get_span_or_capture(span)
-    kwargs: dict[str, Any] = {"layout": layout}
-    return _ir_core.create_op_call("tensor.as_layout", [tensor], kwargs, actual_span)
+    args = [tensor]
+    if shape is not None:
+        args.append(_to_make_tuple(shape, actual_span))
+    kwargs: dict[str, Any] = {}
+    if layout is not None:
+        kwargs["layout"] = layout
+    return _ir_core.create_op_call("tensor.view", args, kwargs, actual_span)
 
 
 def set_validshape(
