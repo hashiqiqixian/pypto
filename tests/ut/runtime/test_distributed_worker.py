@@ -180,6 +180,43 @@ class TestPerTaskRingSizing:
         rt.close()
 
 
+class TestArenaPrewarm:
+    """``init`` prewarms the prebuilt runtime-arena cache with the ring sizing the
+    first dispatch will use, so the ~800ms cold build lands at prepare() time
+    rather than inside the first (usually timed) dispatch.
+    """
+
+    def test_prewarms_with_prepared_baseline_when_no_config(self, patched_setup):
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rt = DistributedWorker(compiled)
+
+        # No worker RunConfig → the program's baseline CallConfig (the same one
+        # config-less dispatches reuse) is what init prewarms with; no rebuild.
+        assert m["make_call_config"].call_count == 1
+        assert m["worker"].init.call_args.kwargs["prewarm_config"] is m["make_call_config"].return_value
+        rt.close()
+
+    def test_prewarms_with_worker_config_ring_sizing(self, patched_setup):
+        from pypto.runtime import RunConfig  # noqa: PLC0415
+
+        m = patched_setup
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rc = RunConfig(platform="a2a3sim", ring_heap=4 * 1024 * 1024)
+
+        rt = DistributedWorker(compiled, rc)
+
+        # A worker RunConfig builds a second CallConfig from (program
+        # DistributedConfig, rc) — the same construction a dispatch with rc uses,
+        # so the prewarmed arena's sizing key matches that dispatch's.
+        assert m["make_call_config"].call_count == 2
+        prewarm_build = m["make_call_config"].call_args
+        assert prewarm_build.args[0] is compiled._distributed_config
+        assert prewarm_build.args[1] is rc
+        assert m["worker"].init.call_args.kwargs["prewarm_config"] is m["make_call_config"].return_value
+        rt.close()
+
+
 class TestPerCallValidation:
     def test_accepts_device_tensor(self, patched_setup):
         compiled = _fake_compiled([_param("a", [128, 128]), _param("b", [128, 128])], [])
