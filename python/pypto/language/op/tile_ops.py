@@ -158,7 +158,7 @@ __all__ = [
 ]
 
 from pypto.ir.op import tile_ops as _ir_ops
-from pypto.ir.utils import _get_span_or_capture, _normalize_expr
+from pypto.ir.utils import _get_span_or_capture, _normalize_expr, has_partial_valid_region
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import (
@@ -381,8 +381,14 @@ def load(
     shapes: Sequence[IntLike],
     valid_shapes: Sequence[IntLike] | None = None,
     target_memory: MemorySpace = MemorySpace.Vec,
+    clamp: bool = False,
 ) -> Tile:
     """Copy data from tensor to unified buffer (tile).
+
+    Only the valid extent is read, so the tile may be larger than the region that
+    exists in the source. The tile's valid region is the source's valid region,
+    shifted by ``offsets`` and cut to the tile — a load never reports source bytes
+    that do not exist as real data.
 
     Args:
         tensor: Source tensor
@@ -393,7 +399,12 @@ def load(
         target_memory: Target memory space (MemorySpace.Vec default, or MemorySpace.Mat)
         valid_shapes: Valid shape of the tile in each dimension. When provided, sets
             TileView.valid_shape in the output TileType. When omitted, shapes is used
-            as valid_shape. Uses the same coordinate convention as shapes.
+            as valid_shape. Uses the same coordinate convention as shapes. Narrows
+            the tile; cannot widen it past what the source has.
+        clamp: Sanction a read that runs off the end of the source. By default a
+            load asserts ``offsets + valid_shapes`` stays inside the source and is
+            rejected when that provably fails; ``clamp=True`` cuts the request back
+            to the source edge instead.
 
     Returns:
         Tile wrapping the load operation
@@ -410,6 +421,7 @@ def load(
         _normalize_intlike(shapes),
         _normalize_intlike(valid_shapes),
         target_memory,
+        clamp=clamp,
     )
     return Tile(expr=call_expr)
 
@@ -1749,31 +1761,50 @@ def slice(
 ) -> Tile:
     """Create a slice of a tile with static shape and optional valid shape.
 
+    The slice is never valid where the source tile is not: the source's valid
+    region, shifted by ``offset`` and cut to the window, bounds the result.
+
     Args:
         tile: Input tile
         shape: Static shape dimensions. Always full-rank — a scalar-indexed axis
             contributes a unit dim here and is listed in ``drop_dims``.
         offset: Offset dimensions for the slice
-        valid_shape: Valid shape dimensions. When omitted, shape is reused as the
-            logical valid shape.
+        valid_shape: Valid shape dimensions. When omitted, the source's validity
+            under the window is used. Narrows the result; cannot widen it.
         drop_dims: Optional axes to erase from the result type (numpy-style rank
-            reduction). Each listed axis must be a static unit dim of ``shape``.
+            reduction). Each listed axis must be a static unit dim of ``shape``
+            and must still be fully valid after the intersection above.
             Because tiles are physically 2D, the result is clamped back to 2D
             if reduction would take it below 2D. ``None`` / ``[]`` drops nothing.
         pad_value: Optional padding mode for out-of-valid-shape elements.
-            ``None`` or ``PadValue.null`` means no padding (the default).
+            ``None`` means the source's padding mode carries through.
             Accepts ``PadValue.zero`` / ``PadValue.max`` / ``PadValue.min``, or
             the literal sugars ``0``, ``math.inf``, ``-math.inf`` (same
-            spelling as :func:`tile.fillpad`). Only meaningful when
-            ``valid_shape`` is smaller than ``shape``.
+            spelling as :func:`tile.fillpad`). Only meaningful when the
+            *effective* valid region is smaller than ``shape`` — which an explicit
+            ``valid_shape`` or a partially-valid source tile can each bring about.
 
     Returns:
         Tile wrapping the slice operation
+
+    Note:
+        Unlike :func:`pypto.language.op.tensor.slice`, there is no ``clamp``
+        option: an on-chip window has nothing that could clamp it, so
+        ``offset + shape`` must stay inside the source tile.
     """
-    if pad_value is not None and pad_value is not PadValue.null and valid_shape is None:
+    # pad_value paints whatever falls outside the *effective* valid region, and an
+    # explicit valid_shape is only one way to narrow it — a partially-valid source
+    # tile narrows it on its own. Warn only when neither can apply.
+    if (
+        pad_value is not None
+        and pad_value is not PadValue.null
+        and valid_shape is None
+        and not has_partial_valid_region(tile.unwrap())
+    ):
         warnings.warn(
-            f"tile.slice received pad_value={pad_value!r} but no valid_shape. "
-            f"pad_value has no effect unless valid_shape is smaller than shape. "
+            f"tile.slice received pad_value={pad_value!r} but no valid_shape and a "
+            f"fully-valid source. "
+            f"pad_value has no effect unless the valid region is smaller than shape. "
             f"If you intend to narrow the valid region later via "
             f"tile.set_validshape, you can ignore this warning; otherwise "
             f"pass valid_shape=... to tile.slice.",

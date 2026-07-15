@@ -112,7 +112,7 @@ __all__ = [
 ]
 
 from pypto.ir.op import tensor_ops as _ir_ops
-from pypto.ir.utils import _normalize_expr
+from pypto.ir.utils import _normalize_expr, has_partial_valid_region
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import AtomicType, Expr, MemorySpace, PadValue, PtrType, TensorLayout
@@ -396,32 +396,57 @@ def slice(
     valid_shape: Sequence[IntLike] | None = None,
     drop_dims: Sequence[int | Expr] | None = None,
     pad_value: PadValue | int | float | None = None,
+    clamp: bool = False,
 ) -> _TensorT:
     """Create a slice of a tensor with new shape and optional valid shape.
+
+    The slice is never valid where the source is not: the source's valid region,
+    shifted by ``offset`` and cut to the window, bounds the result.
 
     Args:
         tensor: Input tensor
         shape: New shape dimensions. Always full-rank — a scalar-indexed axis
             contributes a unit dim here and is listed in ``drop_dims``.
         offset: Offset dimensions for the slice
-        valid_shape: Valid shape dimensions. When omitted, the full shape is valid.
+        valid_shape: Valid shape dimensions. When omitted, the source's validity
+            under the window is used. Narrows the result; cannot widen it.
         drop_dims: Optional axes to erase from the result type (numpy-style rank
-            reduction). Each listed axis must be a static unit dim of ``shape``.
+            reduction). Each listed axis must be a static unit dim of ``shape``
+            and must still be fully valid after the intersection above.
             ``None`` / ``[]`` drops nothing (fully backward compatible).
         pad_value: Optional padding mode for out-of-valid-shape elements.
-            ``None`` or ``PadValue.null`` means no padding (the default).
+            ``None`` means the source's padding mode carries through.
             Accepts ``PadValue.zero`` / ``PadValue.max`` / ``PadValue.min``, or
             the literal sugars ``0``, ``math.inf``, ``-math.inf`` (same
-            spelling as :func:`tensor.fillpad`). Only meaningful when
-            ``valid_shape`` is smaller than ``shape``.
+            spelling as :func:`tensor.fillpad`). Only meaningful when the
+            *effective* valid region is smaller than ``shape`` — which an explicit
+            ``valid_shape``, a partially-valid source, or ``clamp=True`` can each
+            bring about.
+        clamp: Sanction a window that runs off the end of the source. By default
+            a slice asserts ``offset + shape`` stays inside the source and is
+            rejected when that provably fails; ``clamp=True`` lets the window
+            overhang and cuts the valid region back to the source edge. Use it
+            for a fixed-width tail read whose overhang is never addressed.
 
     Returns:
         Tensor wrapping the slice operation
     """
-    if pad_value is not None and pad_value is not PadValue.null and valid_shape is None:
+    # pad_value paints whatever falls outside the *effective* valid region, which
+    # an explicit valid_shape is only one way to narrow: a partially-valid source
+    # narrows it on its own, and clamp=True cuts it back to the source edge. Warn
+    # only when none of those can apply, so the guidance does not contradict the
+    # very options the caller is using.
+    if (
+        pad_value is not None
+        and pad_value is not PadValue.null
+        and valid_shape is None
+        and not clamp
+        and not has_partial_valid_region(tensor.unwrap())
+    ):
         warnings.warn(
-            f"tensor.slice received pad_value={pad_value!r} but no valid_shape. "
-            f"pad_value has no effect unless valid_shape is smaller than shape. "
+            f"tensor.slice received pad_value={pad_value!r} but no valid_shape, "
+            f"clamp, or partially-valid source. "
+            f"pad_value has no effect unless the valid region is smaller than shape. "
             f"If you intend to narrow the valid region later via "
             f"tensor.set_validshape, you can ignore this warning; otherwise "
             f"pass valid_shape=... to tensor.slice.",
@@ -437,6 +462,7 @@ def slice(
         normalized_valid_shape,
         drop_dims,
         pad_value=pad_value,
+        clamp=clamp,
     )
     return tensor.__class__(expr=call_expr)
 
