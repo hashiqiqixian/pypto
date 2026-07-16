@@ -2189,81 +2189,11 @@ def minimums(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Ca
 # ============================================================================
 
 
-def sum(tile: Expr, axis: int, keepdim: bool = False, span: Span | None = None) -> Call:
-    """Sum reduction of a tile along specified axis.
-
-    Args:
-        tile: Input tile (TileType)
-        axis: Reduction axis (0 for row reduction, 1 for column reduction, -1 for last axis)
-        keepdim: Whether to keep the reduced dimension as 1 (default: False)
-        span: Optional source span for debugging (auto-captured if not provided)
-
-    Returns:
-        Call expression for sum reduction
-    """
-
-    actual_span = _get_span_or_capture(span)
-    args = [tile]
-
-    kwargs: dict[str, Any] = {
-        "axis": axis,
-        "keepdim": keepdim,
-    }
-
-    return _ir_core.create_op_call("tile.sum", args, kwargs, actual_span)
-
-
-def max(tile: Expr, axis: int, keepdim: bool = False, span: Span | None = None) -> Call:
-    """Max reduction of a tile along specified axis.
-
-    Args:
-        tile: Input tile (TileType)
-        axis: Reduction axis (0 for row reduction, 1 for column reduction, -1 for last axis)
-        keepdim: Whether to keep the reduced dimension as 1 (default: False)
-        span: Optional source span for debugging (auto-captured if not provided)
-
-    Returns:
-        Call expression for max reduction
-    """
-    actual_span = _get_span_or_capture(span)
-    args = [tile]
-
-    kwargs: dict[str, Any] = {
-        "axis": axis,
-        "keepdim": keepdim,
-    }
-
-    return _ir_core.create_op_call("tile.max", args, kwargs, actual_span)
-
-
-def min(tile: Expr, axis: int, keepdim: bool = False, span: Span | None = None) -> Call:
-    """Min reduction of a tile along specified axis.
-
-    Args:
-        tile: Input tile (TileType)
-        axis: Reduction axis (0 for row reduction, 1 for column reduction, -1 for last axis)
-        keepdim: Whether to keep the reduced dimension as 1 (default: False)
-        span: Optional source span for debugging (auto-captured if not provided)
-
-    Returns:
-        Call expression for min reduction
-    """
-    actual_span = _get_span_or_capture(span)
-    args = [tile]
-
-    kwargs: dict[str, Any] = {
-        "axis": axis,
-        "keepdim": keepdim,
-    }
-
-    return _ir_core.create_op_call("tile.min", args, kwargs, actual_span)
-
-
 def row_max(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
-    """Row-wise max reduction of a tile.
+    """Row-wise max reduction of a tile (reduces along the last axis, maps to TROWMAX).
 
-    This is a convenience function equivalent to max(tile, axis=1, keepdim=True).
-    Output shape is [rows, 1].
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
 
     Args:
         tile: Input tile (TileType)
@@ -2278,10 +2208,10 @@ def row_max(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
 
 def row_sum(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
-    """Row-wise sum reduction of a tile.
+    """Row-wise sum reduction of a tile (reduces along the last axis, maps to TROWSUM).
 
-    This is a convenience function equivalent to sum(tile, axis=1, keepdim=True).
-    Output shape is [rows, 1].
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
 
     Args:
         tile: Input tile (TileType)
@@ -2296,34 +2226,36 @@ def row_sum(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
 
 
 def row_min(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
-    """Row-wise min reduction (reduces along axis=1, maps to TROWMIN).
+    """Row-wise min reduction (reduces along the last axis, maps to TROWMIN).
 
-    Reduces each row to a single value, producing output shape [rows, 1].
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
 
     Args:
-        tile: Input tile (TileType [M, N])
+        tile: Input tile (TileType, e.g. [M, N])
         tmp_tile: Temporary tile (TileType)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for row-wise min reduction (TileType [M, 1])
+        Call expression for row-wise min reduction (TileType, e.g. [M, 1])
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.row_min", [tile, tmp_tile], {}, actual_span)
 
 
 def row_prod(tile: Expr, tmp_tile: Expr, span: Span | None = None) -> Call:
-    """Row-wise product reduction (reduces along axis=1, maps to TROWPROD).
+    """Row-wise product reduction (reduces along the last axis, maps to TROWPROD).
 
-    Reduces each row to a single value, producing output shape [rows, 1].
+    Reduces the last axis with keepdim, producing output shape
+    ``input_shape[:-1] + [1]`` (e.g. ``[rows, 1]`` for a 2D ``[rows, cols]`` input).
 
     Args:
-        tile: Input tile (TileType [M, N])
+        tile: Input tile (TileType, e.g. [M, N])
         tmp_tile: Temporary tile (TileType)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for row-wise product reduction (TileType [M, 1])
+        Call expression for row-wise product reduction (TileType, e.g. [M, 1])
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.row_prod", [tile, tmp_tile], {}, actual_span)

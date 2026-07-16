@@ -174,9 +174,6 @@ Transfer data between memory hierarchy levels.
 | `row_argmin` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Row-wise argmin, column index of per-row min (requires tmp buffer, int32 output) |
 | `col_argmax` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Column-wise argmax, row index of per-column max (requires tmp buffer, int32 output) |
 | `col_argmin` | `(tile: Tile, tmp_tile: Tile) -> Tile` | Column-wise argmin, row index of per-column min (requires tmp buffer, int32 output) |
-| `sum` | `(tile: Tile, axis: int, keepdim: bool = False) -> Tile` | Sum along axis |
-| `max` | `(tile: Tile \| Scalar, axis: int \| Scalar = 0, keepdim: bool = False) -> Tile \| Scalar` | Max along axis |
-| `min` | `(tile: Tile \| Scalar, axis: int \| Scalar = 0, keepdim: bool = False) -> Tile \| Scalar` | Min along axis |
 
 ## Linear Algebra (`pl.tile.*`)
 
@@ -278,3 +275,5 @@ scratch tile to materialize numeric results on A2/A3.
 | `incore` | `() -> IncoreContext` | Context manager for InCore scope |
 | `dynamic` | `(name: str) -> DynVar` | Create dynamic dimension variable |
 | `create_tensor` | `(shape: Sequence[IntLike], dtype: DataType, layout: TensorLayout = None, init_value: int \| float \| None = None) -> Tensor` | Create tensor (promoted from `pl.tensor`; `init_value` AICPU-pre-fills the buffer — `0` zeroes any dtype, non-zero needs an int / 32-bit-or-wider float dtype) |
+| `max` | `(lhs: Scalar \| int \| Expr, rhs: Scalar \| int \| Expr) -> Scalar` | Max of two **scalars** (not a tile reduction — use `pl.tile.row_max` / `pl.tile.col_max`) |
+| `min` | `(lhs: Scalar \| int \| Expr, rhs: Scalar \| int \| Expr) -> Scalar` | Min of two **scalars** (not a tile reduction — use `pl.tile.row_min` / `pl.tile.col_min`) |
