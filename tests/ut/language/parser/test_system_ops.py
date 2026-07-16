@@ -14,6 +14,8 @@ import re
 import pypto.language as pl
 import pytest
 from pypto import ir
+from pypto.ir.op import system_ops
+from pypto.pypto_core import DataType
 
 
 class TestSystemOpsParsing:
@@ -123,6 +125,56 @@ class TestSystemOpsParsing:
         reparsed = pl.parse_program(printed)
         assert isinstance(reparsed, ir.Program)
         ir.assert_structural_equal(Before, reparsed)
+
+    def test_cacheinvalid_round_trip_scalar(self):
+        """Round-trip for the scalar-write (all-ones shapes) form."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Tensor[[64], pl.FP32]:
+                pl.system.cacheinvalid(x, [1], [4])
+                return x
+
+        printed = Before.as_python()
+        assert "pl.system.cacheinvalid(x, [1], [4])" in printed
+
+        reparsed = pl.parse_program(printed)
+        assert isinstance(reparsed, ir.Program)
+        ir.assert_structural_equal(Before, reparsed)
+
+    def test_cacheinvalid_round_trip_region(self):
+        """Round-trip for the partition-view (region) form."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, x: pl.Tensor[[16, 16], pl.FP32]) -> pl.Tensor[[16, 16], pl.FP32]:
+                pl.system.cacheinvalid(x, [16, 16], [0, 0])
+                return x
+
+        printed = Before.as_python()
+        assert "pl.system.cacheinvalid(x, [16, 16], [0, 0])" in printed
+
+        reparsed = pl.parse_program(printed)
+        assert isinstance(reparsed, ir.Program)
+        ir.assert_structural_equal(Before, reparsed)
+
+    def test_cacheinvalid_rejects_float_offset(self):
+        """A non-integer offset is rejected at the IR wrapper, not deep in codegen."""
+        span = ir.Span.unknown()
+        dim = ir.ConstInt(64, DataType.INT32, span)
+        tensor = ir.Var("x", ir.TensorType([dim], DataType.FP32), span)
+        with pytest.raises(TypeError, match="offsets must be integers"):
+            system_ops.cacheinvalid(tensor, [1], [3.5])  # type: ignore[list-item]  # intentionally wrong type
+
+    def test_cacheinvalid_rejects_rank_mismatch(self):
+        """offsets/shapes length must match the tensor rank."""
+        span = ir.Span.unknown()
+        dim = ir.ConstInt(16, DataType.INT32, span)
+        tensor = ir.Var("x", ir.TensorType([dim, dim], DataType.FP32), span)
+        with pytest.raises(ValueError, match="offsets must match tensor rank 2"):
+            system_ops.cacheinvalid(tensor, [1, 1], [0])
 
     def test_syncall_round_trip(self):
         """Test round-trip for pl.system.syncall with an explicit core_type."""

@@ -18,13 +18,14 @@ System operations handle hardware synchronization and cross-core communication:
 - reserve_buffer / import_peer_buffer: Cross-core buffer management (i32 SSA results)
 """
 
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
-from pypto.pypto_core.ir import Call, ConstInt, Expr, PipeType, Span
+from pypto.pypto_core.ir import Call, ConstInt, Expr, PipeType, ScalarType, Span, TensorType
 
-from ..utils import _get_span_or_capture
+from ..utils import _get_span_or_capture, _to_make_tuple
 from .tile_ops import (  # noqa: F401
     tpop_from_aic,
     tpop_from_aiv,
@@ -140,6 +141,59 @@ def fence(*, span: Span | None = None) -> Call:
     Lowers to ``pto.fence.barrier_all #pto.fence_scope<gm>``.
     """
     return _create_barrier_op("system.fence", span=span)
+
+
+def cacheinvalid(
+    tensor: Expr,
+    shapes: Sequence[int | Expr],
+    offsets: Sequence[int | Expr],
+    *,
+    span: Span | None = None,
+) -> Call:
+    """Invalidate the cache lines backing a tensor sub-region.
+
+    The op carries an N-D ``shapes`` and ``offsets`` (both matching the tensor
+    rank). Codegen picks the lowering by the region size:
+
+    - ``shapes`` all 1 (scalar write): flatten ``offsets`` and lower to
+      ``pto.addptr`` + ``pto.cmo.cacheinvalid %write_ptr single_cache_line``.
+    - otherwise (tile store): lower to ``pto.partition_view`` +
+      ``pto.cmo.cacheinvalid %payload_view single_cache_line : !pto.partition_tensor_view<...>``.
+
+    Args:
+        tensor: Target tensor whose sub-region is invalidated
+        shapes: Per-dimension region sizes; length must equal the tensor rank
+            (all 1 selects the scalar-write / ptr form)
+        offsets: Per-dimension start offsets; length must equal the tensor rank
+        span: Optional source span for debugging (auto-captured if not provided)
+
+    Returns:
+        Call expression for system.cacheinvalid
+    """
+    actual_span = _get_span_or_capture(span)
+
+    tensor_type = tensor.type
+    if not isinstance(tensor_type, TensorType):
+        raise TypeError(f"system.cacheinvalid tensor must have TensorType, got {tensor_type}")
+    rank = len(tensor_type.shape)
+
+    shapes = list(shapes)
+    if len(shapes) != rank:
+        raise ValueError(f"system.cacheinvalid shapes must match tensor rank {rank}, got {len(shapes)}")
+    offsets = list(offsets)
+    if len(offsets) != rank:
+        raise ValueError(f"system.cacheinvalid offsets must match tensor rank {rank}, got {len(offsets)}")
+
+    shapes_tuple = _to_make_tuple(shapes, actual_span)
+    offsets_tuple = _to_make_tuple(offsets, actual_span)
+    for name, elems in (("shapes", shapes_tuple.elements), ("offsets", offsets_tuple.elements)):
+        for elem in elems:
+            elem_type = elem.type
+            if isinstance(elem_type, ScalarType) and elem_type.dtype.is_float():
+                raise TypeError(f"system.cacheinvalid {name} must be integers, got dtype {elem_type.dtype}")
+    return _ir_core.create_op_call(
+        "system.cacheinvalid", [tensor, shapes_tuple, offsets_tuple], {}, actual_span
+    )
 
 
 _SYNCALL_CORE_TYPES = ("aiv_only", "aic_only", "mix")
