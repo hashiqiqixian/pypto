@@ -1194,9 +1194,11 @@ def _resolve_dep_call_metadata(
         dep_scalar_dtypes = {n: caller_scalar_dtypes[n] for n in dep_param_names if n in caller_scalar_dtypes}
 
     # Overlay DynDim from the dep's own declarations (pre-computed in
-    # _compute_per_func_dyndim_maps). Dims already carrying a DynDim from
-    # the caller take precedence; we only fill plain int dims and pin
-    # ``static_bound`` to the meta's current extent so cache keys stay coherent.
+    # _compute_per_func_dyndim_maps).  The dep's explicit declaration owns its
+    # parameter contract, even when the caller argument already carries a
+    # different DynDim.  This matters for a runtime-narrowed view: propagating
+    # the caller's packed extent would bind the child kernel to the full parent
+    # tensor instead of the view's runtime extent.
     for dep_param, dim_to_dyn in dep_dyn_map.items():
         meta = dep_tensor_meta.get(dep_param)
         if meta is None:
@@ -1204,12 +1206,14 @@ def _resolve_dep_call_metadata(
         new_shape: list[ShapeDim] = list(meta.shape)
         changed = False
         for i, dyn in dim_to_dyn.items():
-            if i >= len(new_shape) or isinstance(new_shape[i], DynDim):
+            if i >= len(new_shape):
                 continue
             existing = new_shape[i]
-            assert isinstance(existing, int)
-            new_shape[i] = DynDim(name=dyn.name, literal=dyn.literal, static_bound=existing)
-            changed = True
+            static_bound = existing.static_bound if isinstance(existing, DynDim) else existing
+            replacement = DynDim(name=dyn.name, literal=dyn.literal, static_bound=static_bound)
+            if replacement != existing:
+                new_shape[i] = replacement
+                changed = True
         if changed:
             dep_tensor_meta[dep_param] = TensorMeta(shape=tuple(new_shape), dtype=meta.dtype)
 

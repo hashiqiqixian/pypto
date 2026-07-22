@@ -35,7 +35,7 @@ from pypto.jit.decorator import (
     _SlicedArg,
     jit,
 )
-from pypto.jit.specializer import TensorMeta
+from pypto.jit.specializer import DynDim, TensorMeta
 from pypto.language.parser.diagnostics.exceptions import ParserTypeError
 from pypto.pypto_core import DataType, ir
 from pypto.runtime.runner import RunConfig
@@ -1380,6 +1380,8 @@ class TestDynamicLocalTensorMetadata:
 # see real source and annotations (the host-orchestration distributed shape).
 # ---------------------------------------------------------------------------
 _M_SLICE = pl.dynamic("M_SLICE")
+_PARENT_SLICE = pl.dynamic("PARENT_SLICE")
+_CHILD_SLICE = pl.dynamic("CHILD_SLICE")
 
 
 @jit.incore
@@ -1399,6 +1401,25 @@ def _dyn_sliced_chip(data: pl.Tensor[[_M_SLICE, 128], pl.FP32], out: pl.Out[pl.T
     M, N = data.shape
     t = pl.load(data, [0, 0], [M, N])
     pl.store(t, [0, 0], out)
+    return out
+
+
+@jit.incore
+def _narrowed_dyn_child(
+    data: pl.Tensor[[_CHILD_SLICE, 128], pl.FP32],
+    out: pl.Out[pl.Tensor[[_CHILD_SLICE, 128], pl.FP32]],
+) -> pl.Tensor:
+    return out
+
+
+def _runtime_narrowed_dispatch(
+    src: pl.Tensor[[_PARENT_SLICE, 128], pl.FP32],
+    out: pl.Out[pl.Tensor[[_PARENT_SLICE, 128], pl.FP32]],
+    valid_rows: pl.Scalar[pl.INT64],
+) -> pl.Tensor:
+    view = pl.slice(src, [valid_rows, 128], [0, 0])
+    out_view = pl.slice(out, [valid_rows, 128], [0, 0])
+    _narrowed_dyn_child(view, out_view)
     return out
 
 
@@ -1569,6 +1590,34 @@ class TestSlicedDispatchMetadata:
         assert all(isinstance(key, str) for key in host_map)
         assert _SlicedArg("inputs", 1) not in host_map
         assert _SlicedArg("outputs", 1) not in host_map
+
+    def test_dep_explicit_dyndim_overrides_runtime_slice_parent(self):
+        """A narrowed view must use the child kernel's dynamic contract.
+
+        The local slice metadata conservatively carries the parent's static
+        bound, but the callee's explicit DynDim is what makes its runtime shape
+        bind to the view rather than the full packed tensor.
+        """
+        parent_dim = DynDim(name="PARENT_SLICE", literal="PARENT_SLICE", static_bound=73)
+        child_dim = DynDim(name="CHILD_SLICE", literal="CHILD_SLICE", static_bound=0)
+        seed = {
+            "src": TensorMeta(shape=(parent_dim, 128), dtype=DataType.FP32),
+            "out": TensorMeta(shape=(parent_dim, 128), dtype=DataType.FP32),
+        }
+        tensor_meta, _, _ = _resolve_dep_call_metadata(
+            _narrowed_dyn_child,
+            _runtime_narrowed_dispatch,
+            seed,
+            {},
+            {},
+            {
+                "data": {0: child_dim},
+                "out": {0: child_dim},
+            },
+        )
+        expected = DynDim(name="CHILD_SLICE", literal="CHILD_SLICE", static_bound=73)
+        assert tensor_meta["data"].shape == (expected, 128)
+        assert tensor_meta["out"].shape == (expected, 128)
 
 
 class TestInlineFuncIntegration:
