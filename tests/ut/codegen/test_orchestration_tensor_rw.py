@@ -960,6 +960,8 @@ class TestTensorReadWriteOffsetCodegen:
                 v2c_buf = pl.reserve_buffer(name="submit_v2c", size=4096, base=pl.AUTO)
                 c2v_peer = pl.import_peer_buffer(name="submit_c2v", peer_func="vec_side")
                 pl.aic_initialize_pipe(c2v_peer, v2c_buf, dir_mask=3, slot_size=512)
+                tile = pl.load(q, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                pl.tpush_to_aiv(tile, split=0)
                 return sink
 
             @pl.function(type=pl.FunctionType.AIV)
@@ -971,6 +973,8 @@ class TestTensorReadWriteOffsetCodegen:
                 c2v_buf = pl.reserve_buffer(name="submit_c2v", size=4096, base=pl.AUTO)
                 v2c_peer = pl.import_peer_buffer(name="submit_v2c", peer_func="cube_side")
                 pl.aiv_initialize_pipe(c2v_buf, v2c_peer, dir_mask=3, slot_size=512)
+                tile = pl.tpop_from_aic(shape=[16, 16], dtype=pl.FP32, split=0)
+                pl.tfree_to_aic(tile, split=0)
                 return out
 
             @pl.function(type=pl.FunctionType.Orchestration)
@@ -995,6 +999,7 @@ class TestTensorReadWriteOffsetCodegen:
         vec = transformed.get_function("vec_side")
         assert cube is not None
         assert vec is not None
+        assert vec.attrs.get("dual_aiv_dispatch") is True
         canonical_names = [param.name_hint for param in cube.params]
         assert canonical_names == [param.name_hint for param in vec.params]
         assert canonical_names[-1] == "__gm_pipe_buffer"
@@ -1008,6 +1013,15 @@ class TestTensorReadWriteOffsetCodegen:
         assert shape_values == ["512"], code
         assert "rt_submit_task" in code, code
         assert result.func_name_to_signature["cube_side"] == result.func_name_to_signature["vec_side"]
+        expected_mixed = (
+            result.func_name_to_id["cube_side"],
+            result.func_name_to_id["vec_side"],
+            result.func_name_to_id["vec_side"],
+        )
+        assert (
+            f"MixedKernels mixed_0 = {{{expected_mixed[0]}, {expected_mixed[1]}, {expected_mixed[2]}}};"
+            in code
+        )
         # The one shared task payload must contain all three Group tensors plus
         # the injected workspace; pre-fix it was built only from cube_side and
         # omitted ext_out, so vec_side unpacked q as its output/workspace.
