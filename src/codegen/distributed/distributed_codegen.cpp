@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "pypto/codegen/codegen_preconditions.h"
+#include "pypto/codegen/distributed/comm_layout.h"
 #include "pypto/codegen/distributed/distributed_op_registry.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/core/dtype.h"
@@ -554,17 +555,31 @@ void DistributedCodegen::VisitStmt_(const ir::CommDomainScopeStmtPtr& op) {
   // emitted Python at the point we write ``window_size=`` (it comes
   // ahead of the rest of the body).
   std::vector<std::string> slot_nbytes;
+  std::vector<std::string> slot_alloc_nbytes;
   slot_nbytes.reserve(op->slots_.size());
+  slot_alloc_nbytes.reserve(op->slots_.size());
   for (const auto& slot : op->slots_) {
-    slot_nbytes.push_back(GetCommSlotSizeAsCode(slot->size_));
+    const std::string logical_nbytes = GetCommSlotSizeAsCode(slot->size_);
+    slot_nbytes.push_back(logical_nbytes);
+    slot_alloc_nbytes.push_back("(((" + logical_nbytes + " + " +
+                                std::to_string(distributed::comm_layout::kCommBufferAlignmentBytes - 1) +
+                                ") // " +
+                                std::to_string(distributed::comm_layout::kCommBufferAlignmentBytes) + ") * " +
+                                std::to_string(distributed::comm_layout::kCommBufferAlignmentBytes) + ")");
   }
 
-  // window_size = sum of all slot byte expressions. Parenthesise each summand
-  // to keep operator precedence safe under any sub-expression shape.
+  // Simpler places CommBufferSpecs consecutively. Round every physical
+  // allocation up to the transfer alignment so signal buffers following an
+  // odd-sized FP16 data buffer remain CCU-safe. ``count`` below retains the
+  // logical byte count, so the padding is not exposed through a
+  // DistributedTensor view. Aligning the final slot also provides safe tail
+  // storage for an FP16 remote TLOAD rounded to the same granularity.
+  // Parenthesise each summand to keep operator precedence safe under any
+  // sub-expression shape.
   std::ostringstream window_size_expr;
-  for (size_t i = 0; i < slot_nbytes.size(); ++i) {
+  for (size_t i = 0; i < slot_alloc_nbytes.size(); ++i) {
     if (i > 0) window_size_expr << " + ";
-    window_size_expr << "(" << slot_nbytes[i] << ")";
+    window_size_expr << "(" << slot_alloc_nbytes[i] << ")";
   }
 
   emitter_.EmitLine("with (_domain_provider or orch.allocate_domain)(");
@@ -576,12 +591,13 @@ void DistributedCodegen::VisitStmt_(const ir::CommDomainScopeStmtPtr& op) {
   emitter_.IncreaseIndent();
   for (size_t i = 0; i < op->slots_.size(); ++i) {
     const auto& slot = op->slots_[i];
-    const std::string& nbytes = slot_nbytes[i];
+    const std::string& logical_nbytes = slot_nbytes[i];
+    const std::string& alloc_nbytes = slot_alloc_nbytes[i];
     // dtype="opaque" mirrors the manifest-era placeholder: WindowBuffer is
     // intentionally dtype-agnostic (the field is unused by simpler). count is
-    // also in opaque bytes so it shares the same expression as nbytes.
+    // the exact logical byte length; nbytes is the aligned physical allocation.
     emitter_.EmitLine(std::string("CommBufferSpec(name=\"") + SanitizeName(slot->name_hint_) +
-                      R"(", dtype="opaque", count=)" + nbytes + ", nbytes=" + nbytes + "),");
+                      R"(", dtype="opaque", count=)" + logical_nbytes + ", nbytes=" + alloc_nbytes + "),");
   }
   emitter_.DecreaseIndent();
   emitter_.EmitLine("],");

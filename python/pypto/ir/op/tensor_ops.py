@@ -1635,8 +1635,9 @@ def view(
        product-preserving (new product == old product), except for symbolic
        dimensions where equality is unprovable and accepted optimistically.
        Static target dimensions must be positive. A source with a partial
-       ``valid_shape`` can only use the packed ND leading-dimension collapse
-       to 2D and requires an explicit target ``valid_shape``.
+       ``valid_shape`` can only use a packed ND leading-dimension collapse to
+       2D or a contiguous-prefix linear collapse to ``[1, product(shape)]``;
+       both require an explicit target ``valid_shape``.
     Combining ``shape`` with a layout change is valid for type deduction and
     PTO in-core lowering. Orchestration lowering only supports shape
     reinterpret for ND-layout tensors because the runtime ``Tensor::reshape``
@@ -1649,9 +1650,10 @@ def view(
             dimensions (RFC #1300 P4). Must be a sequence of ints or
             Expr values, or a ``MakeTuple``. In an InCore function, the source
             must remain a GM Tensor through tensor-to-tile conversion.
-        valid_shape: Explicit valid dimensions for a packed ND leading-dimension
-            collapse to 2D. Required when this supported collapse reinterprets
-            a source with partial validity.
+        valid_shape: Explicit valid dimensions for a packed ND
+            leading-dimension collapse to 2D or contiguous-prefix linear
+            collapse to ``[1, product(shape)]``. Required when either supported
+            collapse reinterprets a source with partial validity.
         layout: Target ``TensorLayout`` (ND or DN). Must not be ``NZ``.
             When provided without ``shape``, performs a layout-only flip.
             When combined with ``shape``, layout changes are supported in-core

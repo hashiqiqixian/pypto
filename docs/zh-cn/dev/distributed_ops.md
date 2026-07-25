@@ -84,9 +84,9 @@ enum class ReduceOp : int { kSum = 0, kMax = 1, kMin = 2, kProd = 3 };  // pld.t
 | `AtomicType` | `kNone` | 普通远程写 —— 覆盖 peer 的 dst 切片 |
 | `AtomicType` | `kAdd` | 原子地把源数据加到 peer 的 dst 切片 |
 | `ReduceOp` | `kSum` | 对所有参与 rank 的窗口切片做求和规约 |
-| `ReduceOp` | `kMax` | 预留的最大值规约变体；lowering 待实现 |
-| `ReduceOp` | `kMin` | 预留的最小值规约变体；lowering 待实现 |
-| `ReduceOp` | `kProd` | 预留的乘法规约变体；lowering 待实现 |
+| `ReduceOp` | `kMax` | 对所有参与 rank 的窗口切片做最大值规约 |
+| `ReduceOp` | `kMin` | 对所有参与 rank 的窗口切片做最小值规约 |
+| `ReduceOp` | `kProd` | 对所有参与 rank 的窗口切片做乘法规约 |
 
 每个枚举跨三层保持一致（C++ `enum class` → bindings 中的 `nb::enum_` → `.pyi`
 存根）,并以 `pld.NotifyOp` / `pld.WaitCmp` / `pld.AtomicType` / `pld.ReduceOp` 暴露给 DSL。
@@ -103,8 +103,8 @@ pld.tile.remote_load(target, peer, offsets, shape[, valid_shape])
 
 把 `peer` rank 的窗口绑定 `DistributedTensor` 切片中的一个区域读入本地 tile。
 在 IR 层面镜像 `tile.load`（位置参数 `offsets` / `shape` 元组、`TileType` 结果）,
-但源是*远程*切片 —— 地址转换在 codegen 时由
-`CommRemoteOffset(ctx, peer) + addptr + make_tensor_view` 实现。
+但源是*远程*切片 —— 地址转换在 codegen 时由内联的 `CommContext` 加载与
+偏移计算，再接 `addptr + make_tensor_view` 实现。
 
 `valid_shape` 可选。无论是否传入，类型推导都会将请求窗口与源 tensor 的实际有效
 区域取交集，并检查可证明的物理边界。传入时，`shape` 仍决定 UB tile 的物理分配
@@ -130,8 +130,8 @@ pld.tile.remote_store(src_tile, target, peer, offsets) -> Unknown
 
 把本地 tile 写入 `peer` rank 的窗口绑定 `DistributedTensor` 切片中的一个区域。
 在 IR 层面镜像 `tile.store`（位置参数 `offsets` 元组、仅副作用返回值），但目的是
-*远程*切片 —— 地址转换在 codegen 时由
-`CommRemoteOffset(ctx, peer) + addptr + make_tensor_view` 实现。
+*远程*切片 —— 地址转换在 codegen 时由内联的 `CommContext` 加载与
+偏移计算，再接 `addptr + make_tensor_view` 实现。
 
 Verifier：`src_tile` 必须是 `TileType`；`target` 必须是 `DistributedTensorType`；
 `peer` 必须是 `ScalarType` rank 索引；`offsets` 必须是 `MakeTuple`,其 rank 等于
@@ -270,12 +270,18 @@ chunk，Pass 会保留该元数据，并沿用单矩形路径只归约这个矩�
   写后读 (WAR) 竞态。
 - **`"ring"`** — NCCL 风格的分块 reduce-scatter + allgather 调度，
   O(1) 个 HCCL 窗口。信号 shape `[2 * (NR − 1), NR]`（每轮 ring 一行，
-  每 rank 一个槽位）。`SIZE` 按 `floor(i * SIZE / NR)` 边界划分为均衡
-  segment，因此非整除长度以及 `SIZE < NR` 都不会丢元素。每个 segment
-  再按最大 16 KiB 的物理 subchunk 处理，尾块通过显式 `valid_shape`
-  标记真实范围。每个 subchunk 在 store-back 前都使用该轮 signal 行上的
-  ready 和 read-complete 单调屏障，从而避免写后读 (WAR) 竞态，同时保持
-  signal shape 不变。
+  每 rank 一个槽位）。packed ND 目标会被视为逻辑 `[1, SIZE]` 线性流；
+  partial valid box 必须是连续的 row-major 前缀。降级会保留完整的物理
+  `[1, product(target.shape)]` 视图，并把逻辑前缀记录为
+  `TensorView.valid_shape=[1, product(target.valid_shape)]`。
+  FP32 使用均衡的 `floor(i * SIZE / NR)` 边界；FP16 会把每个内部边界向上
+  对齐到 16 个元素（32 字节）并限制在 `SIZE` 内，因此每个非空 segment 都从
+  MTE 安全地址开始，同时不改变用户可见的 packed 布局。很短的输入仍允许空
+  segment。每个 segment 再按最大 16 KiB 的物理 subchunk 处理；FP16 尾块只把
+  remote load 的物理读取范围向上对齐到 32 字节，并在归约或写回前恢复逻辑
+  `valid_shape`。每个 subchunk 在 store-back 前都使用该轮 signal 行上的 ready
+  和 read-complete 单调屏障，从而避免写后读 (WAR) 竞态，同时保持 signal shape
+  不变。
 
 host-orchestrator 用户代码可以在 `for` 和 `while` 循环外省略 `signal`；
 [`SynthesizeAllReduceSignals`](passes/38-synthesize_allreduce_signals.md) 阶段会为该 call 插入 private INT32 signal window，
@@ -284,10 +290,13 @@ signal）。该阶段会先插入 standalone `world_size = pld.world_size()` bin
 再用该变量构造 buffer size 和 window shape。循环内的所有调用都会被拒绝，因为当前 signal 协议只能
 单次使用。显式 `signal` 仍然是 InCore
 lowering 和内部测试使用的形态。通信域物化会把该 signal buffer 保留在与 `src`
-相同的 comm-domain 中，即使它没有传给用户自定义 chip kernel。public op 当前接受
-`ReduceOp.Sum`，并会拒绝预留的 `Max` / `Min` / `Prod` 变体，直到这些
-lowering 落地。host builtin lowering 路径当前支持 `Sum` + FP32 变体，并接受
-rank-1 `[world_size]` 或合成的 rank-2 `[world_size, 1]` signal。
+相同的 comm-domain 中，即使它没有传给用户自定义 chip kernel。mesh、ring 和
+host builtin 路径均支持 FP16、FP32，以及任意正元素数量下的
+`ReduceOp.Sum`、`Max`、`Min` 和 `Prod`。InCore lowering 使用受 UB 上限约束的
+分块，host builtin 使用 256 元素分块。InCore mesh 和 ring 只把 FP16 remote
+尾块的物理范围向上对齐到 32 字节；host builtin 会把 FP16 和 FP32 的 ragged load
+范围都对齐到 32 字节。两者都保留逻辑 valid shape。host builtin 接受 rank-1
+`[world_size]` 或合成的 rank-2 `[world_size, 1]` signal。
 
 ### `pld.system.notify`（TNOTIFY）
 
@@ -315,14 +324,14 @@ Verifier：`signal` 必须是 `DistributedTensorType`；`expected` 必须是
 
 ## 共享 codegen 基础设施
 
-六个算子全部经由 `src/backend/common/pto_ops_common.cpp` 和
+六个算子全部经由 `src/backend/common/pto_ops_distributed.cpp` 和
 `src/codegen/pto/pto_codegen.cpp` 中的 PTO codegen 辅助函数下降。共享的可复用部件
 —— 使每个算子的下降都不携带专门的 peer 算术 —— 如下：
 
 | 辅助函数 | 作用 |
 | -------- | ---- |
-| `CommRemoteOffset_<dtype>` | 按 dtype 的 MLIR 辅助函数（由 `PTOCodegen::EmitCommRemoteOffsetHelpers` 一次性发出）,把 `(ctx, peer)` 转为 peer 窗口切片的字节偏移 |
-| `EmitCommRemoteView` | 在调用点发出 `CommRemoteOffset + addptr + make_tensor_view`,得到 peer 寻址的视图（被 `remote_load`、`get` 的 `src` 和 `put` 的 `dst` 使用） |
+| `EmitCommRemoteOffset` | 发出内联 `CommContext` 加载，并把 peer 与本地窗口之间的字节差转换为元素偏移 |
+| `EmitCommRemoteView` | 发出内联偏移计算，再接 `addptr + make_tensor_view`，得到 peer 寻址的视图（被 `remote_load`、`get` 的 `src` 和 `put` 的 `dst` 使用） |
 | `EmitPartitionViewPTO` | 用给定 offsets/sizes 把 tensor view 包成全切片 `partition_view`（被每个算子的本地与 peer 操作数使用） |
 | `ResolveDistTensorBinding` | 把 `DistributedTensor` 实参解析为其 codegen 绑定（类型 + 窗口变量） |
 | `AsTensorTypeLike` | kind-trait 向下转换,在统一读取视图 element/shape 信息处同时接受 `TensorType` 与 `DistributedTensorType` |

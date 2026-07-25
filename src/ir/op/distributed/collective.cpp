@@ -51,15 +51,22 @@ namespace ir {
 
 namespace {
 
-void CheckReduceOp(int op_value, const std::string& op_name) {
+void CheckSumReduceOp(int op_value, const std::string& op_name) {
   CHECK(op_value == static_cast<int>(ReduceOp::kSum))
       << op_name << " op must be ReduceOp.Sum (got int " << op_value << ")";
 }
 
-void CheckSupportedBuiltinVariant(int op_value, DataType dtype, const std::string& op_name) {
-  CheckReduceOp(op_value, op_name);
+void CheckSupportedSumFp32BuiltinVariant(int op_value, DataType dtype, const std::string& op_name) {
+  CheckSumReduceOp(op_value, op_name);
   CHECK(dtype == DataType::FP32) << op_name << " currently supports only (op=ReduceOp.Sum, dtype=FP32); got "
                                  << "(op=ReduceOp.Sum, dtype=" << dtype.ToString() << ")";
+}
+
+void CheckSupportedAllReduceBuiltinVariant(int op_value, DataType dtype, const std::string& op_name) {
+  CHECK(op_value >= static_cast<int>(ReduceOp::kSum) && op_value <= static_cast<int>(ReduceOp::kProd))
+      << op_name << " op must be ReduceOp.Sum, Max, Min, or Prod (got int " << op_value << ")";
+  CHECK(dtype == DataType::FP16 || dtype == DataType::FP32)
+      << op_name << " currently supports only FP16 or FP32, got " << dtype.ToString();
 }
 
 void CheckSupportedFp32BuiltinVariant(DataType dtype, const std::string& op_name) {
@@ -109,7 +116,7 @@ TypePtr DeduceBuiltinTensorAllReduceType(const std::vector<ExprPtr>& args,
   auto dtype = GetRequiredKwarg<DataType>(kwargs, "dtype", kOpName);
   CHECK(dtype == src_type->dtype_) << kOpName << " dtype kwarg (" << dtype.ToString()
                                    << ") must match src dtype (" << src_type->dtype_.ToString() << ")";
-  CheckSupportedBuiltinVariant(op_value, dtype, kOpName);
+  CheckSupportedAllReduceBuiltinVariant(op_value, dtype, kOpName);
   return args[0]->GetType();
 }
 
@@ -586,7 +593,7 @@ TypePtr DeduceBuiltinTensorReduceScatterType(const std::vector<ExprPtr>& args,
   CHECK(dtype == target_type->dtype_)
       << kOpName << " dtype kwarg (" << dtype.ToString() << ") must match target dtype ("
       << target_type->dtype_.ToString() << ")";
-  CheckSupportedBuiltinVariant(op_value, dtype, kOpName);
+  CheckSupportedSumFp32BuiltinVariant(op_value, dtype, kOpName);
   return args[0]->GetType();
 }
 

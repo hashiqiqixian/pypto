@@ -51,7 +51,8 @@ def remote_load(
 
     Mirrors :func:`pl.tile.load` at the user-visible surface, but the source
     is a *remote* slice of a window-bound :class:`pld.DistributedTensor`.
-    Address translation happens at codegen via ``CommRemoteOffset`` + addptr + make_tensor_view.
+    Address translation happens at codegen via inline ``CommContext`` loads and
+    offset arithmetic followed by addptr + make_tensor_view.
 
     All arguments are positional-or-keyword (mirroring :func:`pl.tile.load`),
     so the printed IR — which emits them positionally — round-trips through
@@ -72,7 +73,6 @@ def remote_load(
             inference must be runtime-bound by a kernel scalar, loop variable,
             or physical tensor-shape parameter; a type-metadata-only symbol is
             rejected during PTO codegen.
-
     Returns:
         A local :class:`pl.Tile` of the requested shape, dtype equal to
         ``target.dtype``.
@@ -97,6 +97,33 @@ def remote_load(
     return Tile(expr=call)
 
 
+def _remote_load_with_physical_tail_padding(
+    target: DistributedTensor,
+    peer: IntLike,
+    offsets: Sequence[IntLike],
+    shape: Sequence[IntLike],
+    valid_shape: Sequence[IntLike],
+) -> Tile:
+    """Reparse a compiler-generated aligned FP16 remote-load tail."""
+    target_expr = _unwrap(target)
+    if not isinstance(target_expr, Expr) or not isinstance(target_expr.type, _ir.DistributedTensorType):
+        got = (
+            _ir.python_print_type(target_expr.type)
+            if isinstance(target_expr, Expr)
+            else type(target_expr).__name__
+        )
+        raise TypeError(f"pld.tile.remote_load expects a DistributedTensor target (window-bound); got {got}")
+
+    call = _ir_tile._remote_load_with_physical_tail_padding(
+        target_expr,
+        _unwrap(peer),
+        _normalize_intlike(offsets),
+        _normalize_intlike(shape),
+        _normalize_intlike(valid_shape),
+    )
+    return Tile(expr=call)
+
+
 def remote_store(
     src_tile: Tile,
     target: DistributedTensor,
@@ -108,7 +135,8 @@ def remote_store(
     Mirrors :func:`pl.tile.store` at the user-visible surface, but the
     destination is a *remote* slice of a window-bound
     :class:`pld.DistributedTensor`. Address translation happens at codegen
-    via ``CommRemoteOffset`` + addptr + make_tensor_view.
+    via inline ``CommContext`` loads and offset arithmetic followed by addptr +
+    make_tensor_view.
 
     All arguments are positional-or-keyword (mirroring :func:`pl.tile.store`),
     so the printed IR — which emits them positionally — round-trips through

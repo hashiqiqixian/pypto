@@ -272,12 +272,15 @@ def test_comm_group_program_emits_domain_provider_with_block():
     # the alloc) lowers to `workers=[*range(world_size)]` — resolved at
     # orch_fn time against the runner-bound `world_size` kwarg.
     assert re.search(r"workers=\[\*range\(world_size\)\],", code), code
-    # window_size is the sum of all slot nbytes expressions, each parenthesised.
-    # Single slot → `window_size=((64 * 4)),` (the inner parens come from the
-    # Mul expression the parser produces for ``SIZE * pl.FP32.get_byte()``).
-    assert re.search(r"window_size=\(\(64 \* 4\)\),", code), code
+    # window_size is the sum of aligned physical slot sizes. Each spec keeps
+    # its exact logical size in count and exposes only its physical size via
+    # nbytes.
+    # Single slot → `window_size=((((64 * 4) + 31) // 32) * 32),`. The inner
+    # parentheses come from the Mul expression.
+    aligned_size = r"\(\(\(\(64 \* 4\) \+ 31\) // 32\) \* 32\)"
+    assert re.search(rf"window_size=\({aligned_size}\),", code), code
     assert re.search(
-        r'CommBufferSpec\(name="data_buf", dtype="opaque", count=\(64 \* 4\), nbytes=\(64 \* 4\)\),',
+        rf'CommBufferSpec\(name="data_buf", dtype="opaque", count=\(64 \* 4\), nbytes={aligned_size}\),',
         code,
     ), code
     assert "as __comm_d0:" in code, code
@@ -285,6 +288,46 @@ def test_comm_group_program_emits_domain_provider_with_block():
     # ``contexts`` parameter must not appear anywhere.
     assert "contexts[" not in code, code
     assert re.search(r"__comm_d0\[\w+\]\.buffer_ptrs", code), code
+
+
+def test_comm_buffer_specs_align_each_physical_allocation():
+    """An odd FP16 data buffer must not misalign the following INT32 signal."""
+
+    @pl.program
+    class Prog:
+        @pl.function(level=pl.Level.CHIP, role=pl.Role.Orchestrator)
+        def chip_orch(
+            self,
+            data: pld.DistributedTensor[[17], pl.FP16],
+            signal: pld.DistributedTensor[[2], pl.INT32],
+        ) -> pl.Tensor[[17], pl.FP16]:
+            return data  # type: ignore[return-value]
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self) -> pl.Tensor[[17], pl.FP16]:
+            data_buf = pld.alloc_window_buffer(17 * pl.FP16.get_byte())
+            signal_buf = pld.alloc_window_buffer(2 * pl.INT32.get_byte())
+            data = pld.window(data_buf, [17], dtype=pl.FP16)
+            signal = pld.window(signal_buf, [2], dtype=pl.INT32)
+            return self.chip_orch(data, signal, device=0)
+
+    code = _lower(Prog)
+    data_logical = r"\(17 \* 2\)"
+    signal_logical = r"\(2 \* 4\)"
+    data_alloc = rf"\(\(\({data_logical} \+ 31\) // 32\) \* 32\)"
+    signal_alloc = rf"\(\(\({signal_logical} \+ 31\) // 32\) \* 32\)"
+    assert re.search(
+        rf'CommBufferSpec\(name="data_buf", dtype="opaque", count={data_logical}, nbytes={data_alloc}\),',
+        code,
+    ), code
+    assert re.search(
+        (
+            rf'CommBufferSpec\(name="signal_buf", dtype="opaque", '
+            rf"count={signal_logical}, nbytes={signal_alloc}\),"
+        ),
+        code,
+    ), code
+    assert re.search(rf"window_size=\({data_alloc}\) \+ \({signal_alloc}\),", code), code
 
 
 # ---------------------------------------------------------------------------
@@ -574,7 +617,93 @@ def test_host_allreduce_builtin_codegen_uses_next_level_callable_key():
     assert spec.variant == "builtin.tensor.allreduce__sum__fp32"
     assert spec.entry_symbol == "builtin_tensor_allreduce__sum__fp32"
     assert spec.template_dir == ":pypto.runtime.builtins.collectives.allreduce"
-    assert spec.template_vars == {"op_cpp": "ReduceOp::kSum", "dtype_cpp": "float"}
+    assert spec.template_vars == {
+        "op_cpp": "ReduceOp::kSum",
+        "reduce_inst": "TADD",
+        "dtype_cpp": "float",
+    }
+
+
+@pytest.mark.parametrize(
+    ("reduce_op", "op_suffix", "op_cpp", "reduce_inst"),
+    [
+        (pld.ReduceOp.Sum, "sum", "ReduceOp::kSum", "TADD"),
+        (pld.ReduceOp.Max, "max", "ReduceOp::kMax", "TMAX"),
+        (pld.ReduceOp.Min, "min", "ReduceOp::kMin", "TMIN"),
+        (pld.ReduceOp.Prod, "prod", "ReduceOp::kProd", "TMUL"),
+    ],
+)
+def test_host_allreduce_builtin_supports_every_op(
+    reduce_op,
+    op_suffix,
+    op_cpp,
+    reduce_inst,
+):
+    DTYPE = pl.FP32
+    REDUCE_OP = reduce_op
+    DTYPE_BYTES = 4
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[SIZE], DTYPE]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(SIZE * DTYPE_BYTES)
+            signal_buf = pld.alloc_window_buffer(pld.world_size() * pl.INT32.get_byte())
+            data = pld.window(data_buf, [SIZE], dtype=DTYPE)
+            signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.tensor.allreduce(data, signal, op=REDUCE_OP)
+            return 0
+
+    generated, cg = _lower_host_collectives(Prog)
+    variant = f"builtin.tensor.allreduce__{op_suffix}__fp32"
+
+    assert f'callables["{variant}"]' in generated
+    specs = cg.get_builtin_next_level_specs()
+    assert len(specs) == 1
+    spec = specs[0]
+    assert spec.variant == variant
+    assert spec.template_vars == {
+        "op_cpp": op_cpp,
+        "reduce_inst": reduce_inst,
+        "dtype_cpp": "float",
+    }
+
+
+def test_host_allreduce_builtin_codegen_supports_fp16_variant():
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def chip_orch(self, data: pld.DistributedTensor[[17], pl.FP16]):
+            return data
+
+        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+        def host_orch(self):
+            data_buf = pld.alloc_window_buffer(17 * pl.FP16.get_byte())
+            signal_buf = pld.alloc_window_buffer(pld.world_size() * pl.INT32.get_byte())
+            data = pld.window(data_buf, [17], dtype=pl.FP16)
+            signal = pld.window(signal_buf, [pld.world_size()], dtype=pl.INT32)
+            for r in pl.range(pld.world_size()):
+                self.chip_orch(data, device=r)
+            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+            return 0
+
+    generated, cg = _lower_host_collectives(Prog)
+    variant = "builtin.tensor.allreduce__sum__fp16"
+    assert f'callables["{variant}"]' in generated
+    specs = cg.get_builtin_next_level_specs()
+    assert len(specs) == 1
+    assert specs[0].variant == variant
+    assert specs[0].template_vars == {
+        "op_cpp": "ReduceOp::kSum",
+        "reduce_inst": "TADD",
+        "dtype_cpp": "half",
+    }
 
 
 def test_implicit_host_allreduce_builtin_codegen_materializes_signal():
@@ -666,7 +795,7 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
 
     entry_cpp = files[f"{base}/orchestration/builtin_tensor_allreduce__sum__fp32.cpp"]
     assert "builtin_tensor_allreduce__sum__fp32" in entry_cpp
-    assert "submit_allreduce_kernel<ReduceOp::kSum, float>" in entry_cpp
+    assert "submit_allreduce_kernel<ReduceOp::kSum>" in entry_cpp
 
     kernel_config = files[f"{base}/kernel_config.py"]
     assert '"function_name": "aicpu_orchestration_entry"' in kernel_config
@@ -675,6 +804,12 @@ def test_backend_materializes_builtin_next_level_files(tmp_path):
     kernel_cpp = files[f"{base}/kernels/aiv/builtin_tensor_allreduce__sum__fp32_kernel.cpp"]
     assert "platform_comm/comm_context.h" in kernel_cpp
     assert "data_tensor->ndims" in kernel_cpp
+    assert "transfer_chunk" in kernel_cpp
+    assert "acc_tile.SetValidShape(1, transfer_chunk)" in kernel_cpp
+    assert "recv_tile.SetValidShape(1, transfer_chunk)" in kernel_cpp
+    assert "acc_tile.SetValidShape(1, chunk)" in kernel_cpp
+    assert "Global data_store_g" in kernel_cpp
+    assert "TADD(acc_tile, acc_tile, recv_tile)" in kernel_cpp
 
 
 # ---------------------------------------------------------------------------

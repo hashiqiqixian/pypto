@@ -641,7 +641,7 @@ void BindIR(nb::module_& m) {
   // codegen. Values come from offsetof(::CommContext, ...) and are pinned by
   // static_assert in include/pypto/codegen/distributed/comm_layout.h. Exposed
   // to Python so unit tests can assert no drift between bindings and the
-  // literal numbers that codegen embeds into emitted CommRemoteOffset kernels.
+  // literal numbers that codegen embeds into remote-address calculations.
   nb::module_ comm_layout_mod = ir.def_submodule(
       "comm_layout", "Compile-time locked CommContext field offsets consumed by distributed codegen.");
   comm_layout_mod.attr("RANK_ID_OFFSET") = pypto::codegen::distributed::comm_layout::kRankIdOffset;
@@ -1307,9 +1307,9 @@ void BindIR(nb::module_& m) {
   nb::enum_<ReduceOp>(ir, "ReduceOp", nb::is_arithmetic(),
                       "Reduction operator for collective reductions (pld.tensor.allreduce, ...)")
       .value("Sum", ReduceOp::kSum, "Element-wise sum across ranks")
-      .value("Max", ReduceOp::kMax, "Element-wise max across ranks (reserved; lowering pending)")
-      .value("Min", ReduceOp::kMin, "Element-wise min across ranks (reserved; lowering pending)")
-      .value("Prod", ReduceOp::kProd, "Element-wise product across ranks (reserved; lowering pending)");
+      .value("Max", ReduceOp::kMax, "Element-wise maximum across ranks")
+      .value("Min", ReduceOp::kMin, "Element-wise minimum across ranks")
+      .value("Prod", ReduceOp::kProd, "Element-wise product across ranks");
 
   // ScopeStmt - abstract base class for all scope statements (issue #1047).
   auto scope_stmt_class = nb::class_<ScopeStmt, Stmt>(

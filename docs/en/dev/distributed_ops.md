@@ -92,9 +92,9 @@ enum class ReduceOp : int { kSum = 0, kMax = 1, kMin = 2, kProd = 3 };  // pld.t
 | `AtomicType` | `kNone` | plain remote store — overwrite the peer's dst slice |
 | `AtomicType` | `kAdd` | atomically add the source data into the peer's dst slice |
 | `ReduceOp` | `kSum` | sum-reduce every participating rank's window slice |
-| `ReduceOp` | `kMax` | reserved max-reduce variant; lowering pending |
-| `ReduceOp` | `kMin` | reserved min-reduce variant; lowering pending |
-| `ReduceOp` | `kProd` | reserved product-reduce variant; lowering pending |
+| `ReduceOp` | `kMax` | max-reduce every participating rank's window slice |
+| `ReduceOp` | `kMin` | min-reduce every participating rank's window slice |
+| `ReduceOp` | `kProd` | product-reduce every participating rank's window slice |
 
 Each enum is mirrored across three layers (C++ `enum class` → `nb::enum_` in the
 bindings → `.pyi` stub) and surfaced to the DSL as `pld.NotifyOp` /
@@ -113,8 +113,8 @@ pld.tile.remote_load(target, peer, offsets, shape[, valid_shape])
 Reads a region of the `peer` rank's slice of a window-bound `DistributedTensor`
 into a local tile. Mirrors `tile.load` at the IR level (positional `offsets` /
 `shape` tuples, `TileType` result) but the source is a *remote* slice — the
-address translation is realised at codegen by
-`CommRemoteOffset(ctx, peer) + addptr + make_tensor_view`.
+address translation is realised at codegen by inline `CommContext` loads and
+offset arithmetic followed by `addptr + make_tensor_view`.
 
 `valid_shape` is optional. With or without it, type inference intersects the
 requested window with the source tensor's effective valid region and checks
@@ -144,8 +144,8 @@ pld.tile.remote_store(src_tile, target, peer, offsets) -> Unknown
 Writes a local tile into a region of the `peer` rank's slice of a window-bound
 `DistributedTensor`. Mirrors `tile.store` at the IR level (positional `offsets`
 tuple + side-effect-only return) but the destination is a *remote* slice —
-address translation happens at codegen via `CommRemoteOffset(ctx, peer) +
-addptr + make_tensor_view`.
+address translation happens at codegen via inline `CommContext` loads and
+offset arithmetic followed by `addptr + make_tensor_view`.
 
 Verifier: `src_tile` must be `TileType`; `target` must be
 `DistributedTensorType`; `peer` must be a `ScalarType` rank index; `offsets`
@@ -311,13 +311,21 @@ dynamic physical target dimension is bound from that tensor parameter.
   counter before store-back, preventing write-after-read races.
 - **`"ring"`** — NCCL-style chunked reduce-scatter + allgather schedule with
   O(1) HCCL windows.  Signal shape `[2 * (NR − 1), NR]` (one row per ring
-  round, one cell per rank). `SIZE` is divided into balanced segments using
-  `floor(i * SIZE / NR)` boundaries, so non-divisible sizes and `SIZE < NR`
-  are covered without dropping elements. Each segment is processed in at most
-  16-KiB physical subchunks; a ragged subchunk carries an explicit
-  `valid_shape`. Every subchunk uses ready and read-complete barriers on the
-  round's monotonic signal row before store-back, preventing write-after-read
-  races while keeping the signal shape unchanged.
+  round, one cell per rank). A packed ND target is viewed as one logical
+  `[1, SIZE]` stream; a partial valid box must be a contiguous row-major
+  prefix. Lowering keeps the full physical
+  `[1, product(target.shape)]` view and records the logical prefix as
+  `TensorView.valid_shape=[1, product(target.valid_shape)]`. FP32 divides
+  `SIZE` with balanced `floor(i * SIZE / NR)` boundaries. FP16 rounds each
+  interior boundary up to 16 elements (32 bytes) and caps it at `SIZE`, so
+  every non-empty segment begins at an MTE-safe address without changing the
+  packed user-visible layout. Empty segments remain legal for very short
+  inputs. Each segment is processed in at most 16-KiB physical subchunks; an
+  FP16 ragged remote tail rounds only its physical read span to 32 bytes and
+  restores the logical `valid_shape` before reduction or store. Every
+  subchunk uses ready and read-complete barriers on the round's monotonic
+  signal row before store-back, preventing write-after-read races while
+  keeping the signal shape unchanged.
 
 Host-orchestrator user code may omit `signal` outside `for` and `while` loops;
 the [`SynthesizeAllReduceSignals`](passes/38-synthesize_allreduce_signals.md)
@@ -329,11 +337,14 @@ loops are rejected because the current signal protocol is single-use. Explicit
 `signal` remains the internal form used by InCore lowering and by tests that
 intentionally construct the internal protocol. Comm-domain materialisation then
 keeps the signal buffer in the same domain as `src`, even when it is not passed
-to a user chip kernel. The public op currently accepts `ReduceOp.Sum` and
-rejects the reserved reduce variants (`Max`, `Min`, `Prod`) until their
-lowerings land. The host builtin lowering path currently supports the `Sum` +
-FP32 variant and accepts either a rank-1 `[world_size]` signal or the
-synthesized rank-2 `[world_size, 1]` signal.
+to a user chip kernel. Mesh, ring, and host-builtin paths support FP16 and FP32
+with `ReduceOp.Sum`, `Max`, `Min`, and `Prod` for arbitrary positive element
+counts. InCore lowering uses UB-bounded chunks; the host builtin uses
+256-element chunks. InCore mesh and ring round only the physical FP16 remote
+tail span to 32 bytes. The host builtin rounds ragged FP16 and FP32 load spans
+to 32 bytes. Both preserve the logical valid shape. The host builtin accepts either a
+rank-1 `[world_size]` signal or the synthesized rank-2 `[world_size, 1]`
+signal.
 
 ### `pld.system.notify` (TNOTIFY)
 
@@ -363,14 +374,14 @@ Verifier: `signal` must be `DistributedTensorType`; `expected` must be
 ## Shared codegen infrastructure
 
 All five ops lower through PTO codegen helpers in
-`src/backend/common/pto_ops_common.cpp` and `src/codegen/pto/pto_codegen.cpp`.
+`src/backend/common/pto_ops_distributed.cpp` and `src/codegen/pto/pto_codegen.cpp`.
 The reusable pieces — shared so each op's lowering carries no bespoke peer
 arithmetic — are:
 
 | Helper | Role |
 | ------ | ---- |
-| `CommRemoteOffset_<dtype>` | per-dtype MLIR helper (emitted once by `PTOCodegen::EmitCommRemoteOffsetHelpers`) that turns `(ctx, peer)` into the byte offset of the peer's window slice |
-| `EmitCommRemoteView` | emits `CommRemoteOffset + addptr + make_tensor_view` at the call site, yielding the peer-addressed view (used by `remote_load`, `get`'s `src`, and `put`'s `dst`) |
+| `EmitCommRemoteOffset` | emits inline `CommContext` loads and converts the peer-vs-local byte delta to an element offset |
+| `EmitCommRemoteView` | emits the inline offset calculation followed by `addptr + make_tensor_view`, yielding the peer-addressed view (used by `remote_load`, `get`'s `src`, and `put`'s `dst`) |
 | `EmitPartitionViewPTO` | wraps a tensor view in a full-slice `partition_view` with given offsets/sizes (used by every op for both local and peer operands) |
 | `ResolveDistTensorBinding` | resolves a `DistributedTensor` arg to its codegen binding (type + window var) |
 | `AsTensorTypeLike` | kind-trait downcast accepting both `TensorType` and `DistributedTensorType` where a view's element/shape info is read uniformly |

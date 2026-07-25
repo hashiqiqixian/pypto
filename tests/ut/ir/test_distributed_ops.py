@@ -232,6 +232,32 @@ def test_tensor_allreduce_returns_src_type():
     assert call.kwargs["op"] == int(ir.ReduceOp.Sum)
 
 
+@pytest.mark.parametrize(
+    "reduce_op",
+    [ir.ReduceOp.Sum, ir.ReduceOp.Max, ir.ReduceOp.Min, ir.ReduceOp.Prod],
+)
+def test_tensor_allreduce_accepts_every_reduce_op(reduce_op):
+    span = ir.Span.unknown()
+    src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+    call = dist_tensor_ops.allreduce(src, signal, op=reduce_op, span=span)
+    assert call.type is src.type
+    assert call.kwargs["op"] == int(reduce_op)
+
+
+def test_tensor_allreduce_rejects_unknown_reduce_op_value():
+    span = ir.Span.unknown()
+    src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+    with pytest.raises(Exception, match="ReduceOp.Sum, Max, Min, or Prod"):
+        ir.create_op_call(
+            "pld.tensor.allreduce",
+            [src, signal],
+            {"op": 99, "mode": "mesh"},
+            span,
+        )
+
+
 def test_tensor_allreduce_defaults_to_sum():
     span = ir.Span.unknown()
     src = _make_distributed_tensor_var("src", [16], DataType.FP32, span)
@@ -297,12 +323,20 @@ def test_tensor_allreduce_accepts_non_rank1_signal():
     assert call.type is src.type
 
 
-def test_tensor_allreduce_accepts_non_fp32_target_dtype():
+def test_tensor_allreduce_accepts_fp16_target_dtype():
     span = ir.Span.unknown()
     src = _make_distributed_tensor_var("src", [16], DataType.FP16, span)
     signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
     call = dist_tensor_ops.allreduce(src, signal, op=ir.ReduceOp.Sum, span=span)
     assert call.type is src.type
+
+
+def test_tensor_allreduce_rejects_unsupported_target_dtype():
+    span = ir.Span.unknown()
+    src = _make_distributed_tensor_var("src", [16], DataType.BF16, span)
+    signal = _make_distributed_tensor_var("signal", [4], DataType.INT32, span)
+    with pytest.raises(Exception, match="target dtype must be FP16 or FP32"):
+        dist_tensor_ops.allreduce(src, signal, op=ir.ReduceOp.Sum, span=span)
 
 
 def test_builtin_tensor_allreduce_is_internal_only():
@@ -376,6 +410,29 @@ def test_remote_load_infers_col_major_for_single_column_tile():
     assert call.type.get_effective_tile_view().blayout == ir.TileLayout.col_major
 
 
+def test_remote_load_respects_explicit_nd_layout_for_single_column_tile():
+    """An explicit ND source keeps a row-major remote tile for [M, 1]."""
+    span = ir.Span.unknown()
+    shape = [ir.ConstInt(8, DataType.INT64, span), ir.ConstInt(1, DataType.INT64, span)]
+    view = ir.TensorView(
+        valid_shape=[],
+        stride=[ir.ConstInt(1, DataType.INT64, span), ir.ConstInt(8, DataType.INT64, span)],
+        layout=ir.TensorLayout.ND,
+    )
+    target = ir.Var("data", ir.DistributedTensorType(shape, DataType.FP32, None, view), span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+
+    call = ir.create_op_call(
+        "pld.tile.remote_load",
+        [target, peer, _make_shape_tuple([0, 0], span), _make_shape_tuple([8, 1], span)],
+        {},
+        span,
+    )
+
+    assert isinstance(call.type, ir.TileType)
+    assert call.type.get_effective_tile_view().blayout == ir.TileLayout.row_major
+
+
 def test_remote_load_four_arg_form_rejects_out_of_bounds_window():
     """Omitting valid_shape still enforces the requested physical window."""
     span = ir.Span.unknown()
@@ -434,6 +491,27 @@ def test_remote_load_valid_shape_preserves_physical_tile_and_narrows_tail():
     assert call.type.shape == [1, 8192]
     assert call.type.tile_view is not None
     assert call.type.tile_view.valid_shape == [1, 17]
+
+
+def test_remote_load_internal_fp16_tail_allows_one_aligned_padding_block():
+    """The allreduce-only mode may read the hidden aligned tail padding."""
+    span = ir.Span.unknown()
+    target = _make_distributed_tensor_var("data", [1, 17], DataType.FP16, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+
+    call = dist_tile_ops._remote_load_with_physical_tail_padding(
+        target,
+        peer,
+        [0, 0],
+        [1, 32],
+        [1, 32],
+        span=span,
+    )
+
+    assert isinstance(call.type, ir.TileType)
+    assert call.kwargs["allow_physical_tail_padding"] is True
+    assert call.type.shape == [1, 32]
+    assert call.type.get_effective_tile_view().valid_shape == [1, 32]
 
 
 def test_remote_load_rejects_mismatched_valid_shape_rank():

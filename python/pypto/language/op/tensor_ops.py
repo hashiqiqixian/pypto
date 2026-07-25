@@ -1697,9 +1697,10 @@ def view(
         tensor: Source tensor.
         shape: New shape for the view. Must be product-preserving unless
             symbolic dimensions are present. Rank-zero views are not supported.
-        valid_shape: Explicit valid dimensions for a packed ND leading-dimension
-            collapse to 2D. Required when this supported collapse reinterprets
-            a source with partial validity.
+        valid_shape: Explicit valid dimensions for a packed ND
+            leading-dimension collapse to 2D or contiguous-prefix linear
+            collapse to ``[1, product(shape)]``. Required when either supported
+            collapse reinterprets a source with partial validity.
         layout: Target ``TensorLayout`` (ND or DN); DN requires rank at least 2.
             Layout changes combined with ``shape`` are supported in-core but not by orchestration
             lowering. Orchestration shape reinterpret is limited to ND-layout

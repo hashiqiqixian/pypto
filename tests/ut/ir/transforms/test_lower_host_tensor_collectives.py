@@ -456,27 +456,25 @@ def test_host_allreduce_rejects_rank2_signal_with_dynamic_second_extent():
         passes.lower_host_tensor_collectives()(program)
 
 
-def test_host_allreduce_rejects_unsupported_builtin_dtype_variant():
-    @pl.program
-    class P:
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def chip_orch(self, data: pld.DistributedTensor[[256], pl.FP16]):
-            return data
+def test_host_allreduce_rejects_unsupported_dtype_before_lowering():
+    with pytest.raises(Exception, match="target dtype must be FP16 or FP32"):
 
-        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(self):
-            data_buf = pld.alloc_window_buffer(256 * pl.FP16.get_byte())
-            signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
-            data = pld.window(data_buf, [256], dtype=pl.FP16)
-            signal = pld.window(signal_buf, [4], dtype=pl.INT32)
-            for r in pl.range(pld.world_size()):
-                self.chip_orch(data, device=r)
-            pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
-            return 0
+        @pl.program
+        class P:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def chip_orch(self, data: pld.DistributedTensor[[256], pl.BF16]):
+                return data
 
-    program = passes.materialize_comm_domain_scopes()(P)
-    with pytest.raises(Exception, match="currently supports only"):
-        passes.lower_host_tensor_collectives()(program)
+            @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
+            def host_orch(self):
+                data_buf = pld.alloc_window_buffer(256 * pl.BF16.get_byte())
+                signal_buf = pld.alloc_window_buffer(4 * pl.INT32.get_byte())
+                data = pld.window(data_buf, [256], dtype=pl.BF16)
+                signal = pld.window(signal_buf, [4], dtype=pl.INT32)
+                for r in pl.range(pld.world_size()):
+                    self.chip_orch(data, device=r)
+                pld.tensor.allreduce(data, signal, op=pld.ReduceOp.Sum)
+                return 0
 
 
 def test_host_barrier_lowers_to_builtin_world_size_loop():

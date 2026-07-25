@@ -938,6 +938,14 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
   // Operations are stored with internal names like "tensor.adds" or "tile.matmul"
   // and are printed in parseable format like "pl.tensor.adds"
   std::string op_name = op->op_->name_;
+  const bool has_physical_remote_tail =
+      IsOp(op, "pld.tile.remote_load") && op->GetKwarg<bool>("allow_physical_tail_padding", false);
+  if (has_physical_remote_tail) {
+    // The aligned FP16 tail is a compiler-only lowering detail. Print a private
+    // parser sentinel that reconstructs the marker instead of exposing the
+    // internal kwarg on the public pld.tile.remote_load API.
+    op_name = "pld.tile._remote_load_with_physical_tail_padding";
+  }
 
   // Normalize tensor.add with scalar rhs to tensor.adds (matches Python API dispatch)
   if (IsOp(op, "tensor.add") && op->args_.size() == 2) {
@@ -1139,6 +1147,7 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
     need_comma = true;
   }
   for (const auto& [key, value] : op->kwargs_) {
+    if (has_physical_remote_tail && key == "allow_physical_tail_padding") continue;
     // ``pld.tensor.alloc_window_buffer`` injects its ``name`` kwarg from the LHS
     // at parse time and explicitly rejects a user-written ``name=`` kwarg. Skip
     // it on print so the round-trip parser can re-derive the name from the

@@ -1099,7 +1099,7 @@ class _CommLayoutModule:
     Values mirror `offsetof(::CommContext, ...)` on the runtime header and are
     pinned by `static_assert` in `include/pypto/codegen/distributed/comm_layout.h`.
     Treat any drift between these constants and the literals embedded in emitted
-    CommRemoteOffset kernels as a runtime/codegen ABI break.
+    remote-address calculations as a runtime/codegen ABI break.
     """
 
     RANK_ID_OFFSET: Final[int]
@@ -2202,22 +2202,20 @@ class ReduceOp(enum.IntEnum):
     """Reduction operator for collective reductions — ``pld.tensor.allreduce`` and friends.
 
     Stored as ``int`` in op kwargs; the C++ deducer validates the int falls
-    within this enum's range. First-version lowering accepts only ``Sum``;
-    ``Max`` / ``Min`` / ``Prod`` are reserved enum values and are rejected
-    at the deducer until their lowerings land.
+    within this enum's range.
     """
 
     Sum = 0
     """Element-wise sum across ranks."""
 
     Max = 1
-    """Element-wise max across ranks (reserved; lowering pending)."""
+    """Element-wise maximum across ranks."""
 
     Min = 2
-    """Element-wise min across ranks (reserved; lowering pending)."""
+    """Element-wise minimum across ranks."""
 
     Prod = 3
-    """Element-wise product across ranks (reserved; lowering pending)."""
+    """Element-wise product across ranks."""
 
 class ScopeStmt(Stmt):
     """Scope statement: marks a region with specific execution context (abstract base).

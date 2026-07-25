@@ -57,9 +57,11 @@ comm-domain scope 带有显式 device 列表，则生成 `SeqStmts`；否则生�
 ## 检查
 
 该 pass 要求两个参数都是已经 materialize 的 `DistributedTensorType` view，并且位于同一个
-`CommDomainScopeStmt` 中。当前 host builtin 路径仅支持 FP32 data 上的
-`ReduceOp.Sum`，并要求 signal 是 INT32 tensor，形状可以是 rank-1 `[world_size]`
-或 rank-2 `[world_size, 1]`；当参与设备数静态可知时，signal 的静态容量必须足够。
+`CommDomainScopeStmt` 中。host allreduce builtin 支持 FP16、FP32 上的
+`ReduceOp.Sum`、`Max`、`Min` 和 `Prod`，并支持任意正元素数量。它按 256 个
+元素分块，并把 FP16 和 FP32 的 ragged load 范围都对齐到 32 字节，不改变逻辑 tensor shape。
+signal 必须是 INT32 tensor，形状可以是 rank-1 `[world_size]` 或 rank-2
+`[world_size, 1]`；当参与设备数静态可知时，signal 的静态容量必须足够。
 
 ## Pass 属性
 

@@ -89,6 +89,14 @@ ExprPtr LeadingProduct(const std::vector<ExprPtr>& dims) {
   return product;
 }
 
+ExprPtr ShapeProduct(const std::vector<ExprPtr>& dims) {
+  ExprPtr product = std::make_shared<ConstInt>(1, DataType::INDEX, Span::unknown());
+  for (const auto& dim : dims) {
+    product = MakeIndexMul(product, dim);
+  }
+  return product;
+}
+
 bool IsNdLeadingCollapseTo2D(const std::vector<ExprPtr>& source_shape,
                              const std::vector<ExprPtr>& source_valid_shape,
                              const std::vector<ExprPtr>& target_shape,
@@ -97,15 +105,22 @@ bool IsNdLeadingCollapseTo2D(const std::vector<ExprPtr>& source_shape,
       target_valid_shape.size() != 2) {
     return false;
   }
-  if (!ExprEqual(target_shape[0], LeadingProduct(source_shape)) ||
-      !ExprEqual(target_shape[1], source_shape.back()) ||
-      !ExprEqual(target_valid_shape[0], LeadingProduct(source_valid_shape)) ||
-      !ExprEqual(target_valid_shape[1], source_valid_shape.back())) {
+  const bool is_leading_collapse = ExprEqual(target_shape[0], LeadingProduct(source_shape)) &&
+                                   ExprEqual(target_shape[1], source_shape.back()) &&
+                                   ExprEqual(target_valid_shape[0], LeadingProduct(source_valid_shape)) &&
+                                   ExprEqual(target_valid_shape[1], source_valid_shape.back());
+  const auto one = std::make_shared<ConstInt>(1, DataType::INDEX, Span::unknown());
+  const bool is_linear_prefix_collapse = ExprEqual(target_shape[0], one) &&
+                                         ExprEqual(target_shape[1], ShapeProduct(source_shape)) &&
+                                         ExprEqual(target_valid_shape[0], one) &&
+                                         ExprEqual(target_valid_shape[1], ShapeProduct(source_valid_shape));
+  if (!is_leading_collapse && !is_linear_prefix_collapse) {
     return false;
   }
 
   bool past_boundary = false;
-  for (size_t i = 0; i + 1 < source_shape.size(); ++i) {
+  const size_t checked_rank = is_linear_prefix_collapse ? source_shape.size() : source_shape.size() - 1;
+  for (size_t i = 0; i < checked_rank; ++i) {
     const bool is_full = ExprEqual(source_valid_shape[i], source_shape[i]);
     if (past_boundary && !is_full) return false;
     auto valid_dim = As<ConstInt>(source_valid_shape[i]);
@@ -603,8 +618,8 @@ TypePtr DeduceTensorViewType(const std::vector<ExprPtr>& args,
           << "tensor.view: explicit valid_shape shape reinterpretation only supports ND layout";
       CHECK(IsNdLeadingCollapseTo2D(src_type->shape_, src_type->tensor_view_->valid_shape, new_shape,
                                     valid_shape))
-          << "tensor.view: explicit valid_shape must describe an ND leading-dimension collapse to 2D "
-             "that preserves the final shape and valid_shape dimensions";
+          << "tensor.view: explicit valid_shape must describe an ND leading-dimension collapse or "
+             "contiguous-prefix linear collapse to 2D";
     } else if (source_has_valid_shape) {
       CHECK(false) << "tensor.view: a partial source valid_shape requires a non-empty target valid_shape";
     }

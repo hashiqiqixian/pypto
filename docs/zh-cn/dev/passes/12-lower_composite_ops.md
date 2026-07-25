@@ -1,6 +1,6 @@
 # LowerCompositeOps Pass
 
-把组合 (composite) tile / distributed 算子降级 (lower) 为一组基本 tile 算子（`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.cast`）和分布式原语的组合，使代码生成 (codegen) 不再需要发射高层 (high-level) 指令。当前支持 `tile.sin` / `tile.cos`（FP32 Cody-Waite + Horner）以及 `pld.tensor.*` 分布式集合通信算子（`allreduce`（mesh 与 ring）、`allgather`、`reduce_scatter`、`broadcast`、`barrier`）。mesh allreduce 还可能创建 shape-only 的 `tensor.view`，让 tile load/remote/store 操作一个 2D 展平目标窗口。新的组合算子只需在 Pass 文件内部的分发表 (dispatch table) 里加一条降级规则，无需改动分发器本身。
+把组合 (composite) tile / distributed 算子降级 (lower) 为一组基本 tile 算子（`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.maximum`、`tile.minimum`、`tile.cast`）和分布式原语的组合，使代码生成 (codegen) 不再需要发射高层 (high-level) 指令。当前支持 `tile.sin` / `tile.cos`（FP32 Cody-Waite + Horner）以及 `pld.tensor.*` 分布式集合通信算子（`allreduce`（mesh 与 ring）、`allgather`、`reduce_scatter`、`broadcast`、`barrier`）。mesh 和 ring allreduce 还可能创建保留元数据的 `tensor.view`，让 tile load/remote/store 操作一个 2D 展平目标窗口。新的组合算子只需在 Pass 文件内部的分发表 (dispatch table) 里加一条降级规则，无需改动分发器本身。
 
 ## 概览 (Overview)
 
@@ -8,9 +8,9 @@
 
 host-orchestrator 中的 `pld.tensor.allreduce` 调用会跳过本 Pass：`SynthesizeAllReduceSignals` 先把可选 signal 的 host 调用规范化为显式 signal 形态，`MaterializeCommDomainScopes` 再把 data 和 signal window 放入 comm domain，随后由 `LowerHostTensorCollectives` 降级为内部 builtin dispatch。
 
-该 Pass **仅支持 FP32**。非 FP32 输入会在算子构造时被共享的 `DeduceTileFP32OnlyType` 类型推导器 (deducer) 拒绝（见 `src/ir/op/tile_ops/unary.cpp:94`），因此本降级 Pass 看到的总是良类型的 FP32 操作数，不需要在 dtype 上失败。
+`tile.sin` / `tile.cos` 规则**仅支持 FP32**。非 FP32 三角函数输入会在算子构造时被共享的 `DeduceTileFP32OnlyType` 类型推导器 (deducer) 拒绝（见 `src/ir/op/tile_ops/unary.cpp:94`），因此这些规则只会看到良类型的 FP32 操作数。分布式规则各自有独立的 dtype 约束；allreduce 如下文所述支持 FP16 和 FP32。
 
-对不含已注册组合调用（例如 `tile.sin`、`tile.cos`、`pld.tensor.*` 分布式集合通信算子）的程序，Pass 是**结构性 no-op**：所有其他语句都直接走 `IRMutator::VisitStmt_`。展开生成的只包含基本 tile 算子（`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.cast`）和分布式原语，mutator 不会再改写它们，因此 Pass 也是**幂等的 (idempotent)**。
+对不含已注册组合调用（例如 `tile.sin`、`tile.cos`、`pld.tensor.*` 分布式集合通信算子）的程序，Pass 是**结构性 no-op**：所有其他语句都直接走 `IRMutator::VisitStmt_`。展开生成的只包含基本 tile 算子（`tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.maximum`、`tile.minimum`、`tile.cast`）和分布式原语，mutator 不会再改写它们，因此 Pass 也是**幂等的 (idempotent)**。
 
 **所需 (Requires)**：无。
 
@@ -18,7 +18,7 @@ host-orchestrator 中的 `pld.tensor.allreduce` 调用会跳过本 Pass：`Synth
 
 **失效 (Invalidates)**：无。
 
-空的 `PassProperties` 契约（`include/pypto/ir/transforms/pass_properties.h` 中的 `kLowerCompositeOpsProperties`）反映了这一事实：本 Pass 的降级在已有 tile/distributed 词汇以及用于暴露规范展平窗口的 shape-only `tensor.view` 内进行，既不建立任何 `IRProperty`，也不破坏任何 `IRProperty`。
+空的 `PassProperties` 契约（`include/pypto/ir/transforms/pass_properties.h` 中的 `kLowerCompositeOpsProperties`）反映了这一事实：本 Pass 的降级在已有 tile/distributed 词汇以及用于暴露规范展平窗口的 metadata-only `tensor.view` 内进行；partial-prefix ring view 还会携带展平后的 `valid_shape`。本 Pass 既不建立任何 `IRProperty`，也不破坏任何 `IRProperty`。
 
 ## 运行时机 (When It Runs)
 
@@ -31,7 +31,8 @@ host-orchestrator 中的 `pld.tensor.allreduce` 调用会跳过本 Pass：`Synth
 ```text
 src/ir/transforms/lower_composite_ops_pass.cpp
   LoweringBuilder           — 单次调用的暂存区 (Bind + 基本 tile 算子构造器：
-                              tile.muls、tile.adds、tile.add、tile.sub、tile.mul、tile.cast
+                              tile.muls、tile.adds、tile.add、tile.sub、tile.mul、
+                              tile.maximum、tile.minimum、tile.cast
                               + 结构化控制流：EmitFor / EmitForReduce
                               / EmitIf / EmitIfExpr + NotEq 标量比较)
   CompositeLoweringFn       — (call, visited_args, builder) -> 结果表达式
@@ -183,11 +184,11 @@ sin 与 cos 共用同一组多项式系数：cos 路径只在区间归约阶段�
 
 ## 幂等性 (Idempotency)
 
-连跑两次 `LowerCompositeOps` 会得到与第一次完全相同的 IR：tile recipes 展开后只剩 `tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.cast`，distributed recipes 展开后只剩下文列出的分布式原语。mutator 只改写已注册的组合调用（`tile.sin`、`tile.cos`、`pld.tensor.*` 分布式集合通信算子等），所以第二次访问 body 时不会有任何变化。`tests/ut/ir/transforms/test_lower_composite_ops.py` 中的 sin/cos 与分布式集合通信幂等性测试验证了这一性质。
+连跑两次 `LowerCompositeOps` 会得到与第一次完全相同的 IR：recipes 展开后只剩 `tile.muls`、`tile.adds`、`tile.add`、`tile.sub`、`tile.mul`、`tile.maximum`、`tile.minimum`、`tile.cast` 等基本算子以及下文列出的分布式原语。mutator 只改写已注册的组合调用（`tile.sin`、`tile.cos`、`pld.tensor.*` 分布式集合通信算子等），所以第二次访问 body 时不会有任何变化。`tests/ut/ir/transforms/test_lower_composite_ops.py` 中的 sin/cos 与分布式集合通信幂等性测试验证了这一性质。
 
 ## `pld.tensor.*` 分布式集合通信算子
 
-本 Pass 同时降级 `pld.tensor.*` 系列的窗口绑定 (window-bound) 分布式集合通信算子。每个集合通信算子都是一个组合 `Call`，展开为 notify / wait + 数据搬运序列。数据搬运原语因算子而异：`allgather` 使用 `pld.tile.put`（基于 TPUT 的推送，经 VEC staging tile 自动分块），`broadcast` 用 `pld.tile.get` 搬运窗口数据（GM→GM 拷贝），`allreduce` 与 `reduce_scatter` 用 `pld.tile.remote_load` 把 peer chunk 拉进 UB tile 并用 `tile.add` 累加。这些规则共享同一套 signal buffer 约定：使用窗口绑定的 INT32 `signal` 矩阵作为跨卡屏障，且**每次调用都需要新分配的 buffer**。
+本 Pass 同时降级 `pld.tensor.*` 系列的窗口绑定 (window-bound) 分布式集合通信算子。每个集合通信算子都是一个组合 `Call`，展开为 notify / wait + 数据搬运序列。数据搬运原语因算子而异：`allgather` 使用 `pld.tile.put`（基于 TPUT 的推送，经 VEC staging tile 自动分块），`broadcast` 用 `pld.tile.get` 搬运窗口数据（GM→GM 拷贝），`allreduce` 与 `reduce_scatter` 用 `pld.tile.remote_load` 把 peer chunk 拉进 UB tile。allreduce 根据规约类型选择 `tile.add`、`tile.maximum`、`tile.minimum` 或 `tile.mul`；reduce-scatter 当前仍用 `tile.add`。这些规则共享同一套 signal buffer 约定：使用窗口绑定的 INT32 `signal` 矩阵作为跨卡屏障，且**每次调用都需要新分配的 buffer**。
 
 ### `pld.tensor.allreduce`
 
@@ -202,6 +203,16 @@ allreduce 仍预留完整 16-KiB tile，又满足 PTO tile 的对齐要求。尾
 符号型有效范围则在源 tensor 的静态物理矩形能放入一个 16-KiB chunk 时回退使用该矩形。
 过大的 partial 矩形、strided 目标、DN partial view 和无法按 leading-dimension collapse
 表示的 partial 区域会被明确拒绝。
+
+ring 降级在 reduce-scatter 和 allgather 阶段使用同一个 packed 2D 视图。
+完全有效的目标会变为 `[1, SIZE]`；连续 partial prefix 保留物理 shape
+`[1, product(target.shape)]`，并携带逻辑
+`TensorView.valid_shape=[1, product(target.valid_shape)]`。FP32 保留均衡的
+`floor(i * SIZE / NR)` segment 边界；FP16 把每个内部
+边界向上对齐到 16 个元素并限制在 `SIZE` 内，因此每个非空 segment 和 UB
+subchunk 都从 32 字节对齐地址开始。FP16 的 ragged remote load 可以读取通信域
+预留的对齐物理尾部，然后通过 `tile.set_validshape` 在归约和写回前恢复逻辑范围。
+该方案无需在公开 tensor 布局中插入空洞，也能支持非整除输入和 `SIZE < NR`。
 
 任何在降级后仍为符号表达式的目标范围或 partial-valid 范围，都必须在 kernel 中
 通过标量参数、循环变量或物理 Tensor shape 参数获得运行时绑定；仅出现在类型元数据
@@ -221,7 +232,8 @@ signal buffer（`alloc_window_buffer` + `window`）。用户侧的 DSL docstring
 
 所有 wait 谓词都用 `kGe` 而非 `kEq`。单次调用内，每个被 wait 的 cell 都单调递增，因此慢 rank 首次轮询时，快 peer 可能已经把 cell 推过本次 wait 的期望值。此时相等判断会死锁，大于等于判断则不会。
 
-第一版仅支持 `ReduceOp::kSum`；C++ deducer 会拒绝 `Max` / `Min` / `Prod`。
+mesh 和 ring 降级均支持 FP16、FP32，以及任意正元素数量下的
+`ReduceOp::kSum`、`kMax`、`kMin` 和 `kProd`。
 
 ### `pld.tensor.allgather`
 

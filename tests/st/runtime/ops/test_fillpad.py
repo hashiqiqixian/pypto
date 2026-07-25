@@ -108,6 +108,31 @@ class FillpadMinProgram:
         return output
 
 
+@pl.program
+class FillpadOddTailFP16Program:
+    """Exercise the FP16 odd-column tail used by mesh allreduce."""
+
+    @pl.function(type=pl.FunctionType.InCore)
+    def fillpad_odd_tail_kernel(
+        self,
+        input_tensor: pl.Tensor[[1, 17], pl.FP16],
+        output: pl.Out[pl.Tensor[[1, 32], pl.FP16]],
+    ) -> pl.Tensor[[1, 32], pl.FP16]:
+        tile: pl.Tile[[1, 32], pl.FP16] = pl.load(
+            input_tensor, offsets=[0, 0], shapes=[1, 32], valid_shapes=[1, 17]
+        )
+        padded_tile: pl.Tile[[1, 32], pl.FP16] = pl.fillpad(tile, pad_value=pl.PadValue.zero)
+        return pl.store(padded_tile, offsets=[0, 0], output_tensor=output)
+
+    @pl.function(type=pl.FunctionType.Orchestration)
+    def orchestrator(
+        self,
+        input_tensor: pl.Tensor[[1, 17], pl.FP16],
+        output: pl.Out[pl.Tensor[[1, 32], pl.FP16]],
+    ) -> pl.Tensor[[1, 32], pl.FP16]:
+        return self.fillpad_odd_tail_kernel(input_tensor, output)
+
+
 # --- Test Cases ---
 
 
@@ -189,6 +214,32 @@ class FillpadMinTestCase(PTOTestCase):
         tensors["output"][:] = expected
 
 
+class FillpadOddTailFP16TestCase(PTOTestCase):
+    """Test FP16 fillpad with a non-32-byte-aligned valid width."""
+
+    __test__ = False
+
+    def __init__(self, *, platform: str | None = None, config=None):
+        super().__init__(config, platform=platform)
+
+    def get_name(self) -> str:
+        return "fillpad_odd_tail_fp16"
+
+    def define_tensors(self) -> list[TensorSpec]:
+        return [
+            TensorSpec("input_tensor", [1, 17], DataType.FP16, init_value=torch.randn),
+            TensorSpec("output", [1, 32], DataType.FP16, is_output=True),
+        ]
+
+    def get_program(self) -> Any:
+        return FillpadOddTailFP16Program
+
+    def compute_expected(self, tensors, params=None):
+        expected = torch.zeros(1, 32, dtype=torch.float16)
+        expected[:, :17] = tensors["input_tensor"]
+        tensors["output"][:] = expected
+
+
 # --- Tests ---
 
 
@@ -211,6 +262,12 @@ class TestFillpad:
     def test_fillpad_min(self, test_runner, platform):
         """Verify fillpad fills the padding region with FP32 min value (-inf)."""
         result = test_runner.run(FillpadMinTestCase(platform=platform))
+        assert result.passed, f"Test failed: {result.error}"
+
+    @pytest.mark.parametrize("platform", PLATFORMS)
+    def test_fillpad_odd_tail_fp16(self, test_runner, platform):
+        """Verify the FP16 odd tail used by mesh allreduce."""
+        result = test_runner.run(FillpadOddTailFP16TestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
 
 

@@ -57,10 +57,13 @@ Assignments preserve the user-facing rebind idiom by appending
 ## Checks
 
 The pass requires both args to be materialized `DistributedTensorType` views in
-the same `CommDomainScopeStmt`. The current host builtin path supports only
-`ReduceOp.Sum` over FP32 data and an INT32 signal tensor shaped either as
-rank-1 `[world_size]` or rank-2 `[world_size, 1]`, with enough static capacity
-when the participating device count is statically known.
+the same `CommDomainScopeStmt`. The host allreduce builtin supports
+`ReduceOp.Sum`, `Max`, `Min`, and `Prod` over FP16 or FP32 data and arbitrary
+positive element counts. It processes 256-element chunks and rounds ragged FP16
+and FP32 load spans to 32 bytes without changing the logical tensor shape.
+Its INT32 signal tensor may be rank-1 `[world_size]` or rank-2
+`[world_size, 1]`, with enough static capacity when the participating device
+count is statically known.
 
 ## Pass properties
 
