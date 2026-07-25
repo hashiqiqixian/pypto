@@ -55,6 +55,7 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -163,6 +164,7 @@ TypePtr DeduceRemoteLoadType(const std::vector<ExprPtr>& args,
       /*span=*/args[0]->span_,
       /*materialize_symbolic_intersection=*/true,
   });
+  tile_view.blayout = tile_view_semantics::InferImplicitTileLayoutFromShape(shape_tuple->elements_);
 
   return std::make_shared<TileType>(shape_tuple->elements_, dist_type->dtype_, std::nullopt, tile_view);
 }

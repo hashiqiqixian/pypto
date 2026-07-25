@@ -86,7 +86,7 @@ std::vector<ExprPtr> CollapseShapeToLinear2D(const std::vector<ExprPtr>& shape, 
 // up to nine physical tile buffers before reuse. At the maximum chunk width,
 // nine 16-KiB tiles stay below the smallest supported 184-KiB VEC UB budget
 // with room for scalar metadata; statically smaller inputs shrink this width.
-constexpr int64_t kMeshAllReduceChunkBytes = 16LL * 1024;
+constexpr int64_t kAllReduceChunkBytes = 16LL * 1024;
 constexpr int64_t kPTOTileAlignmentBytes = 32;
 
 const std::vector<ExprPtr>* GetPartialValidShape(const DistributedTensorTypePtr& target_type,
@@ -107,7 +107,7 @@ const std::vector<ExprPtr>* GetPartialValidShape(const DistributedTensorTypePtr&
 CallPtr CreateAllReduceTargetView(const ExprPtr& target, const std::vector<ExprPtr>& flat_shape,
                                   const std::vector<ExprPtr>& flat_valid_shape,
                                   const std::vector<ExprPtr>* partial_valid_shape, const Span& span) {
-  // Mesh allreduce owns this alias and reduces only flat_valid_shape. Public
+  // Allreduce owns this alias and reduces only flat_valid_shape. Public
   // tensor.view cannot infer a shape reinterpretation for partial validity.
   auto shape_tuple = tile_conversion_utils::MakeShapeTuple(flat_shape, span);
   std::vector<ExprPtr> view_args{target, shape_tuple};
@@ -698,7 +698,7 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
   const int64_t element_bytes = static_cast<int64_t>(target_type->dtype_.GetByte());
   INTERNAL_CHECK_SPAN(element_bytes > 0, span)
       << "pld.tensor.allreduce target dtype has no storage width: " << target_type->dtype_.ToString();
-  const int64_t chunk_elements = kMeshAllReduceChunkBytes / element_bytes;
+  const int64_t chunk_elements = kAllReduceChunkBytes / element_bytes;
   INTERNAL_CHECK_SPAN(chunk_elements > 0, span)
       << "pld.tensor.allreduce dtype is wider than the mesh chunk byte budget";
   INTERNAL_CHECK_SPAN(kPTOTileAlignmentBytes % element_bytes == 0, span)
@@ -736,7 +736,7 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
     auto rectangular_elements = tile_conversion_utils::MakeCanonicalIndexMul(
         rectangular_tile_shape[0], rectangular_tile_shape[1], span, "LowerCompositeOps");
     CHECK_SPAN(ProveValidExtentLessEqual(rectangular_elements, max_chunk_cols) == ProofResult::kTrue, span)
-        << "pld.tensor.allreduce partial valid_shape must fit within one " << kMeshAllReduceChunkBytes
+        << "pld.tensor.allreduce partial valid_shape must fit within one " << kAllReduceChunkBytes
         << "-byte mesh chunk using a statically bounded tile; chunking a partial rectangle with row gaps "
            "is not supported";
   } else if (auto flat_extent = As<ConstInt>(flat_valid_shape[1]);
@@ -882,13 +882,14 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
 // ============================================================================
 // ``pld.tensor.allreduce`` ring lowering rule (mode="ring")
 //
-// NCCL-style chunked reduce-scatter + allgather ring schedule with 2(P−1)
-// per-round barriers.  Signal shape is [2*(NR−1), NR] — one row per ring
-// round, one cell per rank.  Barrier: AtomicAdd(0→1) / WaitGe(1) monotonic.
+// NCCL-style reduce-scatter + allgather ring schedule with 2(P−1) rounds.
+// Signal shape is [2*(NR−1), NR] — one row per ring round, one cell per rank.
+// Each UB-sized subchunk advances its round row through a ready barrier and a
+// read-complete barrier before store-back.
 //
-// The ring operates on the target DistributedTensor [NR, SIZE] in-place:
-// each rank's local window holds SIZE elements, and the ring exchanges
-// chunk_size = SIZE // NR elements per step.  No explicit stage-in needed.
+// The ring operates on target DistributedTensor [1, SIZE] in-place. Balanced
+// floor(i*SIZE/NR) segment boundaries preserve arbitrary lengths, including
+// SIZE < NR, and valid_shape narrows every ragged tail.
 //
 // Hand-rolled reference: tests/st/distributed/collectives/test_l3_allreduce_ring.py
 // Runtime reference:     runtime/examples/workers/l3/allreduce_ring_distributed/
@@ -905,7 +906,7 @@ ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<Expr
   INTERNAL_CHECK_SPAN(target_type, span)
       << "pld.tensor.allreduce target must be DistributedTensorType (deducer-rejected otherwise)";
   CHECK_SPAN(target_type->shape_.size() == 2, span)
-      << "pld.tensor.allreduce mode=ring requires 2D target [NR, SIZE], got " << target_type->shape_.size()
+      << "pld.tensor.allreduce mode=ring requires a 2D target [1, SIZE], got " << target_type->shape_.size()
       << "D";
 
   auto op_value = GetRequiredKwarg<int>(call->kwargs_, "op", "pld.tensor.allreduce");
@@ -938,36 +939,77 @@ ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<Expr
 
   auto zero_idx = std::make_shared<ConstInt>(0, DataType::INDEX, span);
   auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
+  auto two_idx = std::make_shared<ConstInt>(2, DataType::INDEX, span);
   auto one_i32 = std::make_shared<ConstInt>(1, DataType::INT32, span);
 
   // Cast my_rank to INDEX for modulo arithmetic.
+  if (auto rows = As<ConstInt>(target_type->shape_[0])) {
+    CHECK_SPAN(rows->value_ == 1, span)
+        << "pld.tensor.allreduce mode=ring target dim 0 must be 1, got " << rows->value_;
+  }
   auto my_rank_idx =
       b.Bind("my_rank_idx", std::make_shared<ir::Cast>(comm.my_rank, DataType::INDEX, span), span);
 
-  // chunk_size = SIZE // NR.
-  // Prefer the signal type's shape[1] for NR — it is a compile-time
-  // constant from the factory-parameter type annotation (e.g. [2*(NR-1), NR]).
-  // When both SIZE and NR are ConstInts, constant-fold to avoid a dynamic
-  // FloorDiv that downstream passes (InitMemRef) cannot handle.
+  // Balanced segments cover arbitrary SIZE without dropping a remainder:
+  // begin(i) = floor(i * SIZE / NR), end(i) = floor((i + 1) * SIZE / NR).
+  // Empty segments are legal when SIZE < NR; every rank still participates in
+  // the same per-subchunk barriers, while its data path is guarded.
   auto size_expr = target_type->shape_[1];
   auto nr_expr = signal_type->shape_[1];
-  ExprPtr chunk_size;
   auto size_const = As<ConstInt>(size_expr);
   auto nr_const = As<ConstInt>(nr_expr);
+  ExprPtr max_segment_cols;
   if (size_const && nr_const && nr_const->value_ > 0) {
-    // The ring schedule exchanges SIZE // NR elements per step and relies on
-    // every chunk being the same size. Without this CHECK, a non-divisible
-    // SIZE would silently drop the tail chunk. Reject it up front.
-    CHECK_SPAN(size_const->value_ % nr_const->value_ == 0, span)
-        << "pld.tensor.allreduce mode=ring requires the per-rank size (target dim 1 = " << size_const->value_
-        << ") to be an exact multiple of the rank count (" << nr_const->value_ << "); got a remainder of "
-        << (size_const->value_ % nr_const->value_);
-    chunk_size = std::make_shared<ConstInt>(size_const->value_ / nr_const->value_, DataType::INDEX, span);
+    max_segment_cols = std::make_shared<ConstInt>(
+        (size_const->value_ + nr_const->value_ - 1) / nr_const->value_, DataType::INDEX, span);
   } else {
-    chunk_size = MakeFloorDiv(size_expr, nr_expr, span);
+    max_segment_cols = MakeFloorDiv(MakeAdd(size_expr, MakeSub(nr_expr, one_idx, span), span), nr_expr, span);
   }
-  auto chunk_shape = std::make_shared<MakeTuple>(
-      std::vector<ExprPtr>{std::make_shared<ConstInt>(1, DataType::INDEX, span), chunk_size}, span);
+
+  const int64_t element_bytes = static_cast<int64_t>(target_type->dtype_.GetByte());
+  INTERNAL_CHECK_SPAN(element_bytes > 0, span)
+      << "pld.tensor.allreduce mode=ring target dtype has no storage width: "
+      << target_type->dtype_.ToString();
+  const int64_t max_chunk_elements = kAllReduceChunkBytes / element_bytes;
+  INTERNAL_CHECK_SPAN(max_chunk_elements > 0, span)
+      << "pld.tensor.allreduce mode=ring dtype is wider than the chunk byte budget";
+  INTERNAL_CHECK_SPAN(kPTOTileAlignmentBytes % element_bytes == 0, span)
+      << "pld.tensor.allreduce mode=ring dtype width must divide the tile alignment";
+  const int64_t alignment_elements = kPTOTileAlignmentBytes / element_bytes;
+
+  ExprPtr chunk_cols = std::make_shared<ConstInt>(max_chunk_elements, DataType::INDEX, span);
+  if (auto segment_const = As<ConstInt>(max_segment_cols);
+      segment_const && segment_const->value_ > 0 && segment_const->value_ < max_chunk_elements) {
+    const int64_t aligned_segment =
+        ((segment_const->value_ - 1) / alignment_elements + 1) * alignment_elements;
+    chunk_cols = std::make_shared<ConstInt>(aligned_segment, DataType::INDEX, span);
+  }
+  auto chunk_shape = tile_conversion_utils::MakeShapeTuple({one_idx, chunk_cols}, span);
+  // Own a single explicit ND identity view for every subchunk. Besides making
+  // the [1, 1] column-vector exception unambiguous, this keeps the remote-load,
+  // local-load, and store aliases identical throughout the ring pipeline.
+  auto ring_target = b.Bind("target_nd",
+                            CreateAllReduceTargetView(target, target_type->shape_, target_type->shape_,
+                                                      /*partial_valid_shape=*/nullptr, span),
+                            span);
+  // Value-producing IfExpr branches must agree on a fixed TileType. For an
+  // inactive logical segment, read one in-bounds element and pad it to the
+  // physical chunk shape. Using tile.create here would survive the default
+  // pipeline as tensor.alloc, which has no kernel codegen.
+  auto placeholder_offsets = tile_conversion_utils::MakeShapeTuple({zero_idx, zero_idx}, span);
+
+  auto segment_begin = [&](const ExprPtr& segment_idx) {
+    return MakeFloorDiv(MakeMul(segment_idx, size_expr, span), nr_expr, span);
+  };
+  auto segment_end = [&](const ExprPtr& segment_idx) {
+    return MakeFloorDiv(MakeMul(MakeAdd(segment_idx, one_idx, span), size_expr, span), nr_expr, span);
+  };
+  auto emit_barrier = [&](LoweringBuilder& body, const ExprPtr& round, const ExprPtr& expected,
+                          const std::string& suffix) {
+    body.EmitNotifyAll(signal, comm.nranks_idx, comm.my_rank, round, NotifyOp::kAtomicAdd, one_i32, suffix,
+                       span);
+    body.EmitWaitAll(signal, comm.nranks_idx, comm.my_rank, round, expected, suffix, span);
+  };
 
   // nr_minus_one = NR − 1 (loop bound, 0..NR-2 inclusive → P−1 steps)
   auto nr_minus_one = b.Bind("nr_minus_one", MakeSub(comm.nranks_idx, one_idx, span), span);
@@ -994,27 +1036,86 @@ ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<Expr
         auto l2 = MakeAdd(l1, comm.nranks_idx, span);
         auto left_peer = body.Bind("left", MakeFloorMod(l2, comm.nranks_idx, span), span);
 
-        // ---- Round barrier (notify-all + wait-all) ----
-        body.EmitNotifyAll(signal, comm.nranks_idx, comm.my_rank, rs_step_var, NotifyOp::kAtomicAdd, one_i32,
-                           "_rs", span);
-        body.EmitWaitAll(signal, comm.nranks_idx, comm.my_rank, rs_step_var, one_i32, "_rs", span);
+        auto segment_offset = body.Bind("rs_segment_begin", segment_begin(send_idx), span);
+        auto segment_limit = body.Bind("rs_segment_end", segment_end(send_idx), span);
+        auto segment_cols = body.Bind("rs_segment_cols", MakeSub(segment_limit, segment_offset, span), span);
 
-        // ---- remote_load(left, send_idx) + local accumulate ----
-        auto send_offsets = std::make_shared<MakeTuple>(
-            std::vector<ExprPtr>{zero_idx, MakeMul(send_idx, chunk_size, span)}, span);
-        auto recv = body.Bind(
-            "recv_rs",
-            reg.Create("pld.tile.remote_load", {target, left_peer, send_offsets, chunk_shape}, {}, span),
+        body.EmitFor(
+            "rs_col", zero_idx, max_segment_cols, chunk_cols,
+            [&](LoweringBuilder& chunk_body, const VarPtr& subcol) {
+              auto active = MakeLt(subcol, segment_cols, span);
+              auto remaining = MakeSub(segment_cols, subcol, span);
+              auto valid_cols = MakeMin(chunk_cols, remaining, span);
+              // Keep the value-producing IfExpr branch metadata identical.
+              // Inactive ranks use one safe element, while active ranks retain
+              // the exact logical tail extent.
+              auto load_valid_cols = MakeMax(one_idx, valid_cols, span);
+              auto load_valid_shape = tile_conversion_utils::MakeShapeTuple({one_idx, load_valid_cols}, span);
+              auto offsets = tile_conversion_utils::MakeShapeTuple(
+                  {zero_idx, MakeAdd(segment_offset, subcol, span)}, span);
+
+              auto chunk_id = MakeFloorDiv(subcol, chunk_cols, span);
+              auto ready_epoch_idx = MakeAdd(MakeMul(chunk_id, two_idx, span), one_idx, span);
+              auto ready_epoch = chunk_body.Bind(
+                  "rs_ready_epoch", std::make_shared<ir::Cast>(ready_epoch_idx, DataType::INT32, span), span);
+              emit_barrier(chunk_body, rs_step_var, ready_epoch, "_rs_ready");
+
+              auto acc_full = chunk_body.EmitIfExpr(
+                  active,
+                  [&](LoweringBuilder& then_body) {
+                    auto recv_loaded = then_body.Bind(
+                        "recv_rs_loaded",
+                        reg.Create("pld.tile.remote_load",
+                                   {ring_target, left_peer, offsets, chunk_shape, load_valid_shape}, {},
+                                   span),
+                        span);
+                    auto recv = then_body.Bind("recv_rs",
+                                               reg.Create("tile.fillpad_inplace", {recv_loaded},
+                                                          {{"pad_value", PadValue::zero}}, span),
+                                               span);
+                    auto acc_loaded = then_body.Bind(
+                        "acc_rs_loaded",
+                        reg.Create("tile.load", {ring_target, offsets, chunk_shape, load_valid_shape},
+                                   {{"target_memory", MemorySpace::Vec}}, span),
+                        span);
+                    auto acc = then_body.Bind("acc_rs",
+                                              reg.Create("tile.fillpad_inplace", {acc_loaded},
+                                                         {{"pad_value", PadValue::zero}}, span),
+                                              span);
+                    return then_body.Bind("acc_rs_next", then_body.Add(acc, recv, span), span);
+                  },
+                  [&](LoweringBuilder& else_body) {
+                    auto placeholder_loaded = else_body.Bind(
+                        "acc_rs_placeholder_loaded",
+                        reg.Create("tile.load",
+                                   {ring_target, placeholder_offsets, chunk_shape, load_valid_shape},
+                                   {{"target_memory", MemorySpace::Vec}}, span),
+                        span);
+                    return else_body.Bind("acc_rs_placeholder",
+                                          reg.Create("tile.fillpad_inplace", {placeholder_loaded},
+                                                     {{"pad_value", PadValue::zero}}, span),
+                                          span);
+                  },
+                  span);
+
+              auto read_epoch_idx = MakeAdd(ready_epoch_idx, one_idx, span);
+              auto read_epoch = chunk_body.Bind(
+                  "rs_read_epoch", std::make_shared<ir::Cast>(read_epoch_idx, DataType::INT32, span), span);
+              emit_barrier(chunk_body, rs_step_var, read_epoch, "_rs_read");
+
+              chunk_body.EmitIf(
+                  active,
+                  [&](LoweringBuilder& store_body) {
+                    auto narrowed = store_body.Bind(
+                        "acc_rs_valid",
+                        reg.Create("tile.set_validshape", {acc_full, one_idx, valid_cols}, {}, span), span);
+                    store_body.Bind("store_rs",
+                                    reg.Create("tile.store", {narrowed, offsets, ring_target}, {}, span),
+                                    span);
+                  },
+                  /*else_fn=*/nullptr, span);
+            },
             span);
-
-        auto recv_offsets = std::make_shared<MakeTuple>(
-            std::vector<ExprPtr>{zero_idx, MakeMul(recv_add_idx, chunk_size, span)}, span);
-        auto acc = body.Bind("acc_rs",
-                             reg.Create("tile.load", {target, recv_offsets, chunk_shape, chunk_shape},
-                                        {{"target_memory", MemorySpace::Vec}}, span),
-                             span);
-        auto acc_next = body.Bind("acc_rs_next", body.Add(acc, recv, span), span);
-        body.Bind("store_rs", reg.Create("tile.store", {acc_next, recv_offsets, target}, {}, span), span);
       },
       span);
 
@@ -1045,21 +1146,83 @@ ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<Expr
         auto s3 = MakeAdd(s2, comm.nranks_idx, span);
         auto send_idx = body.Bind("ag_send_idx", MakeFloorMod(s3, comm.nranks_idx, span), span);
 
-        // ---- Round barrier ----
-        body.EmitNotifyAll(signal, comm.nranks_idx, comm.my_rank, ag_round, NotifyOp::kAtomicAdd, one_i32,
-                           "_ag", span);
-        body.EmitWaitAll(signal, comm.nranks_idx, comm.my_rank, ag_round, one_i32, "_ag", span);
+        auto send_begin = body.Bind("ag_send_begin", segment_begin(send_idx), span);
+        auto send_limit = body.Bind("ag_send_end", segment_end(send_idx), span);
+        auto send_cols = body.Bind("ag_send_cols", MakeSub(send_limit, send_begin, span), span);
+        auto recv_begin = body.Bind("ag_recv_begin", segment_begin(recv_idx), span);
+        auto recv_limit = body.Bind("ag_recv_end", segment_end(recv_idx), span);
+        auto recv_cols = body.Bind("ag_recv_cols", MakeSub(recv_limit, recv_begin, span), span);
 
-        // ---- remote_load(left, send_idx) + store locally ----
-        auto send_offsets = std::make_shared<MakeTuple>(
-            std::vector<ExprPtr>{zero_idx, MakeMul(send_idx, chunk_size, span)}, span);
-        auto recv = body.Bind(
-            "recv_ag",
-            reg.Create("pld.tile.remote_load", {target, left_peer, send_offsets, chunk_shape}, {}, span),
+        body.EmitFor(
+            "ag_col", zero_idx, max_segment_cols, chunk_cols,
+            [&](LoweringBuilder& chunk_body, const VarPtr& subcol) {
+              auto active = MakeLt(subcol, send_cols, span);
+              auto send_remaining = MakeSub(send_cols, subcol, span);
+              auto send_valid_cols = MakeMin(chunk_cols, send_remaining, span);
+              auto load_valid_cols = MakeMax(one_idx, send_valid_cols, span);
+              auto load_valid_shape = tile_conversion_utils::MakeShapeTuple({one_idx, load_valid_cols}, span);
+              auto send_offsets =
+                  tile_conversion_utils::MakeShapeTuple({zero_idx, MakeAdd(send_begin, subcol, span)}, span);
+
+              auto recv_remaining = MakeSub(recv_cols, subcol, span);
+              auto recv_valid_cols = MakeMin(chunk_cols, recv_remaining, span);
+              auto recv_offsets =
+                  tile_conversion_utils::MakeShapeTuple({zero_idx, MakeAdd(recv_begin, subcol, span)}, span);
+
+              auto chunk_id = MakeFloorDiv(subcol, chunk_cols, span);
+              auto ready_epoch_idx = MakeAdd(MakeMul(chunk_id, two_idx, span), one_idx, span);
+              auto ready_epoch = chunk_body.Bind(
+                  "ag_ready_epoch", std::make_shared<ir::Cast>(ready_epoch_idx, DataType::INT32, span), span);
+              emit_barrier(chunk_body, ag_round, ready_epoch, "_ag_ready");
+
+              auto recv_full = chunk_body.EmitIfExpr(
+                  active,
+                  [&](LoweringBuilder& then_body) {
+                    auto recv_loaded = then_body.Bind(
+                        "recv_ag_loaded",
+                        reg.Create("pld.tile.remote_load",
+                                   {ring_target, left_peer, send_offsets, chunk_shape, load_valid_shape}, {},
+                                   span),
+                        span);
+                    return then_body.Bind("recv_ag",
+                                          reg.Create("tile.fillpad_inplace", {recv_loaded},
+                                                     {{"pad_value", PadValue::zero}}, span),
+                                          span);
+                  },
+                  [&](LoweringBuilder& else_body) {
+                    auto placeholder_loaded = else_body.Bind(
+                        "recv_ag_placeholder_loaded",
+                        reg.Create(
+                            "pld.tile.remote_load",
+                            {ring_target, left_peer, placeholder_offsets, chunk_shape, load_valid_shape}, {},
+                            span),
+                        span);
+                    return else_body.Bind("recv_ag_placeholder",
+                                          reg.Create("tile.fillpad_inplace", {placeholder_loaded},
+                                                     {{"pad_value", PadValue::zero}}, span),
+                                          span);
+                  },
+                  span);
+
+              auto read_epoch_idx = MakeAdd(ready_epoch_idx, one_idx, span);
+              auto read_epoch = chunk_body.Bind(
+                  "ag_read_epoch", std::make_shared<ir::Cast>(read_epoch_idx, DataType::INT32, span), span);
+              emit_barrier(chunk_body, ag_round, read_epoch, "_ag_read");
+
+              chunk_body.EmitIf(
+                  active,
+                  [&](LoweringBuilder& store_body) {
+                    auto narrowed = store_body.Bind(
+                        "recv_ag_valid",
+                        reg.Create("tile.set_validshape", {recv_full, one_idx, recv_valid_cols}, {}, span),
+                        span);
+                    store_body.Bind("store_ag",
+                                    reg.Create("tile.store", {narrowed, recv_offsets, ring_target}, {}, span),
+                                    span);
+                  },
+                  /*else_fn=*/nullptr, span);
+            },
             span);
-        auto recv_offsets = std::make_shared<MakeTuple>(
-            std::vector<ExprPtr>{zero_idx, MakeMul(recv_idx, chunk_size, span)}, span);
-        body.Bind("store_ag", reg.Create("tile.store", {recv, recv_offsets, target}, {}, span), span);
       },
       span);
 

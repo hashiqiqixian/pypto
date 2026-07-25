@@ -270,9 +270,12 @@ chunk，Pass 会保留该元数据，并沿用单矩形路径只归约这个矩�
   写后读 (WAR) 竞态。
 - **`"ring"`** — NCCL 风格的分块 reduce-scatter + allgather 调度，
   O(1) 个 HCCL 窗口。信号 shape `[2 * (NR − 1), NR]`（每轮 ring 一行，
-  每 rank 一个槽位）。2(P−1) 轮 ring 步骤，每轮带有屏障 (AtomicAdd 1 →
-  Ge 1)。块大小 = `SIZE // NR`，且 `SIZE` 必须是 `NR` 的整数倍；当 `SIZE`
-  与 `NR` 均为编译期常量时，`LowerCompositeOps` 会常量折叠块大小。
+  每 rank 一个槽位）。`SIZE` 按 `floor(i * SIZE / NR)` 边界划分为均衡
+  segment，因此非整除长度以及 `SIZE < NR` 都不会丢元素。每个 segment
+  再按最大 16 KiB 的物理 subchunk 处理，尾块通过显式 `valid_shape`
+  标记真实范围。每个 subchunk 在 store-back 前都使用该轮 signal 行上的
+  ready 和 read-complete 单调屏障，从而避免写后读 (WAR) 竞态，同时保持
+  signal shape 不变。
 
 host-orchestrator 用户代码可以在 `for` 和 `while` 循环外省略 `signal`；
 [`SynthesizeAllReduceSignals`](passes/38-synthesize_allreduce_signals.md) 阶段会为该 call 插入 private INT32 signal window，

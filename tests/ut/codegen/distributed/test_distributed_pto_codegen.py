@@ -671,6 +671,81 @@ def test_remote_load_peer_view_preserves_explicit_tensor_view_layout_and_strides
     assert "{layout = #pto.layout<dn>}" in peer_view_line, peer_view_line
 
 
+def test_remote_load_peer_view_matches_column_vector_layout():
+    """A column-vector peer view uses the same forced-DN metadata as its local view."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            data: pld.DistributedTensor[[1, 1], pl.FP32],
+            out: pl.Out[pl.Tensor[[8, 1], pl.FP32]],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            tile = pld.tile.remote_load(
+                data,
+                peer=peer,
+                offsets=[0, 0],
+                shape=[8, 1],
+                valid_shape=[1, 1],
+            )
+            return pl.store(tile, [0, 0], out)
+
+    mlir = _generate_mlir(P)
+    funcs = _split_module(mlir)
+    kernel = funcs["kernel"]
+    addptr_line = next(line for line in kernel.splitlines() if "pto.addptr %arg0" in line)
+    peer_ptr = re.search(r"(%\d+) = pto\.addptr", addptr_line)
+    assert peer_ptr is not None, addptr_line
+    peer_view_line = next(
+        line for line in kernel.splitlines() if f"pto.make_tensor_view {peer_ptr.group(1)}" in line
+    )
+    assert "shape = [%c1_index, %c1_index]" in peer_view_line, peer_view_line
+    assert "strides = [%c1_index, %c1_index]" in peer_view_line, peer_view_line
+    assert "{layout = #pto.layout<dn>}" in peer_view_line, peer_view_line
+
+
+def test_remote_load_peer_view_respects_explicit_nd_column_vector_view():
+    """An explicit ND identity view overrides the default column-vector convention."""
+
+    @pl.program
+    class P:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            data: pld.DistributedTensor[[1, 1], pl.FP32],
+            out: pl.Out[pl.Tensor[[1, 8], pl.FP32]],
+            peer: pl.Scalar[pl.INT32],
+        ):
+            viewed: pld.DistributedTensor[
+                [1, 1],
+                pl.FP32,
+                pl.TensorView(stride=[1, 1], layout=pl.TensorLayout.ND),
+            ] = pl.tensor.view(data, [1, 1], layout=pl.TensorLayout.ND)
+            tile = pld.tile.remote_load(
+                viewed,
+                peer=peer,
+                offsets=[0, 0],
+                shape=[1, 8],
+                valid_shape=[1, 1],
+            )
+            return pl.store(tile, [0, 0], out)
+
+    mlir = _generate_mlir(P)
+    funcs = _split_module(mlir)
+    kernel = funcs["kernel"]
+    addptr_line = next(line for line in kernel.splitlines() if "pto.addptr %arg0" in line)
+    peer_ptr = re.search(r"(%\d+) = pto\.addptr", addptr_line)
+    assert peer_ptr is not None, addptr_line
+    peer_view_line = next(
+        line for line in kernel.splitlines() if f"pto.make_tensor_view {peer_ptr.group(1)}" in line
+    )
+    assert "shape = [%c1_index, %c1_index]" in peer_view_line, peer_view_line
+    assert "strides = [%c1_index, %c1_index]" in peer_view_line, peer_view_line
+    assert "{layout = #pto.layout<nd>}" in peer_view_line, peer_view_line
+
+
 def test_notify_emits_comm_tnotify_with_attr():
     """notify codegen emits pto.comm.tnotify with #pto<notify_op …> attr."""
 
@@ -687,6 +762,11 @@ def test_notify_emits_comm_tnotify_with_attr():
     mlir = _generate_mlir(P)
     assert "pto.comm.tnotify(" in mlir
     assert "#pto<notify_op set>" in mlir
+    lines = mlir.splitlines()
+    notify_idx = next(i for i, line in enumerate(lines) if "pto.comm.tnotify(" in line)
+    assert "pto.barrier <PIPE_ALL>" in lines[notify_idx - 1], (
+        f"expected a PIPE_ALL drain immediately before tnotify, got: {lines[notify_idx - 1]}"
+    )
     # AtomicAdd variant should also lower correctly.
 
     @pl.program

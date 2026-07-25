@@ -311,10 +311,13 @@ dynamic physical target dimension is bound from that tensor parameter.
   counter before store-back, preventing write-after-read races.
 - **`"ring"`** — NCCL-style chunked reduce-scatter + allgather schedule with
   O(1) HCCL windows.  Signal shape `[2 * (NR − 1), NR]` (one row per ring
-  round, one cell per rank).  2(P−1) ring steps with per-round barriers
-  (AtomicAdd 1 → Ge 1).  Chunk size = `SIZE // NR`, and `SIZE` must be an exact
-  multiple of `NR`; `LowerCompositeOps` constant-folds the chunk size when both
-  `SIZE` and `NR` are compile-time constants.
+  round, one cell per rank). `SIZE` is divided into balanced segments using
+  `floor(i * SIZE / NR)` boundaries, so non-divisible sizes and `SIZE < NR`
+  are covered without dropping elements. Each segment is processed in at most
+  16-KiB physical subchunks; a ragged subchunk carries an explicit
+  `valid_shape`. Every subchunk uses ready and read-complete barriers on the
+  round's monotonic signal row before store-back, preventing write-after-read
+  races while keeping the signal shape unchanged.
 
 Host-orchestrator user code may omit `signal` outside `for` and `while` loops;
 the [`SynthesizeAllReduceSignals`](passes/38-synthesize_allreduce_signals.md)

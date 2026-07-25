@@ -573,6 +573,27 @@ std::vector<StmtPtr> TransformBody(const std::vector<StmtPtr>& stmts, FlattenCon
 
     const auto& op_name = call->op_->name_;
 
+    // remote_load is a non-"tile." op that nevertheless produces a TileType
+    // whose valid_shape can embed variables remapped by this pass. Rebuild both
+    // the call and its defining Var together; otherwise a later Substitute on
+    // the consumer remaps only the Var's type and creates a definition-less
+    // clone (printed as __FREE_VAR).
+    if (IsOp(call, "pld.tile.remote_load")) {
+      auto new_value = As<Call>(Substitute(assign->value_, ctx.var_map));
+      INTERNAL_CHECK_SPAN(new_value, assign->span_)
+          << "FlattenTileNdTo2D: remote_load substitution must remain a Call";
+      if (new_value.get() == call.get()) {
+        result.push_back(stmt);
+        ctx.Insert(assign->var_, assign->var_);
+      } else {
+        auto new_var =
+            std::make_shared<Var>(assign->var_->name_hint_, new_value->GetType(), assign->var_->span_);
+        result.push_back(std::make_shared<AssignStmt>(new_var, new_value, assign->span_));
+        ctx.Insert(assign->var_, new_var);
+      }
+      continue;
+    }
+
     // ---- tile.load on >2D tile: flatten the result tile to 2D (hardware tiles
     //      are always 2D), keeping the tensor-rank source window for codegen —
     //      except a natural Mat load with a real batch (>1) collapses its window

@@ -855,8 +855,11 @@ def test_allreduce_mesh_chunks_non_aligned_and_larger_than_ub(size):
     """Chunk bounds, widths, and offsets cover every logical element exactly."""
     Before = _build_allreduce_before(size)
     After = passes.lower_composite_ops()(Before)
-    expected_chunk = min(_ALLREDUCE_FP32_CHUNK, ((size + 7) // 8) * 8)
-    assert expected_chunk * 4 % 32 == 0
+    aligned_chunk = min(_ALLREDUCE_FP32_CHUNK, ((size + 7) // 8) * 8)
+    expected_step = aligned_chunk
+    expected_rows = 1
+    expected_cols = aligned_chunk
+    assert expected_rows * expected_cols * 4 % 32 == 0
 
     class CallCollector(ir.IRVisitor):
         def __init__(self) -> None:
@@ -876,9 +879,9 @@ def test_allreduce_mesh_chunks_non_aligned_and_larger_than_ub(size):
         and isinstance(call.args[0].type, ir.DistributedTensorType)
         and isinstance(call.args[2], ir.MakeTuple)
         and isinstance(call.args[2].elements[0], ir.ConstInt)
-        and call.args[2].elements[0].value == 1
+        and call.args[2].elements[0].value == expected_rows
         and isinstance(call.args[2].elements[1], ir.ConstInt)
-        and call.args[2].elements[1].value == expected_chunk
+        and call.args[2].elements[1].value == expected_cols
         and isinstance(call.args[3], ir.MakeTuple)
         and isinstance(call.args[3].elements[1], ir.Min)
     )
@@ -909,7 +912,7 @@ def test_allreduce_mesh_chunks_non_aligned_and_larger_than_ub(size):
 
     assert len(remote_load.args) == 5
     assert isinstance(chunk_loop.start, ir.ConstInt) and chunk_loop.start.value == 0
-    assert isinstance(chunk_loop.step, ir.ConstInt) and chunk_loop.step.value == expected_chunk
+    assert isinstance(chunk_loop.step, ir.ConstInt) and chunk_loop.step.value == expected_step
     assert isinstance(lowered_load.args[3], ir.MakeTuple)
     assert isinstance(remote_load.args[4], ir.MakeTuple)
     assert isinstance(lowered_load.args[3].elements[1], ir.Min)
@@ -1656,14 +1659,19 @@ _RING_ALLREDUCE_REQUIRED_OPS = {
     "pld.tile.remote_load",  # per-ring-step chunk receive
     "tile.add",  # reduce-scatter accumulation
     "tile.load",  # reduce-scatter local accumulation
+    "tile.fillpad_inplace",  # promote ragged subchunks for fixed-shape arithmetic
+    "tile.set_validshape",  # narrow the tail again before storing
     "tile.store",  # reduce-scatter + allgather chunk writes
 }
 
 
-def _build_ring_allreduce_before():
+def _build_ring_allreduce_before(
+    size: int = _RING_ALLREDUCE_SIZE,
+    n_ranks: int = _RING_ALLREDUCE_NRANKS,
+):
     """Build a minimal Before program that calls allreduce(mode="ring")."""
-    SIZE = _RING_ALLREDUCE_SIZE
-    nr = _RING_ALLREDUCE_NRANKS
+    SIZE = size
+    nr = n_ranks
     total_rounds = 2 * (nr - 1)
 
     @pl.program
@@ -1695,26 +1703,99 @@ def test_ring_allreduce_is_decomposed_to_primitives():
     assert "pld.tensor.allreduce" not in op_names, (
         "lower_composite_ops must remove the composite allreduce call entirely"
     )
+    assert "tile.create" not in op_names, "inactive ring segments must not leave allocation-only placeholders"
     missing = _RING_ALLREDUCE_REQUIRED_OPS - op_names
     assert not missing, f"ring-lowered IR missing expected ops: {missing}"
 
 
 def test_ring_allreduce_emits_ring_control_flow():
-    """Ring lowering emits two phase loops plus notify/wait peer loops.
+    """Ring lowering emits phase, subchunk, and two-phase barrier loops.
 
-    For P=2 each inner notify/wait peer loop has one direct IfStmt body."""
+    For P=2 and one subchunk, each RS/AG phase has one outer loop, one
+    subchunk loop, four peer loops, one guarded data path, and one guarded
+    store."""
     Before = _build_ring_allreduce_before()
     After = passes.lower_composite_ops()(Before)
     collector = _StmtKindCollector()
     collector.visit_program(After)
 
-    # Each phase contains notify and wait peer loops: 2 + 2*2 = 6 loops.
-    assert collector.for_count == 6, (
-        f"expected 6 ForStmts for P=2 ring (2 phase + 4 peer loops), got {collector.for_count}"
-    )
-    assert collector.if_count == 4, (
-        f"expected 4 IfStmts (RS notify+wait + AG notify+wait), got {collector.if_count}"
-    )
+    assert collector.for_count == 12, f"expected 12 ForStmts for P=2 ring, got {collector.for_count}"
+    assert collector.if_count == 12, f"expected 12 IfStmts for P=2 ring, got {collector.if_count}"
+
+
+@pytest.mark.parametrize("size", [1, 3, 17, 8193, 65537])
+@pytest.mark.parametrize("n_ranks", [2, 4])
+def test_ring_allreduce_accepts_arbitrary_lengths(size, n_ranks):
+    """Non-divisible, shorter-than-rank, and larger-than-UB sizes lower safely."""
+    Before = _build_ring_allreduce_before(size=size, n_ranks=n_ranks)
+    After = passes.lower_composite_ops()(Before)
+    ssa_before = passes.convert_to_ssa()(Before)
+    ssa_lowered = passes.lower_composite_ops()(ssa_before)
+    flattened = passes.flatten_tile_nd_to_2d()(ssa_lowered)
+    assert "__FREE_VAR" not in ir.python_print(flattened)
+
+    class CallCollector(ir.IRVisitor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls: list[ir.Call] = []
+
+        def visit_call(self, op: ir.Call) -> None:
+            self.calls.append(op)
+            super().visit_call(op)
+
+    collector = CallCollector()
+    collector.visit_program(After)
+    remote_loads = [call for call in collector.calls if call.op.name == "pld.tile.remote_load"]
+    loads = [call for call in collector.calls if call.op.name == "tile.load"]
+    set_valid_shapes = [call for call in collector.calls if call.op.name == "tile.set_validshape"]
+
+    assert remote_loads
+    assert loads
+    assert set_valid_shapes
+    assert all(len(call.args) == 5 for call in remote_loads)
+
+    loops: list[ir.ForStmt] = []
+
+    def collect_loops(stmt: ir.Stmt) -> None:
+        if isinstance(stmt, ir.SeqStmts):
+            for child in stmt.stmts:
+                collect_loops(child)
+        elif isinstance(stmt, ir.ForStmt):
+            loops.append(stmt)
+            collect_loops(stmt.body)
+        elif isinstance(stmt, ir.IfStmt):
+            collect_loops(stmt.then_body)
+            if stmt.else_body is not None:
+                collect_loops(stmt.else_body)
+
+    func = After.get_function("reduce_step")
+    assert func is not None
+    collect_loops(func.body)
+
+    max_segment = (size + n_ranks - 1) // n_ranks
+    expected_chunk = min(4096, ((max_segment + 7) // 8) * 8)
+    subchunk_loops = [
+        loop
+        for loop in loops
+        if ("rs_col" in loop.loop_var.name_hint or "ag_col" in loop.loop_var.name_hint)
+        and isinstance(loop.step, ir.ConstInt)
+        and loop.step.value == expected_chunk
+    ]
+    assert len(subchunk_loops) == 2
+    for loop in subchunk_loops:
+        assert isinstance(loop.start, ir.ConstInt) and loop.start.value == 0
+        assert isinstance(loop.stop, ir.ConstInt) and loop.stop.value == max_segment
+
+    chunk_shapes = [call.args[3] for call in remote_loads]
+    for shape in chunk_shapes:
+        assert isinstance(shape, ir.MakeTuple)
+        chunk_rows = shape.elements[0]
+        chunk_cols = shape.elements[1]
+        assert isinstance(chunk_rows, ir.ConstInt)
+        assert isinstance(chunk_cols, ir.ConstInt)
+        chunk_bytes = chunk_rows.value * chunk_cols.value * 4
+        assert chunk_bytes <= 16 * 1024
+        assert chunk_bytes % 32 == 0
 
 
 def test_ring_allreduce_lowering_is_idempotent():

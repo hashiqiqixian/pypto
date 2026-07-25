@@ -559,11 +559,16 @@ def allreduce(
     ``1 + chunk_count``; the partial-valid rectangle path ends at ``2``.
     The skipped self row remains zero.
 
-    **Ring barrier protocol:** per-round ``AtomicAdd(0→1) → WaitGe(1)``
-    monotonic on a ``[2*(NR−1), NR]`` signal — each ring step writes
-    a fresh row, so active non-self cells end at non-zero values while the
-    skipped self column remains zero. The monotonic advance is per-row, not
-    per-cell reuse.
+    Ring mode divides arbitrary ``SIZE`` values into balanced logical
+    segments, then traverses each segment in physical subchunks of at most
+    16 KiB. Ragged subchunks carry an explicit ``valid_shape``; this also
+    covers ``SIZE < NR`` without dropping elements.
+
+    **Ring barrier protocol:** each ring round owns one row of the
+    ``[2*(NR−1), NR]`` signal. Every subchunk advances that row twice:
+    a ready barrier before remote reads and a read-complete barrier before
+    store-back. The monotonic expected values are ``2*chunk_id+1`` and
+    ``2*chunk_id+2``. The skipped self column remains zero.
 
     **Do not reuse the same signal buffer for a back-to-back allreduce**
     — allocate a fresh signal buffer (``alloc_window_buffer`` + ``window``)

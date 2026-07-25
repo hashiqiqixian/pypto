@@ -164,11 +164,10 @@ PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& 
   codegen.Emit(peer_ptr + " = pto.addptr " + target.local_ptr_ssa + ", " + delems + " : " + ptr_type +
                " -> " + ptr_type);
 
-  // (3) make_tensor_view at the call site. Same shape/stride emission as
-  // ``EmitMakeTensorViews``: row-major strides, ``{layout = #pto.layout<nd>}``
-  // attribute, dynamic-shape result type (``?x?x…xT``). ``addptr``'s
-  // direct consumer is this ``make_tensor_view`` in the same func →
-  // PTOAS's per-func lowering rule is satisfied.
+  // (3) make_tensor_view at the call site. Mirror ``EmitMakeTensorViews`` so
+  // local and peer views use identical shape/stride/layout metadata.
+  // ``addptr``'s direct consumer is this ``make_tensor_view`` in the same
+  // func, satisfying PTOAS's per-func lowering rule.
   std::vector<std::string> shape_ssa(rank);
   for (size_t i = 0; i < rank; ++i) {
     if (auto ci = As<ir::ConstInt>(shape[i])) {
@@ -177,10 +176,34 @@ PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& 
       shape_ssa[i] = codegen.EmitCastToIndex(shape[i], codegen.GetExprAsCode(shape[i]));
     }
   }
-  std::vector<std::string> stride_ssa(rank);
-  std::string layout_str = "nd";
   const auto& tensor_view = target.type->tensor_view_;
-  if (tensor_view.has_value() && tensor_view->stride.size() == rank) {
+  bool is_column_vector = false;
+  if (rank >= 2) {
+    auto last_dim = As<ir::ConstInt>(shape.back());
+    is_column_vector = last_dim && last_dim->value_ == 1;
+  }
+  const bool use_column_vector_convention = is_column_vector && !tensor_view.has_value();
+
+  ir::TensorLayout layout = ir::TensorLayout::ND;
+  if (tensor_view.has_value()) {
+    layout = tensor_view->layout;
+  }
+  if (use_column_vector_convention) {
+    layout = ir::TensorLayout::DN;
+  }
+
+  auto emit_stride_mul = [&](const std::string& lhs, size_t dim_idx) {
+    std::string mul = codegen.NewTemp();
+    codegen.Emit(mul + " = arith.muli " + lhs + ", " + shape_ssa[dim_idx] + " : index");
+    return mul;
+  };
+
+  std::vector<std::string> stride_ssa(rank);
+  const bool has_explicit_stride = tensor_view.has_value() && !tensor_view->stride.empty();
+  if (has_explicit_stride) {
+    CHECK(tensor_view->stride.size() == rank)
+        << "EmitCommRemoteView: explicit stride rank " << tensor_view->stride.size()
+        << " does not match tensor shape rank " << rank;
     for (size_t i = 0; i < rank; ++i) {
       if (auto ci = As<ir::ConstInt>(tensor_view->stride[i])) {
         stride_ssa[i] = codegen.GetOrEmitConstant(ci->value_, DataType::INDEX);
@@ -189,23 +212,50 @@ PeerViewInfo EmitCommRemoteView(const DistTensorBinding& target, const ExprPtr& 
             codegen.EmitCastToIndex(tensor_view->stride[i], codegen.GetExprAsCode(tensor_view->stride[i]));
       }
     }
-    switch (tensor_view->layout) {
-      case ir::TensorLayout::DN:
-        layout_str = "dn";
-        break;
-      case ir::TensorLayout::NZ:
-        layout_str = "nz";
-        break;
-      case ir::TensorLayout::ND:
-        break;
+  } else if (use_column_vector_convention) {
+    stride_ssa[rank - 2] = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+    if (rank == 2) {
+      stride_ssa[rank - 1] = shape_ssa[0];
+    } else {
+      stride_ssa[rank - 1] = shape_ssa[rank - 1];
+      stride_ssa[rank - 3] = shape_ssa[rank - 2];
+      for (int j = static_cast<int>(rank) - 4; j >= 0; --j) {
+        const size_t dim = static_cast<size_t>(j);
+        stride_ssa[dim] = emit_stride_mul(stride_ssa[dim + 1], dim + 1);
+      }
+    }
+  } else if (layout == ir::TensorLayout::DN) {
+    CHECK(rank >= 2) << "EmitCommRemoteView: DN layout requires rank >= 2, got " << rank;
+    stride_ssa[rank - 2] = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+    stride_ssa[rank - 1] = shape_ssa[rank - 2];
+    if (rank >= 3) {
+      stride_ssa[rank - 3] = emit_stride_mul(shape_ssa[rank - 2], rank - 1);
+      for (int j = static_cast<int>(rank) - 4; j >= 0; --j) {
+        const size_t dim = static_cast<size_t>(j);
+        stride_ssa[dim] = emit_stride_mul(stride_ssa[dim + 1], dim + 1);
+      }
     }
   } else {
     stride_ssa[rank - 1] = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
-    for (size_t j = rank - 1; j > 0; --j) {
-      std::string mul = codegen.NewTemp();
-      codegen.Emit(mul + " = arith.muli " + stride_ssa[j] + ", " + shape_ssa[j] + " : index");
-      stride_ssa[j - 1] = mul;
+    if (rank >= 2) {
+      stride_ssa[rank - 2] = shape_ssa[rank - 1];
+      for (int j = static_cast<int>(rank) - 3; j >= 0; --j) {
+        const size_t dim = static_cast<size_t>(j);
+        stride_ssa[dim] = emit_stride_mul(stride_ssa[dim + 1], dim + 1);
+      }
     }
+  }
+
+  std::string layout_str = "nd";
+  switch (layout) {
+    case ir::TensorLayout::DN:
+      layout_str = "dn";
+      break;
+    case ir::TensorLayout::NZ:
+      layout_str = "nz";
+      break;
+    case ir::TensorLayout::ND:
+      break;
   }
 
   std::string peer_view = codegen.NewTemp();
@@ -399,6 +449,11 @@ static std::string MakeNotifyCodegenPTO(const CallPtr& op, codegen::CodegenBase&
   CHECK(value_scalar) << "pld.system.notify value must have ScalarType, got "
                       << op->args_[3]->GetType()->TypeName();
   std::string value_type = codegen.GetTypeString(value_scalar->dtype_);
+  // A notify publishes completion to a peer. Drain every local pipeline first
+  // so the peer cannot observe the signal before preceding VEC work or GM
+  // accesses are complete. PTOAS's TNOTIFY lowering only drains MTE2/MTE3,
+  // which is insufficient for read-complete barriers following VEC operations.
+  codegen.Emit("pto.barrier <PIPE_ALL>");
   std::ostringstream tnotify;
   tnotify << "pto.comm.tnotify(" << partition_view << ", " << value_ssa << " : " << partition_type << ", "
           << value_type << ") {notifyOp = #pto<notify_op " << notify_attr << ">}";

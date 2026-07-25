@@ -359,6 +359,23 @@ def test_remote_load_returns_tile_type_with_target_dtype():
     assert call.type.shape[0].value == 32
 
 
+def test_remote_load_infers_col_major_for_single_column_tile():
+    """A [M, 1] remote Vec tile follows the standard implicit col-major layout."""
+    span = ir.Span.unknown()
+    target = _make_distributed_tensor_var("data", [8, 1], DataType.FP32, span)
+    peer = ir.Var("peer", ir.ScalarType(DataType.INT32), span)
+
+    call = ir.create_op_call(
+        "pld.tile.remote_load",
+        [target, peer, _make_shape_tuple([0, 0], span), _make_shape_tuple([8, 1], span)],
+        {},
+        span,
+    )
+
+    assert isinstance(call.type, ir.TileType)
+    assert call.type.get_effective_tile_view().blayout == ir.TileLayout.col_major
+
+
 def test_remote_load_four_arg_form_rejects_out_of_bounds_window():
     """Omitting valid_shape still enforces the requested physical window."""
     span = ir.Span.unknown()
