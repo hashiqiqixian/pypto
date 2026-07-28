@@ -104,7 +104,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tadds | TADDS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tsubs | TSUBS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | verified on A2/A3 hardware; A5 hardware verification pending |
 | pto.tmuls | TMULS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.taxpy | TAXPY | tile | ✅ | ✅ | ✅ | ❌ | — | destination-reuse API and ST added; hardware verification pending |
+| pto.taxpy | TAXPY | tile | ✅ | ✅ | ❌ | ✅ | — | destination-reuse path verified on A2/A3 hardware |
 | pto.tdivs | TDIVS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tmaxs | TMAXS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tmins | TMINS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
@@ -123,11 +123,11 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.trecip | TRECIP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.trelu | TRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tlrelu | TLRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.taddrelu | VADDRELU | tile | ✅ | ✅ | ✅ | ❌ | — | exact emission covered; PTOAS v0.53 A2/A3 legalization still marks the op illegal |
+| pto.taddrelu | VADDRELU | tile | ✅ | ✅ | ❌ | ❌ | — | exact emission covered; PTOAS v0.53 A2/A3 legalization still marks the op illegal |
 | pto.tfmod | TFMOD | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | pto.tfmods | TFMODS | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.tpow | TPOW | tile | ✅ | ✅ | ✅ | ❌ | — | integer/no-tmp and floating/tmp precision paths added; hardware verification pending |
-| pto.tpows | TPOWS | tile | ✅ | ✅ | ✅ | ❌ | — | integer/no-tmp and floating/tmp precision paths added; hardware verification pending |
+| pto.tpow | TPOW | tile | ✅ | ✅ | ❌ | ✅ | — | floating/tmp path verified on A2/A3 hardware; integer and A5 high-precision contracts covered by UT |
+| pto.tpows | TPOWS | tile | ✅ | ✅ | ❌ | ✅ | — | floating/tmp path verified on A2/A3 hardware; integer and A5 high-precision contracts covered by UT |
 | pto.trandom | TRANDOM | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | PTOAS source-only compatibility interface |
 | **Reductions (13)** |  |  |  |  |  |  |  |  |
 | pto.trowsum | TROWSUM | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
