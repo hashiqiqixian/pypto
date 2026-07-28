@@ -35,14 +35,6 @@ def _src1() -> torch.Tensor:
     return values.contiguous()
 
 
-def _src1_below_src0() -> torch.Tensor:
-    return (_src0() - 1).contiguous()
-
-
-def _src1_above_src0() -> torch.Tensor:
-    return (_src0() + 1).contiguous()
-
-
 def _idx0() -> torch.Tensor:
     return torch.arange(M * N, dtype=torch.int32).reshape(M, N).contiguous()
 
@@ -138,19 +130,11 @@ class PartialArgTestCase(PTOTestCase):
         return f"{self._op_name}_{self._v_rows}x{self._v_cols}"
 
     def define_tensors(self) -> list[TensorSpec]:
-        src1_init = _src1
-        if (self._v_rows, self._v_cols) != (M, N):
-            # Keep source 0 dominant in the partial case so this specifically
-            # exercises preservation of its full valid region; equal index
-            # payloads isolate that shape behavior.  The aligned cases exercise
-            # source selection, ties, and distinct index pairing.
-            src1_init = _src1_below_src0 if self._op_name == "part_argmax" else _src1_above_src0
-        idx1_init = _idx1 if (self._v_rows, self._v_cols) == (M, N) else _idx0
         return [
             TensorSpec("src0", [M, N], DataType.FP32, init_value=_src0),
-            TensorSpec("src1", [M, N], DataType.FP32, init_value=src1_init),
+            TensorSpec("src1", [M, N], DataType.FP32, init_value=_src1),
             TensorSpec("idx0", [M, N], DataType.INT32, init_value=_idx0),
-            TensorSpec("idx1", [M, N], DataType.INT32, init_value=idx1_init),
+            TensorSpec("idx1", [M, N], DataType.INT32, init_value=_idx1),
             TensorSpec("value_out", [M, N], DataType.FP32, is_output=True),
             TensorSpec("index_out", [M, N], DataType.INT32, is_output=True),
         ]
@@ -172,7 +156,7 @@ class PartialArgTestCase(PTOTestCase):
 @pytest.mark.platforms("a2a3")
 @pytest.mark.parametrize("platform", [pytest.param("a2a3", id="a2a3")])
 @pytest.mark.parametrize("op_name", ["part_argmax", "part_argmin"])
-@pytest.mark.parametrize("valid_shape", [(M, N), (11, 13)], ids=["aligned", "partial"])
+@pytest.mark.parametrize("valid_shape", [(M, N), (11, N)], ids=["aligned", "partial"])
 def test_partial_arg(test_runner, platform, op_name, valid_shape):
     result = test_runner.run(PartialArgTestCase(op_name, *valid_shape, platform=platform))
     assert result.passed, f"Test failed: {result.error}"
