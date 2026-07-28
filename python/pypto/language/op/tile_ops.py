@@ -33,6 +33,7 @@ __all__ = [
     "extract",
     "scatter_update",
     "concat",
+    "print",
     "move",
     "aiv_shard",
     "aic_gather",
@@ -1892,6 +1893,11 @@ def transpose(tile: Tile, axis1: int, axis2: int, tmp_tile: Tile | None = None) 
     tmp_expr = tmp_tile.unwrap() if tmp_tile is not None else None
     call_expr = _ir_ops.transpose(tile_expr, axis1, axis2, tmp=tmp_expr)
     return Tile(expr=call_expr)
+
+
+def print(tile: Tile) -> Call:
+    """Print a Vec tile from device code for debugging."""
+    return _ir_ops.print(tile.unwrap())
 
 
 def transpose_view(tile: Tile) -> Tile:

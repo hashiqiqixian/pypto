@@ -438,6 +438,12 @@ def concat(
     return _ir_core.create_op_call("tile.concat", [src0, src1], {}, actual_span)
 
 
+def print(src: Expr, span: Span | None = None) -> Call:
+    """Print a Vec tile from device code for debugging."""
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.print", [src], {}, actual_span)
+
+
 def transpose_view(
     tile: Expr,
     span: Span | None = None,

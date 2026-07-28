@@ -341,10 +341,12 @@ static std::string MakeRandomCodegenPTO(const std::string& pto_op_name, const Ca
 static std::string MakePrintCodegenPTO(const std::string& pto_op_name, const CallPtr& op,
                                        codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  CHECK(op->args_.size() == 1) << "Operation:" << pto_op_name << "] requires 1 argument, but got "
+  CHECK(op->args_.size() == 1) << "Operation [" << pto_op_name << "] requires 1 argument, but got "
                                << op->args_.size();
   std::string src = codegen.GetExprAsCode(op->args_[0]);
-  codegen.Emit(pto_op_name + " ins(" + src + " | !pto.partition_tensor_view<MxNxdtype>)");
+  std::string src_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+  CHECK(!src_type.empty()) << pto_op_name << " requires a typed tile operand";
+  codegen.Emit(pto_op_name + " ins(" + src + " : " + src_type + ")");
   return "";
 }
 

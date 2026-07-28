@@ -245,7 +245,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.get_block_num | get_block_num | tile+tensor | ✅ | ✅ | ✅ | — | — | codegen converts this to a wrapper parameter; no same-name PTO op is emitted |
 | pto.get_subblock_num | get_subblockdim | internal | ✅ | — | — | — | — | codegen converts this to a wrapper parameter; no same-name PTO op is emitted |
 | **Debugging (3)** |  |  |  |  |  |  |  |  |
-| pto.tprint | TPRINT | tile | ✅ | ❌ | ❌ | ❌ | — | backend hook exists; IR/Python frontend and ST are missing |
+| pto.tprint | TPRINT | tile | ✅ | ✅ | ❌ | ❌ | — | basic Vec-tile frontend and exact codegen added; formatted Mat/Acc printing and output-validating ST remain missing |
 | pto.print | cce::printf | internal | ✅ | — | — | — | — | internal/debugging helper; no standalone ST |
 | pto.trap | trap | internal | ✅ | — | — | — | — | internal/debugging helper; no standalone ST |
 | **Communication (14)** |  |  |  |  |  |  |  |  |

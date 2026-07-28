@@ -257,6 +257,29 @@ def test_pto_codegen_tensor_parameters():
     assert "!pto.tensor_view<?x?xf32>" in mlir_code
 
 
+def test_pto_codegen_tprint_uses_exact_typed_tile_operand():
+    """A tile print statement lowers to the exact same-name PTO operation."""
+
+    @pl.program
+    class PrintProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            src: pl.Tensor[[4, 8], pl.FP32],
+            out: pl.Out[pl.Tensor[[4, 8], pl.FP32]],
+        ) -> pl.Tensor[[4, 8], pl.FP32]:
+            tile = pl.load(src, [0, 0], [4, 8], valid_shapes=[3, 5])
+            pl.tile.print(tile)
+            return pl.store(tile, [0, 0], out)
+
+    lines = _get_mlir_lines(_generate_default_mlir(PrintProgram))
+    print_line = _single_line(lines, "pto.tprint")
+    assert "ins(" in print_line
+    assert "!pto.tile_buf<" in print_line
+    assert "v_row=3" in print_line
+    assert "v_col=5" in print_line
+
+
 def test_pto_codegen_collects_dynamic_var_from_shape_expr():
     """Regression: dynamic var under shape expression must be appended as index arg."""
     func = _get_dyn_expr_incore_func()

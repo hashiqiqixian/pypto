@@ -919,6 +919,18 @@ REGISTER_OP("tile.concat")
       return DeduceTileConcatType(args, kwargs);
     });
 
+REGISTER_OP("tile.print")
+    .set_op_category("TileOp")
+    .set_description("Print a Vec tile from device code for debugging")
+    .add_argument("src", "Source tile")
+    .set_input_memory(0, MemorySpace::Vec)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& /*kwargs*/) {
+      CHECK(args.size() == 1) << "tile.print requires exactly one source tile";
+      CHECK(As<TileType>(args[0]->GetType())) << "tile.print requires a TileType source";
+      return GetUnknownType();
+    });
+
 TypePtr DeduceTileSetValidShapeType(const std::vector<ExprPtr>& args,
                                     const std::vector<std::pair<std::string, std::any>>& kwargs) {
   CHECK(args.size() == 3)
