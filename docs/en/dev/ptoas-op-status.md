@@ -170,14 +170,14 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tand | TAND | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | pto.tor | TOR | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | pto.txor | TXOR | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.tshl | TSHL | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.tshr | TSHR | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
+| pto.tshl | TSHL | tile | ✅ | ✅ | ❌ | ✅ | — | verified on A2/A3 hardware for signed/unsigned 16-bit counts including 0 and width-1; A5 hardware verification pending |
+| pto.tshr | TSHR | tile | ✅ | ✅ | ❌ | ✅ | — | verified on A2/A3 hardware for signed/unsigned 16-bit counts including 0 and width-1; A5 hardware verification pending |
 | pto.tnot | TNOT | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tands | TANDS | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | pto.tors | TORS | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | pto.txors | TXORS | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.tshls | TSHLS | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
-| pto.tshrs | TSHRS | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
+| pto.tshls | TSHLS | tile | ✅ | ✅ | ❌ | ✅ | — | verified on A2/A3 hardware for signed 16-bit scalar counts 0 and width-1; explicit unsigned PTOAS scalar types remain unsupported |
+| pto.tshrs | TSHRS | tile | ✅ | ✅ | ❌ | ✅ | — | verified on A2/A3 hardware for signed 16-bit scalar counts 0 and width-1; explicit unsigned PTOAS scalar types remain unsupported |
 | **Data Rearrangement (15)** |  |  |  |  |  |  |  |  |
 | pto.tconcat | TCONCAT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tconcatidx | TCONCAT (indexed) | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
@@ -274,5 +274,5 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tassign | TASSIGN | internal | ✅ | — | — | — | — | inactive backend hook; no standalone ST |
 
 **Stats**: 204 public/compatibility PTOAS ops; 113 have a pypto tile frontend and 75 have a tensor frontend;
-110 have same-name ST coverage (106 regular STs and 4 distributed STs); 62 lack same-name ST coverage
-(52 regular and 10 distributed); within these 204, another 32 ops are not suitable for standalone STs.
+114 have same-name ST coverage (110 regular STs and 4 distributed STs); 58 lack same-name ST coverage
+(48 regular and 10 distributed); within these 204, another 32 ops are not suitable for standalone STs.

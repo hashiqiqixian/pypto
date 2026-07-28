@@ -156,14 +156,14 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tand | TAND | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
 | pto.tor | TOR | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
 | pto.txor | TXOR | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
-| pto.tshl | TSHL | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
-| pto.tshr | TSHR | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
+| pto.tshl | TSHL | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 真机已验证有/无符号 16 位 shift count（含 0 和位宽边界）；A5 真机待验证 |
+| pto.tshr | TSHR | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 真机已验证有/无符号 16 位 shift count（含 0 和位宽边界）；A5 真机待验证 |
 | pto.tnot | TNOT | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tands | TANDS | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
 | pto.tors | TORS | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
 | pto.txors | TXORS | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
-| pto.tshls | TSHLS | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
-| pto.tshrs | TSHRS | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
+| pto.tshls | TSHLS | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 真机已验证有符号 16 位 scalar shift count（0 和位宽边界）；PTOAS 暂不支持显式无符号 scalar 类型 |
+| pto.tshrs | TSHRS | tile | ✅ | ✅ | ❌ | ✅ | — | A2/A3 真机已验证有符号 16 位 scalar shift count（0 和位宽边界）；PTOAS 暂不支持显式无符号 scalar 类型 |
 | **数据重排（15）** |  |  |  |  |  |  |  |  |
 | pto.tconcat | TCONCAT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tconcatidx | TCONCAT (indexed) | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
@@ -260,5 +260,5 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tassign | TASSIGN | internal | ✅ | — | — | — | — | 失活 backend hook，不独立建 ST |
 
 **统计**：共 204 个 PTOAS 公共/兼容 op；pypto tile 前端 113 个，tensor 前端 75 个；
-同名 ST 覆盖 110 个（普通 ST 106，distributed ST 4）；无同名 ST 62 个
-（普通 52，distributed 10）；这 204 个中另有 32 个 op 不适合独立 ST。
+同名 ST 覆盖 114 个（普通 ST 110，distributed ST 4）；无同名 ST 58 个
+（普通 48，distributed 10）；这 204 个中另有 32 个 op 不适合独立 ST。

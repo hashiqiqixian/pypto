@@ -3547,55 +3547,89 @@ class TestTileBitwiseArithmeticOps:
         ir_str = str(Program)
         assert "tile.shrs" in ir_str
 
-    def test_tile_shl_preserves_lhs_dtype(self):
-        """Regression: tile.shl result dtype must match LHS dtype, not the promoted type.
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            DataType.INT8,
+            DataType.UINT8,
+            DataType.INT16,
+            DataType.UINT16,
+            DataType.INT32,
+            DataType.UINT32,
+        ],
+    )
+    @pytest.mark.parametrize("op", [tile.shl, tile.shr])
+    def test_shift_contract_binary_accepts_supported_widths_and_preserves_view(self, dtype, op):
+        """Tile shift ops preserve src type and require one shared valid region."""
+        span = ir.Span.unknown()
+        view = ir.TileView(
+            valid_shape=[7, 13],
+            blayout=ir.TileLayout.row_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        src = ir.Var("src", ir.TileType([8, 16], dtype, tile_view=view), span)
+        shift = ir.Var("shift", ir.TileType([10, 20], dtype, tile_view=view), span)
 
-        When lhs is UINT16 and rhs is UINT32, the result must be UINT16 (LHS dtype),
-        consistent with the scalar variant tile.shls which preserves the LHS tile dtype.
-        """
+        call = op(src, shift)
 
-        @pl.program
-        class Program:
-            @pl.function(type=pl.FunctionType.InCore)
-            def main(
-                self,
-                a: pl.Tensor[[128, 128], pl.UINT16],
-                b: pl.Tensor[[128, 128], pl.UINT32],
-                output: pl.Tensor[[128, 128], pl.UINT16],
-            ) -> pl.Tensor[[128, 128], pl.UINT16]:
-                tile_a: pl.Tile[[16, 16], pl.UINT16] = pl.load(a, [0, 0], [16, 16])
-                tile_b: pl.Tile[[16, 16], pl.UINT32] = pl.load(b, [0, 0], [16, 16])
-                tile_c: pl.Tile[[16, 16], pl.UINT16] = pl.shl(tile_a, tile_b)
-                result: pl.Tensor[[128, 128], pl.UINT16] = pl.store(tile_c, [0, 0], output)
-                return result
+        assert _tile_result_dtype(call) == dtype
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.shape == src.type.shape
+        assert _valid_of(call.type) == [7, 13]
 
-        ir_str = str(Program)
-        assert "tile.shl" in ir_str
+    @pytest.mark.parametrize("dtype", [DataType.INT8, DataType.INT16, DataType.INT32])
+    @pytest.mark.parametrize("op", [tile.shls, tile.shrs])
+    def test_shift_contract_scalar_literal_matches_tile_dtype(self, dtype, op):
+        """Scalar literal sugar uses the exact tile dtype required by PTO-ISA."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([8, 16], dtype), span)
 
-    def test_tile_shr_preserves_lhs_dtype(self):
-        """Regression: tile.shr result dtype must match LHS dtype, not the promoted type.
+        call = op(src, 1)
 
-        When lhs is UINT16 and rhs is UINT32, the result must be UINT16 (LHS dtype),
-        consistent with the scalar variant tile.shrs which preserves the LHS tile dtype.
-        """
+        assert _operand_dtype(call.args[1]) == dtype
+        assert _tile_result_dtype(call) == dtype
 
-        @pl.program
-        class Program:
-            @pl.function(type=pl.FunctionType.InCore)
-            def main(
-                self,
-                a: pl.Tensor[[128, 128], pl.UINT16],
-                b: pl.Tensor[[128, 128], pl.UINT32],
-                output: pl.Tensor[[128, 128], pl.UINT16],
-            ) -> pl.Tensor[[128, 128], pl.UINT16]:
-                tile_a: pl.Tile[[16, 16], pl.UINT16] = pl.load(a, [0, 0], [16, 16])
-                tile_b: pl.Tile[[16, 16], pl.UINT32] = pl.load(b, [0, 0], [16, 16])
-                tile_c: pl.Tile[[16, 16], pl.UINT16] = pl.shr(tile_a, tile_b)
-                result: pl.Tensor[[128, 128], pl.UINT16] = pl.store(tile_c, [0, 0], output)
-                return result
+    @pytest.mark.parametrize("op", [tile.shl, tile.shr])
+    def test_shift_contract_binary_rejects_dtype_and_valid_shape_mismatch(self, op):
+        """PTO-ISA does not promote or broadcast shift-count tiles."""
+        span = ir.Span.unknown()
+        full = ir.Var("full", ir.TileType([8, 16], DataType.INT16), span)
+        mixed = ir.Var("mixed", ir.TileType([8, 16], DataType.UINT16), span)
+        broadcast = ir.Var("broadcast", ir.TileType([1, 16], DataType.INT16), span)
 
-        ir_str = str(Program)
-        assert "tile.shr" in ir_str
+        with pytest.raises(ValueError, match=r"same dtype"):
+            op(full, mixed)
+        with pytest.raises(ValueError, match=r"same valid_shape"):
+            op(full, broadcast)
+
+    @pytest.mark.parametrize("op", [tile.shls, tile.shrs])
+    def test_shift_contract_scalar_rejects_explicit_dtype_mismatch(self, op):
+        """A typed scalar shift count must exactly match the source dtype."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([8, 16], DataType.INT16), span)
+        shift = ir.ConstInt(1, DataType.INT32, span)
+
+        with pytest.raises(ValueError, match=r"same dtype"):
+            op(src, shift)
+
+    @pytest.mark.parametrize("dtype", [DataType.UINT8, DataType.UINT16, DataType.UINT32])
+    @pytest.mark.parametrize("op", [tile.shls, tile.shrs])
+    def test_shift_contract_scalar_rejects_unsigned_ptoas_encoding_gap(self, dtype, op):
+        """PTOAS scalar operands cannot encode PyPTO's explicit unsigned scalar types."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([8, 16], dtype), span)
+
+        with pytest.raises(ValueError, match=r"INT8, INT16, INT32"):
+            op(src, 1)
+
+    @pytest.mark.parametrize("op", [tile.shl, tile.shr, tile.shls, tile.shrs])
+    def test_shift_contract_rejects_unsupported_integer_width(self, op):
+        """INT64 is not implemented by the current PTO-ISA shift templates."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([8, 16], DataType.INT64), span)
+
+        with pytest.raises(ValueError, match=r"INT8.*INT32"):
+            op(src, 1) if op in (tile.shls, tile.shrs) else op(src, src)
 
     def test_tile_prelu(self):
         """Test tile.prelu operator - element-wise parametric ReLU with slope and tmp buffer."""
@@ -3918,9 +3952,7 @@ class TestTileScalarOperandDtype:
     def test_narrow_shift_literal_adopts_tile_dtype(self):
         """Shift counts follow the tile dtype, including narrow int tiles.
 
-        `DeduceTileOpIntScalarBinaryType` permits any integer width for the
-        shift operand ("codegen casts to i32"), and an i8/i16 shift count is
-        accepted end-to-end by ptoas, so narrowing here is safe.
+        The scalar follows the tile element type required by PTO-ISA/PTOAS.
         """
         for dtype in (DataType.INT8, DataType.INT16):
             for fn in (tile.shls, tile.shrs):
