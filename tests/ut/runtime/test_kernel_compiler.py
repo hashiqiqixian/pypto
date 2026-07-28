@@ -11,9 +11,8 @@
 
 from types import SimpleNamespace
 
-from simpler_setup import KernelCompiler as _SimplerKernelCompiler
-
 from pypto.runtime.kernel_compiler import KernelCompiler
+from simpler_setup import KernelCompiler as _SimplerKernelCompiler
 
 
 def _make_compiler(platform: str = "a2a3") -> KernelCompiler:
