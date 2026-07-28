@@ -122,8 +122,8 @@ REGISTER_OP("tile.gather")
 static TypePtr DeduceTileGatherbType(const std::vector<ExprPtr>& args,
                                      const std::vector<std::pair<std::string, std::any>>& kwargs,
                                      const std::string& op_name) {
-  CHECK(args.size() == 2) << "The operator " << op_name
-                          << " requires 2 arguments (src, offset), but got " << args.size();
+  CHECK(args.size() == 2) << "The operator " << op_name << " requires 2 arguments (src, offset), but got "
+                          << args.size();
 
   auto src_type = As<TileType>(args[0]->GetType());
   CHECK(src_type) << "The operator " << op_name << " requires src to be a TileType, but got "
@@ -144,8 +144,7 @@ static TypePtr DeduceTileGatherbType(const std::vector<ExprPtr>& args,
       << "The operator " << op_name << " requires offset dtype to be UINT32, but got "
       << offset_type->dtype_.ToString();
   CHECK(src_type->shape_.size() == 2)
-      << "The operator " << op_name << " requires a 2D src tile, but got rank "
-      << src_type->shape_.size();
+      << "The operator " << op_name << " requires a 2D src tile, but got rank " << src_type->shape_.size();
   CHECK(offset_type->shape_.size() == 2)
       << "The operator " << op_name << " requires a 2D offset tile, but got rank "
       << offset_type->shape_.size();
