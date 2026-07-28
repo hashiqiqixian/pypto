@@ -1095,10 +1095,10 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
 
   std::vector<ExprPtr> output_shape;
   std::vector<ExprPtr> output_valid_shape;
+  const TileView idx_view = tile_view_semantics::GetEffectiveTileView(*idx_type);
   if (coalesce == kMgatherCoalesceElem) {
     output_shape = idx_type->shape_;
-    output_valid_shape =
-        idx_type->tile_view_.has_value() ? idx_type->tile_view_->valid_shape : idx_type->shape_;
+    output_valid_shape = idx_view.valid_shape;
   } else {
     auto first_dim = As<ConstInt>(idx_type->shape_[0]);
     auto second_dim = As<ConstInt>(idx_type->shape_[1]);
@@ -1111,11 +1111,9 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
     ExprPtr rows = column_vector ? idx_type->shape_[0] : idx_type->shape_[1];
     output_shape = {rows, mem_type->shape_.back()};
 
-    ExprPtr valid_rows = rows;
-    if (idx_type->tile_view_.has_value() && idx_type->tile_view_->valid_shape.size() == 2) {
-      valid_rows = column_vector ? idx_type->tile_view_->valid_shape[0]
-                                 : idx_type->tile_view_->valid_shape[1];
-    }
+    CHECK(idx_view.valid_shape.size() == 2)
+        << "The operator " << op_name << " requires a 2D idx valid shape";
+    ExprPtr valid_rows = column_vector ? idx_view.valid_shape[0] : idx_view.valid_shape[1];
     output_valid_shape = {valid_rows, mem_type->shape_.back()};
   }
 

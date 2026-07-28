@@ -36,6 +36,7 @@
 #include "pypto/ir/op_registry.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "pypto/ir/type_inference.h"
 
@@ -147,8 +148,7 @@ static TypePtr DeduceTileGatherbType(const std::vector<ExprPtr>& args,
       << offset_type->shape_.size();
 
   TileView tile_view;
-  tile_view.valid_shape =
-      offset_type->tile_view_.has_value() ? offset_type->tile_view_->valid_shape : offset_type->shape_;
+  tile_view.valid_shape = tile_view_semantics::GetEffectiveTileView(*offset_type).valid_shape;
   tile_view.blayout = TileLayout::row_major;
   return std::make_shared<TileType>(offset_type->shape_, src_type->dtype_, std::nullopt, tile_view);
 }
