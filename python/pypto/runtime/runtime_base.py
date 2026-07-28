@@ -107,6 +107,18 @@ class Worker(ABC):
     def copy_to(self, dst_dev_ptr: int, src_host_ptr: int, nbytes: int, *, worker_id: int = 0) -> None:
         """H2D copy: ``nbytes`` bytes from host *src_host_ptr* to device *dst_dev_ptr*."""
 
+    def copy_to_offset(
+        self,
+        dst_dev_base: int,
+        dst_offset: int,
+        src_host_ptr: int,
+        nbytes: int,
+        *,
+        worker_id: int = 0,
+    ) -> None:
+        """H2D copy into a checked byte range of a malloc-owned device buffer."""
+        raise NotImplementedError(f"{type(self).__name__} does not support copy_to_offset")
+
     @abstractmethod
     def copy_from(self, dst_host_ptr: int, src_dev_ptr: int, nbytes: int, *, worker_id: int = 0) -> None:
         """D2H copy: ``nbytes`` bytes from device *src_dev_ptr* back to host *dst_host_ptr*."""

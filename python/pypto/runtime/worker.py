@@ -278,6 +278,25 @@ class ChipWorker(Worker):
         self._require_initialized("copy_to")
         self._impl.copy_to(dst_dev_ptr, src_host_ptr, nbytes, worker_id)
 
+    def copy_to_offset(
+        self,
+        dst_dev_base: int,
+        dst_offset: int,
+        src_host_ptr: int,
+        nbytes: int,
+        *,
+        worker_id: int = 0,
+    ) -> None:
+        """H2D copy into a checked byte range of a malloc-owned device buffer."""
+        self._require_initialized("copy_to_offset")
+        self._impl.copy_to_offset(
+            dst_dev_base,
+            dst_offset,
+            src_host_ptr,
+            nbytes,
+            worker_id,
+        )
+
     def copy_from(
         self,
         dst_host_ptr: int,

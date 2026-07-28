@@ -1436,6 +1436,25 @@ class DistributedWorker(Worker):
         self._require_open("copy_to")
         self._orch().copy_to(worker_id, dst_dev_ptr, src_host_ptr, nbytes)
 
+    def copy_to_offset(
+        self,
+        dst_dev_base: int,
+        dst_offset: int,
+        src_host_ptr: int,
+        nbytes: int,
+        *,
+        worker_id: int = 0,
+    ) -> None:
+        """H2D copy into a checked byte range of a malloc-owned device buffer."""
+        self._require_open("copy_to_offset")
+        self._orch().copy_to_offset(
+            worker_id,
+            dst_dev_base,
+            dst_offset,
+            src_host_ptr,
+            nbytes,
+        )
+
     def copy_from(self, dst_host_ptr: int, src_dev_ptr: int, nbytes: int, *, worker_id: int = 0) -> None:
         """D2H copy: ``nbytes`` from device *src_dev_ptr* back to host *dst_host_ptr*."""
         self._require_open("copy_from")

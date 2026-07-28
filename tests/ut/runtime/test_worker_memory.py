@@ -87,6 +87,16 @@ class TestCopy:
         worker.copy_from(0x100, 0x200, 64, worker_id=2)
         fake_simpler_worker.copy_from.assert_called_once_with(0x100, 0x200, 64, 2)
 
+    def test_copy_to_offset_forwards(self, fake_simpler_worker, worker):
+        worker.copy_to_offset(0x1000, 0x80, 0x200, 64, worker_id=2)
+        fake_simpler_worker.copy_to_offset.assert_called_once_with(
+            0x1000,
+            0x80,
+            0x200,
+            64,
+            2,
+        )
+
     def test_copy_to_after_close_raises(self, worker):
         worker.close()
         with pytest.raises(RuntimeError, match="initialized ChipWorker"):
@@ -96,6 +106,11 @@ class TestCopy:
         worker.close()
         with pytest.raises(RuntimeError, match="initialized ChipWorker"):
             worker.copy_from(0x100, 0x200, 64)
+
+    def test_copy_to_offset_after_close_raises(self, worker):
+        worker.close()
+        with pytest.raises(RuntimeError, match="initialized ChipWorker"):
+            worker.copy_to_offset(0x1000, 0x80, 0x200, 64)
 
 
 class TestAllocTensor:

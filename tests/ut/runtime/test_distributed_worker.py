@@ -316,6 +316,21 @@ class TestPerCallValidation:
 
 
 class TestDeviceMemoryApi:
+    def test_copy_to_offset_forwards(self, patched_setup):
+        compiled = _fake_compiled([_param("a", [16, 16])], [])
+        rt = DistributedWorker(compiled)
+
+        rt.copy_to_offset(0xDEAD0000, 128, 0xCAFE0000, 64, worker_id=1)
+
+        patched_setup["worker"]._orch.copy_to_offset.assert_called_once_with(
+            1,
+            0xDEAD0000,
+            128,
+            0xCAFE0000,
+            64,
+        )
+        rt.close()
+
     def test_alloc_tensor_forwards_malloc_and_copy(self, patched_setup):
         compiled = _fake_compiled([_param("a", [16, 16])], [])
         rt = DistributedWorker(compiled)
