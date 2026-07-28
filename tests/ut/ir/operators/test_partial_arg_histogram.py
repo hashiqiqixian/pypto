@@ -10,7 +10,6 @@
 """Type contracts for TPARTARGMAX/MIN and THISTOGRAM."""
 
 import pytest
-
 from pypto import ir
 from pypto.ir.op import tile_ops as tile
 from pypto.pypto_core import DataType
