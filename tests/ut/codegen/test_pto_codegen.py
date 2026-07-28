@@ -495,6 +495,34 @@ def test_pto_codegen_fillpad_inplace():
     assert "pto.tfillpad_inplace " in mlir_code, "Expected pto.tfillpad_inplace in MLIR output"
 
 
+def test_pto_codegen_concat_idx_uses_four_inputs_and_reused_destination():
+    """Indexed concat emits the exact PTO op with ``dst`` only as its output."""
+
+    @pl.program
+    class ConcatIdxProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            src0: pl.Tensor[[8, 64], pl.FP32],
+            src1: pl.Tensor[[8, 64], pl.FP32],
+            idx0: pl.Tensor[[8, 8], pl.INT32],
+            idx1: pl.Tensor[[8, 8], pl.INT32],
+            out: pl.Tensor[[8, 64], pl.FP32],
+        ) -> pl.Tensor[[8, 64], pl.FP32]:
+            value0 = pl.load(src0, [0, 0], [8, 64])
+            value1 = pl.load(src1, [0, 0], [8, 64])
+            count0 = pl.load(idx0, [0, 0], [8, 8], valid_shapes=[8, 1])
+            count1 = pl.load(idx1, [0, 0], [8, 8], valid_shapes=[8, 1])
+            dst = pl.load(out, [0, 0], [8, 64])
+            result = pl.tile.concat_idx(value0, value1, count0, count1, dst)
+            return pl.store(result, [0, 0], out)
+
+    lines = _get_mlir_lines(_generate_default_mlir(ConcatIdxProgram))
+    concat_line = _single_line(lines, "pto.tconcatidx")
+    assert "ins(" in concat_line
+    assert "outs(" in concat_line
+
+
 def test_pto_codegen_dynamic_valid_shape_scalar_defined_in_body():
     """Dynamic valid_shape scalars defined in-body should still reach alloc_tile."""
 
