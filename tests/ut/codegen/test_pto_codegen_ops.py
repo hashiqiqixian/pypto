@@ -3261,15 +3261,15 @@ class TestB03TriAndGatherCodegen:
             @pl.function(type=pl.FunctionType.InCore)
             def kernel(
                 self,
-                src: pl.Tensor[[16, 32], pl.FP16],
-                offset: pl.Tensor[[8, 24], pl.UINT32],
-                out: pl.Tensor[[8, 24], pl.FP16],
-            ) -> pl.Tensor[[8, 24], pl.FP16]:
-                src_tile: pl.Tile[[16, 32], pl.FP16] = pl.load(src, [0, 0], [16, 32])
-                offset_tile: pl.Tile[[8, 24], pl.UINT32] = pl.load(
-                    offset, [0, 0], [8, 24], valid_shapes=[5, 17]
+                src: pl.Tensor[[16, 128], pl.FP16],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, 128], pl.FP16],
+            ) -> pl.Tensor[[8, 128], pl.FP16]:
+                src_tile: pl.Tile[[16, 128], pl.FP16] = pl.load(src, [0, 0], [16, 128])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(
+                    offset, [0, 0], [8, 8], valid_shapes=[5, 5]
                 )
-                gathered: pl.Tile[[8, 24], pl.FP16] = pl.tile.gatherb(src_tile, offset_tile)
+                gathered: pl.Tile[[8, 128], pl.FP16] = pl.tile.gatherb(src_tile, offset_tile)
                 return pl.store(gathered, [0, 0], out)
 
         mlir = self._generate_mlir(Prog)

@@ -2513,7 +2513,11 @@ def gather(src: Tile, indices: Tile, tmp: Tile) -> Tile:
 
 
 def gatherb(src: Tile, offset: Tile) -> Tile:
-    """Gather elements from ``src`` by per-element UINT32 byte offsets."""
+    """Gather 32-byte blocks from ``src`` by UINT32 byte offsets.
+
+    Each offset selects one 32-byte source block. One offset column expands to
+    ``32 / sizeof(src.dtype)`` output elements.
+    """
     return Tile(expr=_ir_ops.gatherb(src.unwrap(), offset.unwrap()))
 
 

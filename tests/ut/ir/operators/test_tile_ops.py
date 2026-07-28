@@ -5685,22 +5685,28 @@ class TestB03TriAndGatherOps:
         with pytest.raises(ValueError, match="valid_shape"):
             tile.tri(0, [8, 16], valid_shape=[9, 16])
 
-    def test_gatherb_uses_offset_shape_and_valid_shape(self):
-        src = self._tile("src", [16, 32], DataType.FP32, [16, 32])
-        offset = self._tile("offset", [8, 24], DataType.UINT32, [5, 17])
+    def test_gatherb_expands_block_offsets_to_output_elements(self):
+        src = self._tile("src", [16, 64], DataType.FP16, [16, 64])
+        offset = self._tile("offset", [8, 16], DataType.UINT32, [5, 9])
 
         call = tile.gatherb(src, offset)
 
         assert call.op.name == "tile.gatherb"
         assert isinstance(call.type, ir.TileType)
-        assert [dim.value for dim in call.type.shape] == [8, 24]
-        assert _valid_of(call.type) == [5, 17]
-        assert call.type.dtype == DataType.FP32
+        assert [dim.value for dim in call.type.shape] == [8, 256]
+        assert _valid_of(call.type) == [5, 144]
+        assert call.type.dtype == DataType.FP16
 
     def test_gatherb_rejects_non_uint32_offsets(self):
         src = self._tile("src", [8, 16], DataType.FP16)
         offset = self._tile("offset", [8, 16], DataType.INT32)
         with pytest.raises(ValueError, match="UINT32"):
+            tile.gatherb(src, offset)
+
+    def test_gatherb_rejects_unaligned_offset_rows(self):
+        src = self._tile("src", [8, 16], DataType.FP16)
+        offset = self._tile("offset", [8, 7], DataType.UINT32)
+        with pytest.raises(ValueError, match="multiple of 8"):
             tile.gatherb(src, offset)
 
     def test_mgather_row_mode_shapes_from_index_and_table(self):

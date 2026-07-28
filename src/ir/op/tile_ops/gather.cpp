@@ -143,21 +143,55 @@ static TypePtr DeduceTileGatherbType(const std::vector<ExprPtr>& args,
   CHECK(offset_type->dtype_ == DataType::UINT32)
       << "The operator " << op_name << " requires offset dtype to be UINT32, but got "
       << offset_type->dtype_.ToString();
+  CHECK(src_type->shape_.size() == 2)
+      << "The operator " << op_name << " requires a 2D src tile, but got rank "
+      << src_type->shape_.size();
   CHECK(offset_type->shape_.size() == 2)
       << "The operator " << op_name << " requires a 2D offset tile, but got rank "
       << offset_type->shape_.size();
 
+  // TGATHERB is a 32-byte block gather. Each UINT32 offset selects the first
+  // byte of one source block, and one offset row expands to a destination row
+  // whose element count is offset_cols * (32 / sizeof(src_dtype)). The offset
+  // row itself must occupy a whole number of 32-byte blocks: eight UINT32
+  // entries. This also supplies all eight offsets consumed by one vgatherb
+  // repeat on A2/A3, including a partial valid-column tail.
+  auto offset_cols = As<ConstInt>(offset_type->shape_[1]);
+  CHECK(offset_cols) << "The operator " << op_name << " requires static offset columns";
+  CHECK(offset_cols->value_ > 0 && offset_cols->value_ % 8 == 0)
+      << "The operator " << op_name
+      << " requires offset columns to be a positive multiple of 8 (32-byte UINT32 row), but got "
+      << offset_cols->value_;
+
+  const int64_t elements_per_block = 32 / static_cast<int64_t>(src_type->dtype_.GetByte());
+  auto make_scaled_dim = [elements_per_block](const ExprPtr& dim, const char* label) -> ExprPtr {
+    auto constant = As<ConstInt>(dim);
+    CHECK(constant) << "tile.gatherb requires static " << label;
+    return std::make_shared<ConstInt>(constant->value_ * elements_per_block, DataType::INDEX,
+                                      constant->span_);
+  };
+
+  const auto& offset_view = tile_view_semantics::GetEffectiveTileView(*offset_type);
+  std::vector<ExprPtr> output_shape = {
+      offset_type->shape_[0],
+      make_scaled_dim(offset_type->shape_[1], "offset columns"),
+  };
+  std::vector<ExprPtr> output_valid_shape = {
+      offset_view.valid_shape[0],
+      make_scaled_dim(offset_view.valid_shape[1], "offset valid columns"),
+  };
+
   TileView tile_view;
-  tile_view.valid_shape = tile_view_semantics::GetEffectiveTileView(*offset_type).valid_shape;
+  tile_view.valid_shape = std::move(output_valid_shape);
   tile_view.blayout = TileLayout::row_major;
-  return std::make_shared<TileType>(offset_type->shape_, src_type->dtype_, std::nullopt, tile_view);
+  return std::make_shared<TileType>(std::move(output_shape), src_type->dtype_, std::nullopt, tile_view);
 }
 
 REGISTER_OP("tile.gatherb")
     .set_op_category("TileOp")
-    .set_description("Gather elements by per-element byte offset (maps to pto.tgatherb)")
+    .set_description("Gather 32-byte source blocks by UINT32 byte offset (maps to pto.tgatherb)")
     .add_argument("src", "Source tile (8/16/32-bit int/uint or FP16/BF16/FP32)")
-    .add_argument("offset", "Byte-offset tile (UINT32)")
+    .add_argument("offset", "One UINT32 byte offset per 32-byte destination block")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
