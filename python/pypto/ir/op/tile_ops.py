@@ -442,8 +442,8 @@ def mgather(
     """Gather-load indexed rows or elements from a GM tensor.
 
     ``coalesce="row"`` produces ``dst[r, j] = mem[idx[r], j]`` from a
-    ``[1, R]`` or ``[R, 1]`` index tile. ``coalesce="elem"`` flat-indexes
-    ``mem`` and preserves the index tile's shape and valid shape.
+    row-major ``[1, R]`` index tile. ``coalesce="elem"`` flat-indexes ``mem``
+    and preserves the index tile's shape and valid shape.
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call(

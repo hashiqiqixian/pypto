@@ -5735,6 +5735,35 @@ class TestB03TriAndGatherOps:
         assert [dim.value for dim in call.type.shape] == [8, 32]
         assert _valid_of(call.type) == [5, 19]
 
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            DataType.INT8,
+            DataType.UINT8,
+            DataType.INT16,
+            DataType.UINT16,
+            DataType.INT32,
+            DataType.UINT32,
+            DataType.FP16,
+            DataType.BF16,
+            DataType.FP32,
+        ],
+    )
+    def test_mgather_supported_payload_dtypes(self, dtype):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], dtype), span)
+        idx = self._tile("idx", [1, 8], DataType.INT32)
+
+        assert tile.mgather(mem, idx).type.dtype == dtype
+
+    def test_mgather_row_rejects_column_vector_index(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx = self._tile("idx", [8, 1], DataType.INT32)
+
+        with pytest.raises(ValueError, match=r"\[1, R\]"):
+            tile.mgather(mem, idx)
+
     @pytest.mark.parametrize(("coalesce", "expected"), [(0, 0), (1, 1)])
     def test_mgather_accepts_printed_integer_coalesce(self, coalesce, expected):
         span = ir.Span.unknown()

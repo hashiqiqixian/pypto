@@ -1057,7 +1057,8 @@ constexpr int kMgatherCoalesceRow = 0;
 constexpr int kMgatherCoalesceElem = 1;
 
 bool IsMgatherElementDtype(const DataType& dtype) {
-  return dtype == DataType::INT8 || dtype == DataType::INT16 || dtype == DataType::INT32 ||
+  return dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
+         dtype == DataType::UINT16 || dtype == DataType::INT32 || dtype == DataType::UINT32 ||
          dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32;
 }
 }  // namespace
@@ -1073,7 +1074,8 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
                   << " requires mem to be a TensorType or DistributedTensorType, but got "
                   << args[0]->GetType()->TypeName();
   CHECK(IsMgatherElementDtype(mem_type->dtype_))
-      << "The operator " << op_name << " requires mem dtype in {I8, I16, I32, FP16, BF16, FP32}, but got "
+      << "The operator " << op_name
+      << " requires mem dtype in {I8, U8, I16, U16, I32, U32, FP16, BF16, FP32}, but got "
       << mem_type->dtype_.ToString();
   CHECK(!mem_type->shape_.empty())
       << "The operator " << op_name << " requires mem to have at least one dimension";
@@ -1103,18 +1105,15 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
     auto first_dim = As<ConstInt>(idx_type->shape_[0]);
     auto second_dim = As<ConstInt>(idx_type->shape_[1]);
     CHECK(first_dim && second_dim)
-        << "The operator " << op_name << " row mode requires a static [1, R] or [R, 1] idx shape";
-    CHECK(first_dim->value_ == 1 || second_dim->value_ == 1)
-        << "The operator " << op_name << " row mode requires a [1, R] or [R, 1] idx shape, but got ["
+        << "The operator " << op_name << " row mode requires a static [1, R] idx shape";
+    CHECK(first_dim->value_ == 1)
+        << "The operator " << op_name << " row mode requires a [1, R] idx shape, but got ["
         << first_dim->value_ << ", " << second_dim->value_ << "]";
-    const bool column_vector = second_dim->value_ == 1 && first_dim->value_ != 1;
-    ExprPtr rows = column_vector ? idx_type->shape_[0] : idx_type->shape_[1];
-    output_shape = {rows, mem_type->shape_.back()};
+    output_shape = {idx_type->shape_[1], mem_type->shape_.back()};
 
     CHECK(idx_view.valid_shape.size() == 2)
         << "The operator " << op_name << " requires a 2D idx valid shape";
-    ExprPtr valid_rows = column_vector ? idx_view.valid_shape[0] : idx_view.valid_shape[1];
-    output_valid_shape = {valid_rows, mem_type->shape_.back()};
+    output_valid_shape = {idx_view.valid_shape[1], mem_type->shape_.back()};
   }
 
   TileView tile_view;
