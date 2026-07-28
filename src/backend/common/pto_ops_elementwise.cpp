@@ -16,6 +16,7 @@
 
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>

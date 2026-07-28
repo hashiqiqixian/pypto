@@ -31,6 +31,14 @@ def _tile(name, dtype, valid_shape, layout=ir.TileLayout.row_major, shape=(8, 16
     )
 
 
+def _const_values(shape):
+    values = []
+    for dim in shape:
+        assert isinstance(dim, ir.ConstInt)
+        values.append(dim.value)
+    return values
+
+
 @pytest.mark.parametrize("op", [tile.part_argmax, tile.part_argmin])
 @pytest.mark.parametrize("value_dtype", [DataType.FP16, DataType.FP32])
 @pytest.mark.parametrize("index_dtype", [DataType.INT32, DataType.UINT32])
@@ -48,8 +56,8 @@ def test_partial_arg_contract_returns_value_and_index_tiles(op, value_dtype, ind
     assert isinstance(index_type, ir.TileType)
     assert value_type.dtype == value_dtype
     assert index_type.dtype == index_dtype
-    assert [dim.value for dim in value_type.get_effective_tile_view().valid_shape] == [8, 16]
-    assert [dim.value for dim in index_type.get_effective_tile_view().valid_shape] == [8, 16]
+    assert _const_values(value_type.get_effective_tile_view().valid_shape) == [8, 16]
+    assert _const_values(index_type.get_effective_tile_view().valid_shape) == [8, 16]
 
 
 @pytest.mark.parametrize("op", [tile.part_argmax, tile.part_argmin])
@@ -77,8 +85,8 @@ def test_histogram_contract_uint16(byte):
 
     assert isinstance(call.type, ir.TileType)
     assert call.type.dtype == DataType.UINT32
-    assert [dim.value for dim in call.type.shape] == [8, 256]
-    assert [dim.value for dim in call.type.get_effective_tile_view().valid_shape] == [7, 256]
+    assert _const_values(call.type.shape) == [8, 256]
+    assert _const_values(call.type.get_effective_tile_view().valid_shape) == [7, 256]
 
 
 @pytest.mark.parametrize("byte,rows", [(0, 3), (1, 2), (2, 1), (3, 1)])
@@ -90,7 +98,7 @@ def test_histogram_contract_uint32(byte, rows):
 
     assert isinstance(call.type, ir.TileType)
     assert call.type.dtype == DataType.UINT32
-    assert [dim.value for dim in call.type.shape] == [8, 256]
+    assert _const_values(call.type.shape) == [8, 256]
 
 
 def test_histogram_contract_rejects_invalid_byte_and_index_layout():
