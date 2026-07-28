@@ -139,7 +139,10 @@ print(pto_code)
 | `tile.assemble(target, source, [row, col])` | （可选）`pto.tmov target -> dst` + `pto.subview dst[row, col] sizes [src.rows, src.cols]` + `pto.tmov src -> dst_view` |
 | `tile.set_validshape(tile, vr, vc)` | 发 `pto.set_validshape`；操作数是视图时报错（见下） |
 | `tile.mul(lhs, rhs)` | `pto.tmul` |
-| `tile.add(a, b, c)` | `pto.taddc` (三操作数加法) |
+| `tile.addc(src0, src1, carry)` | `pto.taddc`（`src0 + src1 + carry`） |
+| `tile.subc(src0, src1, carry)` | `pto.tsubc`（`src0 - src1 + carry`） |
+| `tile.addsc(src0, scalar, carry)` | `pto.taddsc`（`src0 + scalar + carry`） |
+| `tile.subsc(src0, scalar, carry)` | `pto.tsubsc`（`src0 - scalar + carry`） |
 | `tile.adds(tile, scalar)` | `pto.tadds` (Tile + 标量) |
 | `tile.fillpad_expand(src, shape)` | `pto.tfillpad_expand ins(%src) outs(%dst)`（`shape` 元组仅用于类型推导；更大的 `dst` 及其 pad 来自结果类型） |
 
