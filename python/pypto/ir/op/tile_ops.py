@@ -448,9 +448,7 @@ def concat_idx(
 ) -> Call:
     """Indexed per-row concatenation into ``dst``."""
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call(
-        "tile.concat_idx", [src0, src1, src0_idx, src1_idx, dst], {}, actual_span
-    )
+    return _ir_core.create_op_call("tile.concat_idx", [src0, src1, src0_idx, src1_idx, dst], {}, actual_span)
 
 
 def transpose_view(
