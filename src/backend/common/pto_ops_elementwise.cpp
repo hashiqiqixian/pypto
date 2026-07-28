@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "pypto/backend/common/backend.h"
+#include "pypto/backend/common/backend_handler.h"
 #include "pypto/codegen/codegen_base.h"
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/core/logging.h"
@@ -79,6 +80,7 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
       "tile.sqrt",
       "tile.recip",
       "tile.not",
+      "tile.prelu",
       "tile.relu",
       // Tile x Scalar ops
       "tile.adds",
@@ -88,6 +90,7 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
       "tile.fmods",
       "tile.maximums",
       "tile.lrelu",
+      "tile.sels",
       // Ternary scalar ops (Tile x Scalar x Tile)
       "tile.addsc",
       "tile.subsc",
@@ -348,6 +351,34 @@ static std::string MakePrintCodegenPTO(const std::string& pto_op_name, const Cal
   return "";
 }
 
+static std::string MakeSelsCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CheckArity(op, "pto.tsels", 4);
+  auto src_type = As<ir::TileType>(op->args_[1]->GetType());
+  INTERNAL_CHECK(src_type);
+  const auto* handler = codegen.GetBackendHandler();
+  const auto dtype = src_type->dtype_;
+  const bool supported_on_a2a3 = dtype == DataType::INT16 || dtype == DataType::UINT16 ||
+                                 dtype == DataType::INT32 || dtype == DataType::UINT32 ||
+                                 dtype == DataType::FP16 || dtype == DataType::FP32;
+  CHECK_SPAN(supported_on_a2a3 || handler->GetPtoTargetArch() == "a5", op->span_)
+      << "tile.sels with integer src dtype " << src_type->dtype_.ToString()
+      << " is only supported on the 'a5' backend; A2/A3 supports 16/32-bit integers, FP16, and FP32";
+  return MakeNaryCodegenPTO("pto.tsels", 4, op, codegen_base);
+}
+
+static std::string MakePreluCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CheckArity(op, "pto.tprelu", 3);
+  auto tmp_type = As<ir::TileType>(op->args_[2]->GetType());
+  INTERNAL_CHECK(tmp_type);
+  if (codegen.GetBackendHandler()->GetPtoTargetArch() != "a5") {
+    CHECK_SPAN(tmp_type->dtype_ == DataType::UINT8, op->args_[2]->span_)
+        << "tile.prelu on A2/A3 requires UINT8 tmp scratch, but got " << tmp_type->dtype_.ToString();
+  }
+  return MakeNaryCodegenPTO("pto.tprelu", 3, op, codegen_base);
+}
+
 struct SimpleOpEntry {
   const char* op_name;
   const char* pto_op_name;
@@ -378,7 +409,6 @@ static const SimpleOpEntry kSimpleOps[] = {
     // Tile x Tile comparison/selection operations
     {"tile.maximum",         "pto.tmax",             2},
     {"tile.minimum",         "pto.tmin",             2},
-    {"tile.prelu",           "pto.tprelu",           2},
     // Unary operations
     {"tile.abs",             "pto.tabs",             1},
     {"tile.exp",             "pto.texp",             1},
@@ -489,6 +519,24 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
       }
       reg_entry.set_output_layout(ir::TileLayout::row_major);
     }
+  }
+
+  if (exclude_ops.count("tile.sels") == 0) {
+    auto entry = backend.RegisterOp("tile.sels");
+    entry.f_codegen(MakeSelsCodegenPTO);
+    for (size_t i = 0; i < 4; ++i) {
+      entry.set_input_layout(i, ir::TileLayout::row_major);
+    }
+    entry.set_output_layout(ir::TileLayout::row_major);
+  }
+
+  if (exclude_ops.count("tile.prelu") == 0) {
+    auto entry = backend.RegisterOp("tile.prelu");
+    entry.f_codegen(MakePreluCodegenPTO);
+    for (size_t i = 0; i < 3; ++i) {
+      entry.set_input_layout(i, ir::TileLayout::row_major);
+    }
+    entry.set_output_layout(ir::TileLayout::row_major);
   }
 
   // Register ops with custom codegen logic
