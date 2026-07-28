@@ -141,14 +141,16 @@ class PartialArgTestCase(PTOTestCase):
         src1_init = _src1
         if (self._v_rows, self._v_cols) != (M, N):
             # Keep source 0 dominant in the partial case so this specifically
-            # exercises preservation of its full valid region.  The aligned
-            # cases exercise source selection, ties, and distinct index pairing.
+            # exercises preservation of its full valid region; equal index
+            # payloads isolate that shape behavior.  The aligned cases exercise
+            # source selection, ties, and distinct index pairing.
             src1_init = _src1_below_src0 if self._op_name == "part_argmax" else _src1_above_src0
+        idx1_init = _idx1 if (self._v_rows, self._v_cols) == (M, N) else _idx0
         return [
             TensorSpec("src0", [M, N], DataType.FP32, init_value=_src0),
             TensorSpec("src1", [M, N], DataType.FP32, init_value=src1_init),
             TensorSpec("idx0", [M, N], DataType.INT32, init_value=_idx0),
-            TensorSpec("idx1", [M, N], DataType.INT32, init_value=_idx1),
+            TensorSpec("idx1", [M, N], DataType.INT32, init_value=idx1_init),
             TensorSpec("value_out", [M, N], DataType.FP32, is_output=True),
             TensorSpec("index_out", [M, N], DataType.INT32, is_output=True),
         ]
