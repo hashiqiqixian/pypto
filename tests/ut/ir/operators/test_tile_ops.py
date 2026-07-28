@@ -5729,12 +5729,26 @@ class TestB03TriAndGatherOps:
         assert [dim.value for dim in call.type.shape] == [8, 32]
         assert _valid_of(call.type) == [5, 19]
 
+    @pytest.mark.parametrize(("coalesce", "expected"), [(0, 0), (1, 1)])
+    def test_mgather_accepts_printed_integer_coalesce(self, coalesce, expected):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx = self._tile("idx", [1, 8], DataType.INT32)
+
+        call = tile.mgather(mem, idx, coalesce=coalesce)
+
+        assert dict(call.kwargs) == {"coalesce": expected}
+
     def test_mgather_rejects_invalid_coalesce(self):
         span = ir.Span.unknown()
         mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
         idx = self._tile("idx", [1, 8], DataType.INT32)
         with pytest.raises(ValueError, match="coalesce"):
             tile.mgather(mem, idx, coalesce="invalid")
+        with pytest.raises(ValueError, match="coalesce"):
+            tile.mgather(mem, idx, coalesce=2)
+        with pytest.raises(ValueError, match="coalesce"):
+            tile.mgather(mem, idx, coalesce=True)
 
 
 if __name__ == "__main__":

@@ -2687,13 +2687,14 @@ def mscatter(src: Tile, idx: Tile, output_tensor: _TensorT) -> _TensorT:
     return output_tensor.__class__(expr=call_expr)
 
 
-def mgather(mem: Tensor, idx: Tile, coalesce: str = "row") -> Tile:
+def mgather(mem: Tensor, idx: Tile, coalesce: str | int = "row") -> Tile:
     """Gather-load rows or elements from a GM tensor into a fresh Vec tile.
 
     Args:
         mem: Source tensor in GM.
         idx: Two-dimensional INT32 index tile.
-        coalesce: ``"row"`` for row gather or ``"elem"`` for flat element gather.
+        coalesce: ``"row"``/``0`` for row gather or ``"elem"``/``1`` for flat
+            element gather. Integer values support printed-IR round trips.
     """
     return Tile(expr=_ir_ops.mgather(mem.unwrap(), idx.unwrap(), coalesce=coalesce))
 

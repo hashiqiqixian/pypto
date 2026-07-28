@@ -422,10 +422,27 @@ def mscatter(
 _MGATHER_COALESCE = {"row": 0, "elem": 1}
 
 
+def _resolve_mgather_coalesce(coalesce: str | int) -> int:
+    if isinstance(coalesce, str):
+        try:
+            return _MGATHER_COALESCE[coalesce]
+        except KeyError as e:
+            raise ValueError(
+                f"mgather coalesce must be 'row', 'elem', 0, or 1, got {coalesce!r}"
+            ) from e
+    if (
+        isinstance(coalesce, int)
+        and not isinstance(coalesce, bool)
+        and coalesce in (0, 1)
+    ):
+        return coalesce
+    raise ValueError(f"mgather coalesce must be 'row', 'elem', 0, or 1, got {coalesce!r}")
+
+
 def mgather(
     mem: Expr,
     idx: Expr,
-    coalesce: str = "row",
+    coalesce: str | int = "row",
     span: Span | None = None,
 ) -> Call:
     """Gather-load indexed rows or elements from a GM tensor.
@@ -434,13 +451,11 @@ def mgather(
     ``[1, R]`` or ``[R, 1]`` index tile. ``coalesce="elem"`` flat-indexes
     ``mem`` and preserves the index tile's shape and valid shape.
     """
-    if coalesce not in _MGATHER_COALESCE:
-        raise ValueError(f"mgather coalesce must be 'row' or 'elem', got {coalesce!r}")
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call(
         "tile.mgather",
         [mem, idx],
-        {"coalesce": _MGATHER_COALESCE[coalesce]},
+        {"coalesce": _resolve_mgather_coalesce(coalesce)},
         actual_span,
     )
 
