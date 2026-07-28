@@ -88,6 +88,8 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
       "tile.fmods",
       "tile.maximums",
       "tile.lrelu",
+      // Gather operands and result are linearly addressed.
+      "tile.gatherb",
       // Ternary scalar ops (Tile x Scalar x Tile)
       "tile.addsc",
       "tile.subsc",
@@ -284,6 +286,26 @@ static std::string MakeCiCodegenPTO(const std::string& pto_op_name, const CallPt
   return "";
 }
 
+// TTRI's upper/lower selector is only accepted through the generic MLIR form.
+// Shape and optional valid_shape operands are type-only and are not emitted.
+static std::string MakeTriCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CHECK(op->args_.size() == 2 || op->args_.size() == 3)
+      << "Operation:[pto.ttri] requires 2 or 3 arguments (diagonal, shape, [valid_shape]), but got "
+      << op->args_.size();
+  const bool upper = op->GetKwarg<bool>("upper", false);
+  const std::string diagonal = codegen.GetExprAsCode(op->args_[0]);
+  const std::string diagonal_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+  const std::string dst = codegen.GetCurrentResultTarget();
+  const std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
+
+  std::ostringstream oss;
+  oss << "\"pto.ttri\"(" << diagonal << ", " << dst << ") {upperOrLower = " << (upper ? 1 : 0)
+      << " : i32} : (" << diagonal_type << ", " << dst_type << ") -> ()";
+  codegen.Emit(oss.str());
+  return "";
+}
+
 // Helper function for Random: emits pto.trandom.
 // IR tile.random(key0, key1, counter0..3, shape) carries the shape tuple as the
 // last arg for type deduction only; the hardware reads the destination extent
@@ -356,8 +378,6 @@ struct SimpleOpEntry {
 
 // clang-format off
 static const SimpleOpEntry kSimpleOps[] = {
-    // Memory operations
-    {"tile.mgather",         "pto.tmgather",         2},
     // Tile x Tile arithmetic operations
     {"tile.add",             "pto.tadd",             2},
     {"tile.sub",             "pto.tsub",             2},
@@ -687,6 +707,14 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   reg("tile.ci", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeCiCodegenPTO("pto.tci", op, codegen);
   });
+
+  if (exclude_ops.count("tile.tri") == 0) {
+    backend.RegisterOp("tile.tri")
+        .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+          return MakeTriCodegenPTO(op, codegen);
+        })
+        .set_output_layout(ir::TileLayout::row_major);
+  }
 
   // tile.random (TRANDOM): output must be row_major per ISA
   if (exclude_ops.count("tile.random") == 0) {

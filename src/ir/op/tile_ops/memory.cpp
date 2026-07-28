@@ -625,6 +625,73 @@ TypePtr DeduceTileCiType(const std::vector<ExprPtr>& args,
   return std::make_shared<TileType>(tile_shape, dtype, std::nullopt, tile_view);
 }
 
+TypePtr DeduceTileTriType(const std::vector<ExprPtr>& args,
+                          const std::vector<std::pair<std::string, std::any>>& kwargs,
+                          const std::string& op_name) {
+  CHECK(args.size() == 2 || args.size() == 3)
+      << "The operator " << op_name
+      << " requires 2 or 3 arguments (diagonal, shape, [valid_shape]), but got " << args.size();
+
+  DataType dtype = GetKwarg<DataType>(kwargs, "dtype");
+  CHECK(dtype == DataType::INT16 || dtype == DataType::INT32 || dtype == DataType::UINT16 ||
+        dtype == DataType::UINT32 || dtype == DataType::FP16 || dtype == DataType::FP32)
+      << "The operator " << op_name
+      << " requires dtype to be one of {INT16, INT32, UINT16, UINT32, FP16, FP32}, but got "
+      << dtype.ToString();
+
+  auto diagonal_type = As<ScalarType>(args[0]->GetType());
+  CHECK(diagonal_type) << "The operator " << op_name << " requires diagonal to be a scalar, but got "
+                       << args[0]->GetType()->TypeName();
+  CHECK(diagonal_type->dtype_ == DataType::INT32)
+      << "The operator " << op_name << " requires diagonal to be an INT32 scalar, but got "
+      << diagonal_type->dtype_.ToString();
+
+  auto shape_tuple = As<MakeTuple>(args[1]);
+  CHECK(shape_tuple) << "The operator " << op_name
+                     << " requires shape to be a MakeTuple of compile-time constants, but got "
+                     << args[1]->TypeName();
+  CHECK(shape_tuple->elements_.size() == 2)
+      << "The operator " << op_name << " requires a 2D shape, but got rank "
+      << shape_tuple->elements_.size();
+
+  std::vector<ExprPtr> tile_shape;
+  tile_shape.reserve(2);
+  for (size_t i = 0; i < shape_tuple->elements_.size(); ++i) {
+    auto dim = As<ConstInt>(shape_tuple->elements_[i]);
+    CHECK(dim) << "The operator " << op_name << " shape element " << i
+               << " must be a compile-time constant";
+    CHECK(dim->value_ > 0) << "The operator " << op_name << " shape element " << i
+                           << " must be positive, got " << dim->value_;
+    tile_shape.push_back(shape_tuple->elements_[i]);
+  }
+
+  std::vector<ExprPtr> valid_shape = tile_shape;
+  if (args.size() == 3) {
+    auto valid_tuple = As<MakeTuple>(args[2]);
+    CHECK(valid_tuple) << "The operator " << op_name
+                       << " requires valid_shape to be a MakeTuple of compile-time constants";
+    CHECK(valid_tuple->elements_.size() == tile_shape.size())
+        << "The operator " << op_name << " requires valid_shape rank " << tile_shape.size()
+        << ", but got " << valid_tuple->elements_.size();
+    valid_shape.clear();
+    for (size_t i = 0; i < valid_tuple->elements_.size(); ++i) {
+      auto valid_dim = As<ConstInt>(valid_tuple->elements_[i]);
+      auto physical_dim = As<ConstInt>(tile_shape[i]);
+      CHECK(valid_dim) << "The operator " << op_name << " valid_shape element " << i
+                       << " must be a compile-time constant";
+      CHECK(valid_dim->value_ > 0 && valid_dim->value_ <= physical_dim->value_)
+          << "The operator " << op_name << " requires 0 < valid_shape[" << i << "] <= shape[" << i
+          << "], but got " << valid_dim->value_ << " and " << physical_dim->value_;
+      valid_shape.push_back(valid_tuple->elements_[i]);
+    }
+  }
+
+  (void)GetKwarg<bool>(kwargs, "upper", false);
+  TileView tile_view;
+  tile_view.valid_shape = valid_shape;
+  return std::make_shared<TileType>(tile_shape, dtype, std::nullopt, tile_view);
+}
+
 TypePtr DeduceTileRandomType(const std::vector<ExprPtr>& args,
                              const std::vector<std::pair<std::string, std::any>>& kwargs,
                              const std::string& op_name) {
@@ -985,6 +1052,95 @@ REGISTER_OP("tile.mscatter")
       return DeduceTileMscatterType(args, kwargs, "tile.mscatter");
     });
 
+namespace {
+constexpr int kMgatherCoalesceRow = 0;
+constexpr int kMgatherCoalesceElem = 1;
+
+bool IsMgatherElementDtype(const DataType& dtype) {
+  return dtype == DataType::INT8 || dtype == DataType::INT16 || dtype == DataType::INT32 ||
+         dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32;
+}
+}  // namespace
+
+TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
+                              const std::vector<std::pair<std::string, std::any>>& kwargs,
+                              const std::string& op_name) {
+  CHECK(args.size() == 2) << "The operator " << op_name
+                          << " requires 2 arguments (mem, idx), but got " << args.size();
+
+  auto mem_type = AsTensorTypeLike(args[0]->GetType());
+  CHECK(mem_type) << "The operator " << op_name
+                  << " requires mem to be a TensorType or DistributedTensorType, but got "
+                  << args[0]->GetType()->TypeName();
+  CHECK(IsMgatherElementDtype(mem_type->dtype_))
+      << "The operator " << op_name << " requires mem dtype in {I8, I16, I32, FP16, BF16, FP32}, but got "
+      << mem_type->dtype_.ToString();
+  CHECK(!mem_type->shape_.empty())
+      << "The operator " << op_name << " requires mem to have at least one dimension";
+
+  auto idx_type = As<TileType>(args[1]->GetType());
+  CHECK(idx_type) << "The operator " << op_name << " requires idx to be a TileType, but got "
+                  << args[1]->GetType()->TypeName();
+  CHECK(idx_type->dtype_ == DataType::INT32)
+      << "The operator " << op_name << " requires idx dtype to be INT32, but got "
+      << idx_type->dtype_.ToString();
+  CHECK(idx_type->shape_.size() == 2)
+      << "The operator " << op_name << " requires a 2D idx tile, but got rank "
+      << idx_type->shape_.size();
+
+  int coalesce = GetKwarg<int>(kwargs, "coalesce", kMgatherCoalesceRow);
+  CHECK(coalesce == kMgatherCoalesceRow || coalesce == kMgatherCoalesceElem)
+      << "The operator " << op_name << " requires coalesce in {0 (row), 1 (elem)}, but got "
+      << coalesce;
+
+  std::vector<ExprPtr> output_shape;
+  std::vector<ExprPtr> output_valid_shape;
+  if (coalesce == kMgatherCoalesceElem) {
+    output_shape = idx_type->shape_;
+    output_valid_shape =
+        idx_type->tile_view_.has_value() ? idx_type->tile_view_->valid_shape : idx_type->shape_;
+  } else {
+    auto first_dim = As<ConstInt>(idx_type->shape_[0]);
+    auto second_dim = As<ConstInt>(idx_type->shape_[1]);
+    CHECK(first_dim && second_dim)
+        << "The operator " << op_name << " row mode requires a static [1, R] or [R, 1] idx shape";
+    CHECK(first_dim->value_ == 1 || second_dim->value_ == 1)
+        << "The operator " << op_name << " row mode requires a [1, R] or [R, 1] idx shape, but got ["
+        << first_dim->value_ << ", " << second_dim->value_ << "]";
+    const bool column_vector = second_dim->value_ == 1 && first_dim->value_ != 1;
+    ExprPtr rows = column_vector ? idx_type->shape_[0] : idx_type->shape_[1];
+    output_shape = {rows, mem_type->shape_.back()};
+
+    ExprPtr valid_rows = rows;
+    if (idx_type->tile_view_.has_value() && idx_type->tile_view_->valid_shape.size() == 2) {
+      valid_rows = column_vector ? idx_type->tile_view_->valid_shape[0]
+                                 : idx_type->tile_view_->valid_shape[1];
+    }
+    output_valid_shape = {valid_rows, mem_type->shape_.back()};
+  }
+
+  TileView tile_view;
+  tile_view.valid_shape = output_valid_shape;
+  tile_view.blayout = TileLayout::row_major;
+  return std::make_shared<TileType>(output_shape, mem_type->dtype_, std::nullopt, tile_view);
+}
+
+REGISTER_OP("tile.mgather")
+    .set_op_category("TileOp")
+    .set_description(
+        "Gather-load rows or elements from a GM tensor into a fresh VEC tile "
+        "(maps to pto.mgather)")
+    .add_argument("mem", "GM source table (TensorType or DistributedTensorType)")
+    .add_argument("idx", "Index tile (INT32, 2D)")
+    .set_attr<int>("coalesce")
+    .set_input_memory(1, MemorySpace::Vec)
+    .set_output_memory(MemorySpace::Vec)
+    .not_inplace_safe()
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileMgatherType(args, kwargs, "tile.mgather");
+    });
+
 REGISTER_OP("tile.move")
     .set_op_category("TileOp")
     .set_description("Move tile between memory levels (Vec/Mat/Left/Right)")
@@ -1042,6 +1198,20 @@ REGISTER_OP("tile.ci")
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
       return DeduceTileCiType(args, kwargs, "tile.ci");
+    });
+
+REGISTER_OP("tile.tri")
+    .set_op_category("TileOp")
+    .set_description("Generate a lower/upper triangular mask tile (pto.ttri)")
+    .add_argument("diagonal", "Diagonal offset scalar (INT32)")
+    .add_argument("shape", "Destination shape (2D TupleType of ConstInt)")
+    .add_argument("valid_shape", "Optional written region (2D TupleType of ConstInt, <= shape)")
+    .set_attr<DataType>("dtype")
+    .set_attr<bool>("upper")
+    .set_output_memory(MemorySpace::Vec)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTileTriType(args, kwargs, "tile.tri");
     });
 
 REGISTER_OP("tile.random")

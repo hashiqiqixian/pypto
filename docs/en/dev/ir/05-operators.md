@@ -280,7 +280,10 @@ with ib.function("tensor_example") as f:
 | - | `tile.transpose` | Swap two axes of a tile |
 | - | `tile.set_validshape` | Update valid-shape metadata without data movement |
 | - | `tile.ci` | Generate contiguous integer sequence (start + k / start - k); dtype ∈ {INT16, INT32}; innermost dim != 1 |
+| - | `tile.tri` | Generate a lower/upper triangular 0/1 mask with an INT32 diagonal offset; supports an optional partial `valid_shape`; maps to `pto.ttri`. |
 | **Reduction** | `tile.row_*` / `tile.col_*` | Direction-specific reduction (`row_sum`/`row_max`/`row_min`/`row_prod` collapse the last axis; `col_*` collapse axis 0). There is no axis-parameterized reduction — the ISA has only direction-specific intrinsics (`pto.trowsum`, `pto.tcolsum`, …) |
+| **Gather** | `tile.gatherb` | Gather by per-element UINT32 byte offsets; output shape/valid shape follow the offset tile and output dtype follows the source; maps to `pto.tgatherb`. |
+| - | `tile.mgather` | Gather from a GM tensor into a fresh Vec tile. `coalesce="row"` gathers complete rows through a `[1,R]`/`[R,1]` INT32 index tile; `"elem"` flat-indexes individual elements. Every valid index must remain inside the source tensor (out-of-range addressing is invalid). Emits canonical `pto.mgather` with an explicit coalesce attribute. |
 | **Scatter** | `tile.scatter` | Row-scatter `src` into `dst` at per-row indices (`pto.tscatter` index form; DPS — `dst` is in/out, the result aliases `dst`). `src`/`dst` dtype ∈ {I8, I16, I32, FP16, FP32, BF16}; `indexes` dtype ∈ {I16, I32}; element-size matching rule: 4-byte dst ↔ INT32, 2-byte dst ↔ INT16, 1-byte dst ↔ INT16. |
 | - | `tile.scatter_mask` | Mask-pattern row-scatter: write each `src` row into the mask-marked columns of `dst` (DPS — `dst` is in/out). A PyPTO codegen form lowered to a `pto.tscatter` mask emission — **not** a distinct pto-isa instruction (unlike `tile.gather_mask`). See [Mask patterns](#mask-patterns). |
 

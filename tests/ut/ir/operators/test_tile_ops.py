@@ -5648,5 +5648,94 @@ class TestWriteValidRegionUnion:
         assert result_type.tensor_view is None
 
 
+class TestB03TriAndGatherOps:
+    """IR contracts for TTRI, TGATHERB, and MGATHER."""
+
+    @staticmethod
+    def _tile(name, shape, dtype, valid_shape=None):
+        span = ir.Span.unknown()
+        view = None if valid_shape is None else ir.TileView(valid_shape=valid_shape)
+        return ir.Var(name, ir.TileType(shape, dtype, tile_view=view), span)
+
+    def test_tri_preserves_physical_and_partial_valid_shape(self):
+        call = tile.tri(1, [16, 32], valid_shape=[9, 21], dtype=DataType.FP16, upper=True)
+
+        assert call.op.name == "tile.tri"
+        assert dict(call.kwargs) == {"dtype": DataType.FP16, "upper": True}
+        assert isinstance(call.type, ir.TileType)
+        assert [dim.value for dim in call.type.shape] == [16, 32]
+        assert _valid_of(call.type) == [9, 21]
+        assert call.type.dtype == DataType.FP16
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            DataType.INT16,
+            DataType.INT32,
+            DataType.UINT16,
+            DataType.UINT32,
+            DataType.FP16,
+            DataType.FP32,
+        ],
+    )
+    def test_tri_supported_dtypes(self, dtype):
+        assert tile.tri(0, [8, 16], dtype=dtype).type.dtype == dtype
+
+    def test_tri_rejects_invalid_valid_shape(self):
+        with pytest.raises(ValueError, match="valid_shape"):
+            tile.tri(0, [8, 16], valid_shape=[9, 16])
+
+    def test_gatherb_uses_offset_shape_and_valid_shape(self):
+        src = self._tile("src", [16, 32], DataType.FP32, [16, 32])
+        offset = self._tile("offset", [8, 24], DataType.UINT32, [5, 17])
+
+        call = tile.gatherb(src, offset)
+
+        assert call.op.name == "tile.gatherb"
+        assert isinstance(call.type, ir.TileType)
+        assert [dim.value for dim in call.type.shape] == [8, 24]
+        assert _valid_of(call.type) == [5, 17]
+        assert call.type.dtype == DataType.FP32
+
+    def test_gatherb_rejects_non_uint32_offsets(self):
+        src = self._tile("src", [8, 16], DataType.FP16)
+        offset = self._tile("offset", [8, 16], DataType.INT32)
+        with pytest.raises(ValueError, match="UINT32"):
+            tile.gatherb(src, offset)
+
+    def test_mgather_row_mode_shapes_from_index_and_table(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.BF16), span)
+        idx = self._tile("idx", [1, 16], DataType.INT32, [1, 9])
+
+        call = tile.mgather(mem, idx)
+
+        assert call.op.name == "tile.mgather"
+        assert dict(call.kwargs) == {"coalesce": 0}
+        assert isinstance(call.type, ir.TileType)
+        assert [dim.value for dim in call.type.shape] == [16, 32]
+        assert _valid_of(call.type) == [9, 32]
+        assert call.type.dtype == DataType.BF16
+
+    def test_mgather_elem_mode_preserves_index_region(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([256], DataType.INT16), span)
+        idx = self._tile("idx", [8, 32], DataType.INT32, [5, 19])
+
+        call = tile.mgather(mem, idx, coalesce="elem")
+
+        assert dict(call.kwargs) == {"coalesce": 1}
+        assert isinstance(call.type, ir.TileType)
+        assert [dim.value for dim in call.type.shape] == [8, 32]
+        assert _valid_of(call.type) == [5, 19]
+
+    def test_mgather_rejects_invalid_coalesce(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx = self._tile("idx", [1, 8], DataType.INT32)
+        with pytest.raises(ValueError, match="coalesce"):
+            tile.mgather(mem, idx, coalesce="invalid")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

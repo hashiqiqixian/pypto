@@ -3223,5 +3223,103 @@ class TestCacheInvalidCodegen:
         assert "partition_tensor_view" not in cmo_line
 
 
+class TestB03TriAndGatherCodegen:
+    """Exact PTOAS spellings and attributes for the B03 operators."""
+
+    @staticmethod
+    def _generate_mlir(program_cls) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        funcs = list(optimized.functions.values())
+        assert funcs
+        single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
+        return codegen.PTOCodegen().generate(single)
+
+    def test_ttri_emits_upper_selector_and_partial_destination(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                mask: pl.Tile[[16, 32], pl.FP32] = pl.tile.tri(
+                    1, [16, 32], valid_shape=[9, 21], dtype=pl.FP32, upper=True
+                )
+                return pl.store(mask, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        line = next(line for line in mlir.splitlines() if '"pto.ttri"' in line)
+        assert "upperOrLower = 1 : i32" in line
+        alloc = next(line for line in mlir.splitlines() if "pto.alloc_tile" in line)
+        assert "valid_row =" in alloc and "valid_col =" in alloc
+
+    def test_tgatherb_emits_exact_two_input_name(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 32], pl.FP16],
+                offset: pl.Tensor[[8, 24], pl.UINT32],
+                out: pl.Tensor[[8, 24], pl.FP16],
+            ) -> pl.Tensor[[8, 24], pl.FP16]:
+                src_tile: pl.Tile[[16, 32], pl.FP16] = pl.load(src, [0, 0], [16, 32])
+                offset_tile: pl.Tile[[8, 24], pl.UINT32] = pl.load(
+                    offset, [0, 0], [8, 24], valid_shapes=[5, 17]
+                )
+                gathered: pl.Tile[[8, 24], pl.FP16] = pl.tile.gatherb(src_tile, offset_tile)
+                return pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        line = next(line for line in mlir.splitlines() if "pto.tgatherb" in line)
+        assert "ins(" in line and "outs(" in line
+        assert line.split("ins(", 1)[1].split(")", 1)[0].split(":", 1)[0].count(",") == 1
+
+    def test_mgather_row_emits_correct_name_and_explicit_coalesce(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], pl.FP32],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                idx_tile: pl.Tile[[1, 16], pl.INT32] = pl.load(idx, [0, 0], [1, 16])
+                gathered: pl.Tile[[16, 32], pl.FP32] = pl.tile.mgather(
+                    mem, idx_tile, coalesce="row"
+                )
+                return pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.tmgather" not in mlir
+        line = next(line for line in mlir.splitlines() if "pto.mgather" in line)
+        assert "#pto<coalesce row>" in line
+        assert "pto.partition_view" in mlir
+
+    def test_mgather_elem_emits_explicit_coalesce(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[256], pl.FP32],
+                idx: pl.Tensor[[8, 32], pl.INT32],
+                out: pl.Tensor[[8, 32], pl.FP32],
+            ) -> pl.Tensor[[8, 32], pl.FP32]:
+                idx_tile: pl.Tile[[8, 32], pl.INT32] = pl.load(idx, [0, 0], [8, 32])
+                gathered: pl.Tile[[8, 32], pl.FP32] = pl.tile.mgather(
+                    mem, idx_tile, coalesce="elem"
+                )
+                return pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        line = next(line for line in mlir.splitlines() if "pto.mgather" in line)
+        assert "#pto<coalesce elem>" in line
+        assert "pto.partition_view" in mlir
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

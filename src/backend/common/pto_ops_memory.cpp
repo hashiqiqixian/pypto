@@ -333,6 +333,72 @@ static std::string MakeTileMscatterCodegenPTO(const CallPtr& op, codegen::Codege
   return "";
 }
 
+// tile.mgather(mem, idx) -> pto.mgather (fresh-output VEC tile).
+static std::string MakeTileMgatherCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  INTERNAL_CHECK(op->args_.size() == 2)
+      << "tile.mgather requires 2 arguments (mem, idx), got " << op->args_.size();
+
+  auto mem = AsVarLike(op->args_[0]);
+  INTERNAL_CHECK(mem) << "tile.mgather mem must be a Var or IterArg";
+  auto idx = AsVarLike(op->args_[1]);
+  INTERNAL_CHECK(idx) << "tile.mgather idx must be a Var or IterArg";
+
+  auto tensor_type = AsTensorTypeLike(mem->GetType());
+  INTERNAL_CHECK(tensor_type) << "tile.mgather mem must have TensorType or DistributedTensorType";
+
+  const int coalesce = op->GetKwarg<int>("coalesce", 0);
+  INTERNAL_CHECK(coalesce == 0 || coalesce == 1)
+      << "tile.mgather coalesce must be 0 (row) or 1 (elem), got " << coalesce;
+  const char* coalesce_name = coalesce == 1 ? "elem" : "row";
+
+  const std::string idx_name = codegen.GetVarName(idx);
+  const std::string idx_type = codegen.GetExprTypeAnnotation(op->args_[1]);
+  const std::string dtype = codegen.GetTypeString(tensor_type->dtype_);
+  const std::string tensor_view = codegen.GetOrCreateTensorView(mem);
+  const std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
+
+  std::string partition_type = "!pto.partition_tensor_view<";
+  std::string partition_view = codegen.NewNamedTemp(mem->name_hint_ + "_pview");
+  std::ostringstream partition_line;
+  partition_line << partition_view << " = pto.partition_view " << tensor_view << ", offsets = [";
+  for (size_t i = 0; i < tensor_type->shape_.size(); ++i) {
+    if (i > 0) partition_line << ", ";
+    partition_line << codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INDEX);
+  }
+  partition_line << "], sizes = [";
+  for (size_t i = 0; i < tensor_type->shape_.size(); ++i) {
+    if (i > 0) {
+      partition_line << ", ";
+      partition_type += "x";
+    }
+    if (auto dim = As<ir::ConstInt>(tensor_type->shape_[i])) {
+      partition_line << codegen.GetOrEmitConstant(dim->value_, DataType::INDEX);
+      partition_type += std::to_string(dim->value_);
+    } else {
+      partition_line << codegen.GetExprAsCode(tensor_type->shape_[i]);
+      partition_type += "?";
+    }
+  }
+  partition_line << "]";
+  partition_type += "x" + dtype + ">";
+  partition_line << " : " << tensor_view_type << " -> " << partition_type;
+  codegen.Emit(partition_line.str());
+
+  const std::string dst = codegen.GetCurrentResultTarget();
+  const std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
+  std::ostringstream mgather_line;
+  mgather_line << "pto.mgather ins(" << partition_view << ", " << idx_name;
+  if (!idx_type.empty()) {
+    mgather_line << " : " << partition_type << ", " << idx_type;
+  }
+  mgather_line << ") outs(" << dst;
+  if (!dst_type.empty()) mgather_line << " : " << dst_type;
+  mgather_line << ") {coalesce = #pto<coalesce " << coalesce_name << ">}";
+  codegen.Emit(mgather_line.str());
+  return "";
+}
+
 // Helper function for tile.alloc (no-op: allocation handled elsewhere)
 static std::string MakeTileAllocCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   (void)op;
@@ -788,6 +854,15 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
         })
         .set_input_layout(0, ir::TileLayout::row_major)
         .set_input_layout(1, ir::TileLayout::row_major);
+  }
+
+  if (exclude_ops.count("tile.mgather") == 0) {
+    backend.RegisterOp("tile.mgather")
+        .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+          return MakeTileMgatherCodegenPTO(op, codegen);
+        })
+        .set_input_layout(1, ir::TileLayout::row_major)
+        .set_output_layout(ir::TileLayout::row_major);
   }
 
   reg("tile.alloc", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {

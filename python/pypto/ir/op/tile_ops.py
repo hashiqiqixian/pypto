@@ -419,6 +419,32 @@ def mscatter(
     return _ir_core.create_op_call("tile.mscatter", [src, idx, output_tensor], {}, actual_span)
 
 
+_MGATHER_COALESCE = {"row": 0, "elem": 1}
+
+
+def mgather(
+    mem: Expr,
+    idx: Expr,
+    coalesce: str = "row",
+    span: Span | None = None,
+) -> Call:
+    """Gather-load indexed rows or elements from a GM tensor.
+
+    ``coalesce="row"`` produces ``dst[r, j] = mem[idx[r], j]`` from a
+    ``[1, R]`` or ``[R, 1]`` index tile. ``coalesce="elem"`` flat-indexes
+    ``mem`` and preserves the index tile's shape and valid shape.
+    """
+    if coalesce not in _MGATHER_COALESCE:
+        raise ValueError(f"mgather coalesce must be 'row' or 'elem', got {coalesce!r}")
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call(
+        "tile.mgather",
+        [mem, idx],
+        {"coalesce": _MGATHER_COALESCE[coalesce]},
+        actual_span,
+    )
+
+
 def concat(
     src0: Expr,
     src1: Expr,
@@ -613,6 +639,43 @@ def ci(
 
 
 arange = ci
+
+
+def tri(
+    diagonal: int | Expr,
+    shape: Sequence[int | Expr] | _ir_core.MakeTuple,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
+    dtype: DataType = DataType.INT32,
+    upper: bool = False,
+    span: Span | None = None,
+) -> Call:
+    """Generate a lower- or upper-triangular mask tile (``pto.ttri``).
+
+    Args:
+        diagonal: INT32 diagonal offset, matching ``torch.tril``/``torch.triu``.
+        shape: Static two-dimensional physical destination shape.
+        valid_shape: Optional written region, bounded by ``shape``.
+        dtype: One of INT16, INT32, UINT16, UINT32, FP16, or FP32.
+        upper: Generate the upper triangle when true; lower otherwise.
+        span: Optional source span.
+    """
+    actual_span = _get_span_or_capture(span)
+    if isinstance(diagonal, Expr):
+        if isinstance(diagonal, ConstInt) and diagonal.dtype != DataType.INT32:
+            diagonal_expr: Expr = ConstInt(diagonal.value, DataType.INT32, actual_span)
+        else:
+            diagonal_expr = diagonal
+    else:
+        diagonal_expr = ConstInt(diagonal, DataType.INT32, actual_span)
+    args: list[Expr] = [diagonal_expr, _to_make_tuple(shape, actual_span)]
+    if valid_shape is not None:
+        args.append(_to_make_tuple(valid_shape, actual_span))
+    return _ir_core.create_op_call(
+        "tile.tri",
+        args,
+        {"dtype": dtype, "upper": upper},
+        actual_span,
+    )
 
 
 def random(  # noqa: PLR0913
@@ -2874,6 +2937,16 @@ def gather(
     """
     actual_span = _get_span_or_capture(span)
     return _ir_core.create_op_call("tile.gather", [src, indices, tmp], {}, actual_span)
+
+
+def gatherb(
+    src: Expr,
+    offset: Expr,
+    span: Span | None = None,
+) -> Call:
+    """Gather elements by per-element UINT32 byte offsets (``pto.tgatherb``)."""
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tile.gatherb", [src, offset], {}, actual_span)
 
 
 def gather_mask(

@@ -118,7 +118,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.texp | TEXP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tlog | TLOG | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | verified on A2/A3 hardware; A5 hardware verification pending |
 | pto.tsqrt | TSQRT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.ttri | TTRI | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
+| pto.ttri | TTRI | tile | ✅ | ✅ | ❌ | ✅ | — | frontend + exact codegen + same-name ST; B03 hardware validation |
 | pto.trsqrt | TRSQRT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.trecip | TRECIP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.trelu | TRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
@@ -182,9 +182,9 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tconcat | TCONCAT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tconcatidx | TCONCAT (indexed) | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
 | pto.tgather | TGATHER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.tgatherb | TGATHERB | tile | ✅ | ❌ | ❌ | ❌ | — | backend hook exists; IR/Python frontend and ST are missing |
+| pto.tgatherb | TGATHERB | tile | ✅ | ✅ | ❌ | ✅ | — | byte-offset frontend + exact codegen + same-name ST; B03 hardware validation |
 | pto.tscatter | TSCATTER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.mgather | MGATHER | tile | ✅ | ❌ | ❌ | ❌ | — | the current backend emits the legacy name `pto.tmgather` |
+| pto.mgather | MGATHER | tile | ✅ | ✅ | ❌ | ✅ | — | canonical name with explicit row/elem coalesce; B03 hardware validation |
 | pto.mscatter | MSCATTER | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.treshape | TRESHAPE | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tinsert | TINSERT | tile | ✅ | ❌ | ❌ | ✅ | — | emitted by `tile.assemble` / automatic matmul lowering |

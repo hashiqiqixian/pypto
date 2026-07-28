@@ -39,6 +39,7 @@ __all__ = [
     "full",
     "ci",
     "arange",
+    "tri",
     "random",
     "fillpad",
     "fillpad_inplace",
@@ -149,11 +150,13 @@ __all__ = [
     "tpop_from_aiv",
     "sort32",
     "gather",
+    "gatherb",
     "gather_mask",
     "gather_compare",
     "scatter",
     "scatter_mask",
     "mscatter",
+    "mgather",
     "MaskPattern",
     "mrgsort",
 ]
@@ -705,6 +708,30 @@ def ci(
 
 
 arange = ci
+
+
+def tri(
+    diagonal: int | Scalar,
+    shape: Sequence[int],
+    valid_shape: Sequence[int] | None = None,
+    dtype: DataType = DataType.INT32,
+    upper: bool = False,
+) -> Tile:
+    """Generate a lower- or upper-triangular mask tile.
+
+    ``upper=False`` writes one where ``j <= i + diagonal``; ``upper=True``
+    writes one where ``j >= i + diagonal``. Only the optional valid region is
+    written.
+    """
+    diagonal_expr = diagonal.unwrap() if isinstance(diagonal, Scalar) else diagonal
+    call_expr = _ir_ops.tri(
+        diagonal_expr,
+        list(shape),
+        valid_shape=list(valid_shape) if valid_shape is not None else None,
+        dtype=dtype,
+        upper=upper,
+    )
+    return Tile(expr=call_expr)
 
 
 def random(
@@ -2485,6 +2512,11 @@ def gather(src: Tile, indices: Tile, tmp: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
+def gatherb(src: Tile, offset: Tile) -> Tile:
+    """Gather elements from ``src`` by per-element UINT32 byte offsets."""
+    return Tile(expr=_ir_ops.gatherb(src.unwrap(), offset.unwrap()))
+
+
 def gather_mask(
     src: Tile,
     mask_pattern: int,
@@ -2653,6 +2685,17 @@ def mscatter(src: Tile, idx: Tile, output_tensor: _TensorT) -> _TensorT:
     """
     call_expr = _ir_ops.mscatter(src.unwrap(), idx.unwrap(), output_tensor.unwrap())
     return output_tensor.__class__(expr=call_expr)
+
+
+def mgather(mem: Tensor, idx: Tile, coalesce: str = "row") -> Tile:
+    """Gather-load rows or elements from a GM tensor into a fresh Vec tile.
+
+    Args:
+        mem: Source tensor in GM.
+        idx: Two-dimensional INT32 index tile.
+        coalesce: ``"row"`` for row gather or ``"elem"`` for flat element gather.
+    """
+    return Tile(expr=_ir_ops.mgather(mem.unwrap(), idx.unwrap(), coalesce=coalesce))
 
 
 @overload
