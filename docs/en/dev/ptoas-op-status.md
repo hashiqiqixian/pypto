@@ -245,7 +245,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.get_block_num | get_block_num | tile+tensor | ✅ | ✅ | ✅ | — | — | codegen converts this to a wrapper parameter; no same-name PTO op is emitted |
 | pto.get_subblock_num | get_subblockdim | internal | ✅ | — | — | — | — | codegen converts this to a wrapper parameter; no same-name PTO op is emitted |
 | **Debugging (3)** |  |  |  |  |  |  |  |  |
-| pto.tprint | TPRINT | tile | ✅ | ✅ | ❌ | ❌ | — | basic Vec-tile frontend and exact codegen added; device compilation requires `_DEBUG` and `--cce-enable-print`, which the current runtime compiler cannot request per kernel |
+| pto.tprint | TPRINT | tile | ✅ | ✅ | ❌ | ❌ | — | basic Vec-tile frontend and per-kernel CCEC print flags added; task-submit does not surface device print output, and the A2/A3 probe corrupted subsequent tile data, blocking an output-validating ST |
 | pto.print | cce::printf | internal | ✅ | — | — | — | — | internal/debugging helper; no standalone ST |
 | pto.trap | trap | internal | ✅ | — | — | — | — | internal/debugging helper; no standalone ST |
 | **Communication (14)** |  |  |  |  |  |  |  |  |
