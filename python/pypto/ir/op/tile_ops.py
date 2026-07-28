@@ -430,11 +430,7 @@ def _resolve_mgather_coalesce(coalesce: str | int) -> int:
             raise ValueError(
                 f"mgather coalesce must be 'row', 'elem', 0, or 1, got {coalesce!r}"
             ) from e
-    if (
-        isinstance(coalesce, int)
-        and not isinstance(coalesce, bool)
-        and coalesce in (0, 1)
-    ):
+    if isinstance(coalesce, int) and not isinstance(coalesce, bool) and coalesce in (0, 1):
         return coalesce
     raise ValueError(f"mgather coalesce must be 'row', 'elem', 0, or 1, got {coalesce!r}")
 
