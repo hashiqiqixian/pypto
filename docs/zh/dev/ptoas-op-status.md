@@ -122,7 +122,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.trowmin | TROWMIN | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 真机已验证；A5 真机待验证 |
 | pto.trowargmin | TROWARGMIN | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.trowprod | TROWPROD | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.thistogram | THISTOGRAM | tile | ✅ | ✅ | ✅ | ❌ | — | 仅 A5；已增加同名 A5 模拟器覆盖，A5 真机待验证 |
+| pto.thistogram | THISTOGRAM | tile | ✅ | ✅ | ✅ | ❌ | — | 仅 A5；已增加同名 A5sim PTOAS 编译覆盖，A5 执行待验证 |
 | pto.tcolsum | TCOLSUM | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tcolmax | TCOLMAX | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tcolargmax | TCOLARGMAX | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |

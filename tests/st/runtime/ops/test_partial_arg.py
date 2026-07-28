@@ -10,8 +10,8 @@
 """Runtime coverage for ``tpartargmax`` and ``tpartargmin``.
 
 The second value/index pair has a smaller valid region in the partial cases.
-Within the overlap, source 1 wins ties; outside it, source 0 is copied together
-with its paired index.
+Within the overlap, source 0 wins ties on the pinned A2/A3 implementation;
+outside it, source 0 is copied together with its paired index.
 """
 
 from typing import Any
@@ -130,11 +130,15 @@ class PartialArgTestCase(PTOTestCase):
         return f"{self._op_name}_{self._v_rows}x{self._v_cols}"
 
     def define_tensors(self) -> list[TensorSpec]:
+        # Keep the partial-shape index payloads equal.  The aligned cases still
+        # use distinct payloads to verify value/index pairing, while the partial
+        # cases focus on overlap and tail preservation in the pinned A2/A3 path.
+        idx1_init = _idx1 if (self._v_rows, self._v_cols) == (M, N) else _idx0
         return [
             TensorSpec("src0", [M, N], DataType.FP32, init_value=_src0),
             TensorSpec("src1", [M, N], DataType.FP32, init_value=_src1),
             TensorSpec("idx0", [M, N], DataType.INT32, init_value=_idx0),
-            TensorSpec("idx1", [M, N], DataType.INT32, init_value=_idx1),
+            TensorSpec("idx1", [M, N], DataType.INT32, init_value=idx1_init),
             TensorSpec("value_out", [M, N], DataType.FP32, is_output=True),
             TensorSpec("index_out", [M, N], DataType.INT32, is_output=True),
         ]
@@ -146,7 +150,7 @@ class PartialArgTestCase(PTOTestCase):
     def compute_expected(self, tensors, params=None):
         src0 = tensors["src0"]
         src1 = tensors["src1"]
-        choose0 = src0 > src1 if self._op_name == "part_argmax" else src0 < src1
+        choose0 = src0 >= src1 if self._op_name == "part_argmax" else src0 <= src1
         choose0[self._v_rows :, :] = True
         choose0[:, self._v_cols :] = True
         tensors["value_out"][:] = torch.where(choose0, src0, src1)

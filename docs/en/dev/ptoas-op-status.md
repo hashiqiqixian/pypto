@@ -136,7 +136,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.trowmin | TROWMIN | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | verified on A2/A3 hardware; A5 hardware verification pending |
 | pto.trowargmin | TROWARGMIN | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.trowprod | TROWPROD | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.thistogram | THISTOGRAM | tile | ✅ | ✅ | ✅ | ❌ | — | A5-only; same-name A5 simulator coverage added, A5 hardware verification pending |
+| pto.thistogram | THISTOGRAM | tile | ✅ | ✅ | ✅ | ❌ | — | A5-only; same-name A5sim PTOAS compilation coverage added, A5 execution pending |
 | pto.tcolsum | TCOLSUM | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tcolmax | TCOLMAX | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tcolargmax | TCOLARGMAX | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
