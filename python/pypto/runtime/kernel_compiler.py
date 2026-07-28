@@ -23,7 +23,10 @@ simpler_setup (issue #1064), this file can be deleted and callers can
 ``from simpler_setup import KernelCompiler`` directly.
 """
 
+import copy
 import importlib.util
+import re
+from pathlib import Path
 
 from simpler_setup import KernelCompiler as _SimplerKernelCompiler  # pyright: ignore[reportMissingImports]
 
@@ -103,7 +106,31 @@ class KernelCompiler(_SimplerKernelCompiler):
             all_include_dirs.extend(self.get_kernel_include_dirs(runtime_name))
         if extra_include_dirs:
             all_include_dirs.extend(extra_include_dirs)
-        return super().compile_incore(
+
+        compiler = self
+        if self.platform in ("a2a3", "a5") and re.search(
+            r"\bTPRINT\s*\(", Path(source_path).read_text(encoding="utf-8")
+        ):
+            # PTO-ISA intentionally hides TPRINT unless _DEBUG is defined, and
+            # CCEC needs its print channel enabled as well. Clone both objects:
+            # device_runner may compile several kernels concurrently, so
+            # mutating the shared compiler/toolchain would leak debug flags to
+            # unrelated kernels.
+            compiler = copy.copy(self)
+            compiler.ccec = copy.copy(self.ccec)
+            assert compiler.ccec is not None
+            get_compile_flags = compiler.ccec.get_compile_flags
+
+            def get_print_compile_flags(core_type: str = "aiv", **kwargs) -> list[str]:
+                return [
+                    *get_compile_flags(core_type=core_type, **kwargs),
+                    "-D_DEBUG",
+                    "--cce-enable-print",
+                ]
+
+            compiler.ccec.get_compile_flags = get_print_compile_flags
+
+        return super(KernelCompiler, compiler).compile_incore(
             source_path,
             core_type=core_type,
             pto_isa_root=pto_isa_root,
