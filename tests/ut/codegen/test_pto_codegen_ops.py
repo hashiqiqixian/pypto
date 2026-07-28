@@ -3266,9 +3266,7 @@ class TestB03TriAndGatherCodegen:
                 out: pl.Tensor[[8, 128], pl.FP16],
             ) -> pl.Tensor[[8, 128], pl.FP16]:
                 src_tile: pl.Tile[[16, 128], pl.FP16] = pl.load(src, [0, 0], [16, 128])
-                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(
-                    offset, [0, 0], [8, 8], valid_shapes=[5, 5]
-                )
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8], valid_shapes=[5, 5])
                 gathered: pl.Tile[[8, 128], pl.FP16] = pl.tile.gatherb(src_tile, offset_tile)
                 return pl.store(gathered, [0, 0], out)
 
