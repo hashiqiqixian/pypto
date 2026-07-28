@@ -944,9 +944,7 @@ def part_argmax(
 ) -> Call:
     """Partial element-wise maximum returning selected values and indices."""
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call(
-        "tile.part_argmax", [src0, src1, src0_idx, src1_idx], {}, actual_span
-    )
+    return _ir_core.create_op_call("tile.part_argmax", [src0, src1, src0_idx, src1_idx], {}, actual_span)
 
 
 def part_argmin(
@@ -958,9 +956,7 @@ def part_argmin(
 ) -> Call:
     """Partial element-wise minimum returning selected values and indices."""
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call(
-        "tile.part_argmin", [src0, src1, src0_idx, src1_idx], {}, actual_span
-    )
+    return _ir_core.create_op_call("tile.part_argmin", [src0, src1, src0_idx, src1_idx], {}, actual_span)
 
 
 def histogram(src: Expr, idx: Expr, byte: int = 1, span: Span | None = None) -> Call:

@@ -2044,9 +2044,7 @@ def part_min(src0: Tile, src1: Tile) -> Tile:
 
 def part_argmax(src0: Tile, src1: Tile, src0_idx: Tile, src1_idx: Tile) -> tuple[Tile, Tile]:
     """Partial element-wise maximum returning ``(value, index)`` tiles."""
-    call_expr = _ir_ops.part_argmax(
-        src0.unwrap(), src1.unwrap(), src0_idx.unwrap(), src1_idx.unwrap()
-    )
+    call_expr = _ir_ops.part_argmax(src0.unwrap(), src1.unwrap(), src0_idx.unwrap(), src1_idx.unwrap())
     span = call_expr.span
     return (
         Tile(expr=_ir_core.TupleGetItemExpr(call_expr, 0, span)),
@@ -2056,9 +2054,7 @@ def part_argmax(src0: Tile, src1: Tile, src0_idx: Tile, src1_idx: Tile) -> tuple
 
 def part_argmin(src0: Tile, src1: Tile, src0_idx: Tile, src1_idx: Tile) -> tuple[Tile, Tile]:
     """Partial element-wise minimum returning ``(value, index)`` tiles."""
-    call_expr = _ir_ops.part_argmin(
-        src0.unwrap(), src1.unwrap(), src0_idx.unwrap(), src1_idx.unwrap()
-    )
+    call_expr = _ir_ops.part_argmin(src0.unwrap(), src1.unwrap(), src0_idx.unwrap(), src1_idx.unwrap())
     span = call_expr.span
     return (
         Tile(expr=_ir_core.TupleGetItemExpr(call_expr, 0, span)),

@@ -148,8 +148,7 @@ class HistogramTestCase(PTOTestCase):
             for filter_byte in range(self._byte + 1, 4):
                 idx_row = 3 - filter_byte
                 values = values[
-                    ((src[0] >> (8 * filter_byte)) & 0xFF)
-                    == tensors["idx"][idx_row, 0].to(torch.int64)
+                    ((src[0] >> (8 * filter_byte)) & 0xFF) == tensors["idx"][idx_row, 0].to(torch.int64)
                 ]
         tensors["out"][0] = _cumulative(values)
 
