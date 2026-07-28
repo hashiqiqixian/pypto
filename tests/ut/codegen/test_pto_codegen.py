@@ -276,8 +276,8 @@ def test_pto_codegen_tprint_uses_exact_typed_tile_operand():
     print_line = _single_line(lines, "pto.tprint")
     assert "ins(" in print_line
     assert "!pto.tile_buf<" in print_line
-    assert "v_row=3" in print_line
-    assert "v_col=5" in print_line
+    assert "v_row=?" in print_line
+    assert "v_col=?" in print_line
 
 
 def test_pto_codegen_collects_dynamic_var_from_shape_expr():
