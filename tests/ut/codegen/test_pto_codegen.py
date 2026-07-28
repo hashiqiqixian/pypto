@@ -997,6 +997,60 @@ class TestPreprocessPtoasOutput:
         result = _preprocess_ptoas_output(SAMPLE_PTOAS_OUTPUT)
         assert "ptoas_bitcast" in result
 
+    def test_restores_mgather_wrapper_operands(self):
+        result = _preprocess_ptoas_output(
+            "AICORE void kernel() {\n"
+            "  Tile<TileType::Vec, float, 8, 16> dst_tile;\n"
+            "  __ubuf__ float* dst_ptr = dst_tile.data();\n"
+            "  GlobalTensor<float, Shape, Stride> table;\n"
+            "  __gm__ float* table_ptr = (__gm__ float*) table;\n"
+            "  Tile<TileType::Vec, int32_t, 1, 8> idx_tile;\n"
+            "  __ubuf__ int32_t* idx_ptr = idx_tile.data();\n"
+            "  MGATHER<pto::Coalesce::Row>(dst_ptr, table_ptr, idx_ptr);\n"
+            "}\n"
+        )
+
+        assert "MGATHER<pto::Coalesce::Row>(dst_tile, table, idx_tile);" in result
+        assert "dst_ptr" not in result
+        assert "table_ptr" not in result
+        assert "idx_ptr" not in result
+
+    def test_leaves_mgather_with_non_unique_pointer_alias_unchanged(self):
+        source = (
+            "AICORE void kernel() {\n"
+            "  __ubuf__ float* dst_ptr = dst_tile.data();\n"
+            "  __gm__ float* table_ptr = (__gm__ float*) table;\n"
+            "  __ubuf__ int32_t* idx_ptr = idx_tile.data();\n"
+            "  consume(dst_ptr);\n"
+            "  MGATHER(dst_ptr, table_ptr, idx_ptr);\n"
+            "}\n"
+        )
+
+        result = _preprocess_ptoas_output(source)
+
+        assert "consume(dst_ptr);" in result
+        assert "MGATHER(dst_ptr, table_ptr, idx_ptr);" in result
+        assert "__gm__ float* table_ptr = (__gm__ float*) table;" in result
+
+    def test_restores_reused_local_names_in_multiple_functions(self):
+        function_template = (
+            "AICORE void {function_name}() {{\n"
+            "  __ubuf__ float* v1 = {function_name}_dst.data();\n"
+            "  __gm__ float* v2 = (__gm__ float*) {function_name}_table;\n"
+            "  __ubuf__ int32_t* v3 = {function_name}_idx.data();\n"
+            "  MGATHER(v1, v2, v3);\n"
+            "}}\n"
+        )
+        source = function_template.format(function_name="first") + function_template.format(
+            function_name="second"
+        )
+
+        result = _preprocess_ptoas_output(source)
+
+        assert "MGATHER(first_dst, first_table, first_idx);" in result
+        assert "MGATHER(second_dst, second_table, second_idx);" in result
+        assert "__gm__ float* v2" not in result
+
 
 class TestGenerateArgUnpacking:
     """Tests for _generate_arg_unpacking."""
