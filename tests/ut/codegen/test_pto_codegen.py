@@ -412,7 +412,7 @@ def test_pto_codegen_fillpad_shared_memref_uses_single_alloc_tile():
 
 
 def test_pto_codegen_fillpad_inplace():
-    """Test that tile.fillpad_inplace emits pto.tfillpad and shares MemRef with input."""
+    """Test that tile.fillpad_inplace emits its exact PTO op and shares MemRef with input."""
     span = ir.Span.unknown()
     zero = ir.ConstInt(0, DataType.INDEX, span)
     size = ir.ConstInt(128, DataType.INDEX, span)
@@ -491,8 +491,8 @@ def test_pto_codegen_fillpad_inplace():
     # Dynamic valid_shape tile: type has v_row=?, v_col=? (both dynamic per PTOAS requirement)
     assert "v_row=?" in alloc_lines[0], f"Expected dynamic v_row=? in alloc: {alloc_lines[0]}"
     assert "v_col=?" in alloc_lines[0], f"Expected dynamic v_col=? in alloc: {alloc_lines[0]}"
-    # fillpad_inplace emits pto.tfillpad; inplace semantics come from shared UB addr above.
-    assert "pto.tfillpad " in mlir_code, "Expected pto.tfillpad in MLIR output"
+    # In-place semantics come from the shared UB address above.
+    assert "pto.tfillpad_inplace " in mlir_code, "Expected pto.tfillpad_inplace in MLIR output"
 
 
 def test_pto_codegen_dynamic_valid_shape_scalar_defined_in_body():

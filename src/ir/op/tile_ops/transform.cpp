@@ -919,6 +919,65 @@ REGISTER_OP("tile.concat")
       return DeduceTileConcatType(args, kwargs);
     });
 
+static TypePtr DeduceTileConcatIdxType(const std::vector<ExprPtr>& args) {
+  CHECK(args.size() == 5)
+      << "tile.concat_idx requires 5 arguments (src0, src1, src0_idx, src1_idx, dst), got "
+      << args.size();
+  auto src0 = As<TileType>(args[0]->GetType());
+  auto src1 = As<TileType>(args[1]->GetType());
+  auto idx0 = As<TileType>(args[2]->GetType());
+  auto idx1 = As<TileType>(args[3]->GetType());
+  auto dst = As<TileType>(args[4]->GetType());
+  CHECK(src0 && src1 && idx0 && idx1 && dst) << "tile.concat_idx requires five TileType operands";
+  CHECK(src0->dtype_ == src1->dtype_ && src0->dtype_ == dst->dtype_)
+      << "tile.concat_idx requires src0, src1, and dst to have the same dtype";
+  CHECK(idx0->dtype_ == DataType::INT32 && idx1->dtype_ == DataType::INT32)
+      << "tile.concat_idx requires INT32 index tiles";
+  CHECK(src0->shape_.size() == 2 && src1->shape_.size() == 2 && idx0->shape_.size() == 2 &&
+        idx1->shape_.size() == 2 && dst->shape_.size() == 2)
+      << "tile.concat_idx requires rank-2 tiles";
+  for (const auto& type : {src0, src1, idx0, idx1}) {
+    CHECK(ProveValidExtentEqual(type->shape_[0], dst->shape_[0]) == ProofResult::kTrue)
+        << "tile.concat_idx requires all physical row counts to match dst";
+  }
+  const auto dst_valid = GetValidShape(dst);
+  for (const auto& type : {src0, src1, idx0, idx1}) {
+    const auto valid = GetValidShape(type);
+    CHECK(ProveValidExtentEqual(valid[0], dst_valid[0]) == ProofResult::kTrue)
+        << "tile.concat_idx requires all valid row counts to match dst";
+  }
+  const auto idx0_valid = GetValidShape(idx0);
+  const auto idx1_valid = GetValidShape(idx1);
+  auto one = std::make_shared<ConstInt>(1, DataType::INDEX, Span::unknown());
+  CHECK(ProveValidExtentEqual(idx0_valid[1], one) == ProofResult::kTrue &&
+        ProveValidExtentEqual(idx1_valid[1], one) == ProofResult::kTrue)
+      << "tile.concat_idx requires index tiles with valid_shape columns equal to 1";
+  TileView view;
+  view.valid_shape = dst_valid;
+  InheritTileViewLayout(view, dst);
+  return std::make_shared<TileType>(dst->shape_, dst->dtype_, std::nullopt, view);
+}
+
+REGISTER_OP("tile.concat_idx")
+    .set_op_category("TileOp")
+    .set_description("Indexed per-row concatenation into a destination tile")
+    .add_argument("src0", "First source tile")
+    .add_argument("src1", "Second source tile")
+    .add_argument("src0_idx", "Per-row source-0 column count")
+    .add_argument("src1_idx", "Per-row source-1 column count")
+    .add_argument("dst", "Destination tile")
+    .set_input_memory(0, MemorySpace::Vec)
+    .set_input_memory(1, MemorySpace::Vec)
+    .set_input_memory(2, MemorySpace::Vec)
+    .set_input_memory(3, MemorySpace::Vec)
+    .set_input_memory(4, MemorySpace::Vec)
+    .set_output_memory(MemorySpace::Vec)
+    .set_output_reuses_input(4)
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& /*kwargs*/) {
+      return DeduceTileConcatIdxType(args);
+    });
+
 TypePtr DeduceTileSetValidShapeType(const std::vector<ExprPtr>& args,
                                     const std::vector<std::pair<std::string, std::any>>& kwargs) {
   CHECK(args.size() == 3)
