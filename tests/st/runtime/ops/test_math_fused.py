@@ -45,7 +45,12 @@ def _axpy_program():
             return pl.store(result, [0, 0], out)
 
         @pl.function(type=pl.FunctionType.Orchestration)
-        def orchestrator(self, src0, src1, out):
+        def orchestrator(
+            self,
+            src0: pl.Tensor[[M, N], pl.FP32],
+            src1: pl.Tensor[[M, N], pl.FP32],
+            out: pl.InOut[pl.Tensor[[M, N], pl.FP32]],
+        ) -> pl.Tensor[[M, N], pl.FP32]:
             return self.kernel(src0, src1, out)
 
     return AxpyProgram
@@ -67,13 +72,18 @@ def _add_relu_program():
             return pl.store(result, [0, 0], out)
 
         @pl.function(type=pl.FunctionType.Orchestration)
-        def orchestrator(self, src0, src1, out):
+        def orchestrator(
+            self,
+            src0: pl.Tensor[[M, N], pl.FP32],
+            src1: pl.Tensor[[M, N], pl.FP32],
+            out: pl.InOut[pl.Tensor[[M, N], pl.FP32]],
+        ) -> pl.Tensor[[M, N], pl.FP32]:
             return self.kernel(src0, src1, out)
 
     return AddReluProgram
 
 
-def _pow_program(*, scalar: bool, high_precision: bool):
+def _pow_program():
     @pl.program
     class PowProgram:
         @pl.function(type=pl.FunctionType.InCore)
@@ -86,17 +96,48 @@ def _pow_program(*, scalar: bool, high_precision: bool):
             base = pl.load(src0, [0, 0], [M, N], valid_shapes=VALID)
             exp = pl.load(src1, [0, 0], [M, N], valid_shapes=VALID)
             tmp = pl.tile.create([M, N], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            if scalar:
-                result = pl.tile.pows(base, 2.0, tmp, high_precision=high_precision)
-            else:
-                result = pl.tile.pow(base, exp, tmp, high_precision=high_precision)
+            tmp = pl.tile.set_validshape(tmp, VALID[0], VALID[1])
+            result = pl.tile.pow(base, exp, tmp, high_precision=True)
             return pl.store(result, [0, 0], out)
 
         @pl.function(type=pl.FunctionType.Orchestration)
-        def orchestrator(self, src0, src1, out):
+        def orchestrator(
+            self,
+            src0: pl.Tensor[[M, N], pl.FP32],
+            src1: pl.Tensor[[M, N], pl.FP32],
+            out: pl.InOut[pl.Tensor[[M, N], pl.FP32]],
+        ) -> pl.Tensor[[M, N], pl.FP32]:
             return self.kernel(src0, src1, out)
 
     return PowProgram
+
+
+def _pows_program():
+    @pl.program
+    class PowsProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            src0: pl.Tensor[[M, N], pl.FP32],
+            src1: pl.Tensor[[M, N], pl.FP32],
+            out: pl.InOut[pl.Tensor[[M, N], pl.FP32]],
+        ) -> pl.Tensor[[M, N], pl.FP32]:
+            base = pl.load(src0, [0, 0], [M, N], valid_shapes=VALID)
+            tmp = pl.tile.create([M, N], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            tmp = pl.tile.set_validshape(tmp, VALID[0], VALID[1])
+            result = pl.tile.pows(base, 2.0, tmp)
+            return pl.store(result, [0, 0], out)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orchestrator(
+            self,
+            src0: pl.Tensor[[M, N], pl.FP32],
+            src1: pl.Tensor[[M, N], pl.FP32],
+            out: pl.InOut[pl.Tensor[[M, N], pl.FP32]],
+        ) -> pl.Tensor[[M, N], pl.FP32]:
+            return self.kernel(src0, src1, out)
+
+    return PowsProgram
 
 
 class MathFusedCase(PTOTestCase):
@@ -121,7 +162,9 @@ class MathFusedCase(PTOTestCase):
             return _axpy_program()
         if self.op_name == "add_relu":
             return _add_relu_program()
-        return _pow_program(scalar=self.op_name == "pows", high_precision=self.op_name == "pow")
+        if self.op_name == "pow":
+            return _pow_program()
+        return _pows_program()
 
     def compute_expected(self, tensors, params=None):
         src0 = tensors["src0"][: VALID[0], : VALID[1]]
