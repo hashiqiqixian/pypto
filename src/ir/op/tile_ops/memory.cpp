@@ -629,8 +629,8 @@ TypePtr DeduceTileTriType(const std::vector<ExprPtr>& args,
                           const std::vector<std::pair<std::string, std::any>>& kwargs,
                           const std::string& op_name) {
   CHECK(args.size() == 2 || args.size() == 3)
-      << "The operator " << op_name
-      << " requires 2 or 3 arguments (diagonal, shape, [valid_shape]), but got " << args.size();
+      << "The operator " << op_name << " requires 2 or 3 arguments (diagonal, shape, [valid_shape]), but got "
+      << args.size();
 
   DataType dtype = GetKwarg<DataType>(kwargs, "dtype");
   CHECK(dtype == DataType::INT16 || dtype == DataType::INT32 || dtype == DataType::UINT16 ||
@@ -651,15 +651,13 @@ TypePtr DeduceTileTriType(const std::vector<ExprPtr>& args,
                      << " requires shape to be a MakeTuple of compile-time constants, but got "
                      << args[1]->TypeName();
   CHECK(shape_tuple->elements_.size() == 2)
-      << "The operator " << op_name << " requires a 2D shape, but got rank "
-      << shape_tuple->elements_.size();
+      << "The operator " << op_name << " requires a 2D shape, but got rank " << shape_tuple->elements_.size();
 
   std::vector<ExprPtr> tile_shape;
   tile_shape.reserve(2);
   for (size_t i = 0; i < shape_tuple->elements_.size(); ++i) {
     auto dim = As<ConstInt>(shape_tuple->elements_[i]);
-    CHECK(dim) << "The operator " << op_name << " shape element " << i
-               << " must be a compile-time constant";
+    CHECK(dim) << "The operator " << op_name << " shape element " << i << " must be a compile-time constant";
     CHECK(dim->value_ > 0) << "The operator " << op_name << " shape element " << i
                            << " must be positive, got " << dim->value_;
     tile_shape.push_back(shape_tuple->elements_[i]);
@@ -671,8 +669,8 @@ TypePtr DeduceTileTriType(const std::vector<ExprPtr>& args,
     CHECK(valid_tuple) << "The operator " << op_name
                        << " requires valid_shape to be a MakeTuple of compile-time constants";
     CHECK(valid_tuple->elements_.size() == tile_shape.size())
-        << "The operator " << op_name << " requires valid_shape rank " << tile_shape.size()
-        << ", but got " << valid_tuple->elements_.size();
+        << "The operator " << op_name << " requires valid_shape rank " << tile_shape.size() << ", but got "
+        << valid_tuple->elements_.size();
     valid_shape.clear();
     for (size_t i = 0; i < valid_tuple->elements_.size(); ++i) {
       auto valid_dim = As<ConstInt>(valid_tuple->elements_[i]);
@@ -1066,8 +1064,8 @@ bool IsMgatherElementDtype(const DataType& dtype) {
 TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
                               const std::vector<std::pair<std::string, std::any>>& kwargs,
                               const std::string& op_name) {
-  CHECK(args.size() == 2) << "The operator " << op_name
-                          << " requires 2 arguments (mem, idx), but got " << args.size();
+  CHECK(args.size() == 2) << "The operator " << op_name << " requires 2 arguments (mem, idx), but got "
+                          << args.size();
 
   auto mem_type = AsTensorTypeLike(args[0]->GetType());
   CHECK(mem_type) << "The operator " << op_name
@@ -1077,8 +1075,8 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
       << "The operator " << op_name
       << " requires mem dtype in {I8, U8, I16, U16, I32, U32, FP16, BF16, FP32}, but got "
       << mem_type->dtype_.ToString();
-  CHECK(!mem_type->shape_.empty())
-      << "The operator " << op_name << " requires mem to have at least one dimension";
+  CHECK(!mem_type->shape_.empty()) << "The operator " << op_name
+                                   << " requires mem to have at least one dimension";
 
   auto idx_type = As<TileType>(args[1]->GetType());
   CHECK(idx_type) << "The operator " << op_name << " requires idx to be a TileType, but got "
@@ -1087,13 +1085,11 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
       << "The operator " << op_name << " requires idx dtype to be INT32, but got "
       << idx_type->dtype_.ToString();
   CHECK(idx_type->shape_.size() == 2)
-      << "The operator " << op_name << " requires a 2D idx tile, but got rank "
-      << idx_type->shape_.size();
+      << "The operator " << op_name << " requires a 2D idx tile, but got rank " << idx_type->shape_.size();
 
   int coalesce = GetKwarg<int>(kwargs, "coalesce", kMgatherCoalesceRow);
   CHECK(coalesce == kMgatherCoalesceRow || coalesce == kMgatherCoalesceElem)
-      << "The operator " << op_name << " requires coalesce in {0 (row), 1 (elem)}, but got "
-      << coalesce;
+      << "The operator " << op_name << " requires coalesce in {0 (row), 1 (elem)}, but got " << coalesce;
 
   std::vector<ExprPtr> output_shape;
   std::vector<ExprPtr> output_valid_shape;
@@ -1104,15 +1100,14 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
   } else {
     auto first_dim = As<ConstInt>(idx_type->shape_[0]);
     auto second_dim = As<ConstInt>(idx_type->shape_[1]);
-    CHECK(first_dim && second_dim)
-        << "The operator " << op_name << " row mode requires a static [1, R] idx shape";
-    CHECK(first_dim->value_ == 1)
-        << "The operator " << op_name << " row mode requires a [1, R] idx shape, but got ["
-        << first_dim->value_ << ", " << second_dim->value_ << "]";
+    CHECK(first_dim && second_dim) << "The operator " << op_name
+                                   << " row mode requires a static [1, R] idx shape";
+    CHECK(first_dim->value_ == 1) << "The operator " << op_name
+                                  << " row mode requires a [1, R] idx shape, but got [" << first_dim->value_
+                                  << ", " << second_dim->value_ << "]";
     output_shape = {idx_type->shape_[1], mem_type->shape_.back()};
 
-    CHECK(idx_view.valid_shape.size() == 2)
-        << "The operator " << op_name << " requires a 2D idx valid shape";
+    CHECK(idx_view.valid_shape.size() == 2) << "The operator " << op_name << " requires a 2D idx valid shape";
     output_valid_shape = {idx_view.valid_shape[1], mem_type->shape_.back()};
   }
 
