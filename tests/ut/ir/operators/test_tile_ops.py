@@ -5662,10 +5662,11 @@ class TestB03TriAndGatherOps:
 
         assert call.op.name == "tile.tri"
         assert dict(call.kwargs) == {"dtype": DataType.FP16, "upper": True}
-        assert isinstance(call.type, ir.TileType)
-        assert [dim.value for dim in call.type.shape] == [16, 32]
-        assert _valid_of(call.type) == [9, 21]
-        assert call.type.dtype == DataType.FP16
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [16, 32]
+        assert _valid_of(result_type) == [9, 21]
+        assert result_type.dtype == DataType.FP16
 
     @pytest.mark.parametrize(
         "dtype",
@@ -5679,7 +5680,7 @@ class TestB03TriAndGatherOps:
         ],
     )
     def test_tri_supported_dtypes(self, dtype):
-        assert tile.tri(0, [8, 16], dtype=dtype).type.dtype == dtype
+        assert _tile_result_dtype(tile.tri(0, [8, 16], dtype=dtype)) == dtype
 
     def test_tri_rejects_invalid_valid_shape(self):
         with pytest.raises(ValueError, match="valid_shape"):
@@ -5692,10 +5693,11 @@ class TestB03TriAndGatherOps:
         call = tile.gatherb(src, offset)
 
         assert call.op.name == "tile.gatherb"
-        assert isinstance(call.type, ir.TileType)
-        assert [dim.value for dim in call.type.shape] == [8, 256]
-        assert _valid_of(call.type) == [5, 144]
-        assert call.type.dtype == DataType.FP16
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [8, 256]
+        assert _valid_of(result_type) == [5, 144]
+        assert result_type.dtype == DataType.FP16
 
     def test_gatherb_rejects_non_uint32_offsets(self):
         src = self._tile("src", [8, 16], DataType.FP16)
@@ -5718,10 +5720,11 @@ class TestB03TriAndGatherOps:
 
         assert call.op.name == "tile.mgather"
         assert dict(call.kwargs) == {"coalesce": 0}
-        assert isinstance(call.type, ir.TileType)
-        assert [dim.value for dim in call.type.shape] == [16, 32]
-        assert _valid_of(call.type) == [9, 32]
-        assert call.type.dtype == DataType.BF16
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [16, 32]
+        assert _valid_of(result_type) == [9, 32]
+        assert result_type.dtype == DataType.BF16
 
     def test_mgather_elem_mode_preserves_index_region(self):
         span = ir.Span.unknown()
@@ -5731,9 +5734,10 @@ class TestB03TriAndGatherOps:
         call = tile.mgather(mem, idx, coalesce="elem")
 
         assert dict(call.kwargs) == {"coalesce": 1}
-        assert isinstance(call.type, ir.TileType)
-        assert [dim.value for dim in call.type.shape] == [8, 32]
-        assert _valid_of(call.type) == [5, 19]
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [8, 32]
+        assert _valid_of(result_type) == [5, 19]
 
     @pytest.mark.parametrize(
         "dtype",
@@ -5754,7 +5758,7 @@ class TestB03TriAndGatherOps:
         mem = ir.Var("mem", ir.TensorType([64, 32], dtype), span)
         idx = self._tile("idx", [1, 8], DataType.INT32)
 
-        assert tile.mgather(mem, idx).type.dtype == dtype
+        assert _tile_result_dtype(tile.mgather(mem, idx)) == dtype
 
     def test_mgather_row_rejects_column_vector_index(self):
         span = ir.Span.unknown()

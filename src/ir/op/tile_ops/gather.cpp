@@ -162,7 +162,12 @@ static TypePtr DeduceTileGatherbType(const std::vector<ExprPtr>& args,
       << " requires offset columns to be a positive multiple of 8 (32-byte UINT32 row), but got "
       << offset_cols->value_;
 
-  const int64_t elements_per_block = 32 / static_cast<int64_t>(src_type->dtype_.GetByte());
+  const size_t element_bytes = src_type->dtype_.GetByte();
+  CHECK(element_bytes != 0 && 32 % element_bytes == 0)
+      << "The operator " << op_name
+      << " requires a byte-addressable src dtype that divides 32 bytes, but got "
+      << src_type->dtype_.ToString();
+  const int64_t elements_per_block = static_cast<int64_t>(32 / element_bytes);
   auto make_scaled_dim = [elements_per_block](const ExprPtr& dim, const char* label) -> ExprPtr {
     auto constant = As<ConstInt>(dim);
     CHECK(constant) << "tile.gatherb requires static " << label;
