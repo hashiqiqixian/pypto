@@ -450,8 +450,9 @@ REGISTER_OP("tile.part_min")
       return DeduceTileOpElementwiseBinaryType(args, kwargs, "tile.part_min");
     });
 
-static std::shared_ptr<const TileType> RequireSameMathTileType(
-    const std::vector<ExprPtr>& args, const std::vector<size_t>& operands, const std::string& op_name) {
+static std::shared_ptr<const TileType> RequireSameMathTileType(const std::vector<ExprPtr>& args,
+                                                               const std::vector<size_t>& operands,
+                                                               const std::string& op_name) {
   CHECK(!operands.empty());
   auto reference = As<TileType>(args[operands[0]]->GetType());
   CHECK(reference) << "The operator " << op_name << " requires tile operands";
@@ -530,13 +531,14 @@ static TypePtr DeduceTilePowType(const std::vector<ExprPtr>& args,
   }
   const bool is_float = base->dtype_.IsFloat();
   CHECK((is_float && args.size() == 3) || (!is_float && args.size() == 2))
-      << "The operator " << op_name << " requires tmp for floating-point dtype and forbids tmp for integer dtype";
+      << "The operator " << op_name
+      << " requires tmp for floating-point dtype and forbids tmp for integer dtype";
   bool high_precision = false;
   for (const auto& [key, value] : kwargs) {
     if (key == "high_precision") high_precision = AnyCast<bool>(value, "kwarg key: high_precision");
   }
-  CHECK(!high_precision || is_float)
-      << "The operator " << op_name << " only supports high_precision for floating-point dtype";
+  CHECK(!high_precision || is_float) << "The operator " << op_name
+                                     << " only supports high_precision for floating-point dtype";
   return CopyMathTileType(base);
 }
 

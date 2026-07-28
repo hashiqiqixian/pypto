@@ -40,6 +40,8 @@ def test_axpy_and_add_relu_preserve_destination_contract():
     axpy = tile.axpy(src, 2.0, dst)
     fused = tile.add_relu(dst, _tile("rhs"))
 
+    assert isinstance(axpy.type, ir.TileType)
+    assert isinstance(fused.type, ir.TileType)
     assert axpy.type.dtype == DataType.FP32
     assert _const_values(axpy.type.get_effective_tile_view().valid_shape) == [7, 13]
     assert fused.type.dtype == DataType.FP32
@@ -51,16 +53,26 @@ def test_float_pow_forms_require_and_accept_tmp(high_precision):
     exp = _tile("exp")
     tmp = _tile("tmp")
 
-    assert tile.pow(base, exp, tmp, high_precision=high_precision).type.dtype == DataType.FP32
-    assert tile.pows(base, 2.0, tmp, high_precision=high_precision).type.dtype == DataType.FP32
+    power = tile.pow(base, exp, tmp, high_precision=high_precision)
+    scalar_power = tile.pows(base, 2.0, tmp, high_precision=high_precision)
+
+    assert isinstance(power.type, ir.TileType)
+    assert isinstance(scalar_power.type, ir.TileType)
+    assert power.type.dtype == DataType.FP32
+    assert scalar_power.type.dtype == DataType.FP32
 
 
 def test_integer_pow_forms_omit_tmp():
     base = _tile("base", DataType.INT32)
     exp = _tile("exp", DataType.INT32)
 
-    assert tile.pow(base, exp).type.dtype == DataType.INT32
-    assert tile.pows(base, 3).type.dtype == DataType.INT32
+    power = tile.pow(base, exp)
+    scalar_power = tile.pows(base, 3)
+
+    assert isinstance(power.type, ir.TileType)
+    assert isinstance(scalar_power.type, ir.TileType)
+    assert power.type.dtype == DataType.INT32
+    assert scalar_power.type.dtype == DataType.INT32
 
 
 def test_pow_rejects_wrong_tmp_contract():
