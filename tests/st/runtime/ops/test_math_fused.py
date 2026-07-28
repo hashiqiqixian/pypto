@@ -66,8 +66,8 @@ def _add_relu_program():
             src1: pl.Tensor[[M, N], pl.FP32],
             out: pl.InOut[pl.Tensor[[M, N], pl.FP32]],
         ) -> pl.Tensor[[M, N], pl.FP32]:
-            lhs = pl.load(src0, [0, 0], [M, N], valid_shapes=VALID)
-            rhs = pl.load(src1, [0, 0], [M, N], valid_shapes=VALID)
+            lhs = pl.load(src0, [0, 0], [M, N], valid_shapes=[M, N])
+            rhs = pl.load(src1, [0, 0], [M, N], valid_shapes=[M, N])
             result = pl.tile.add_relu(lhs, rhs)
             return pl.store(result, [0, 0], out)
 
@@ -167,8 +167,9 @@ class MathFusedCase(PTOTestCase):
         return _pows_program()
 
     def compute_expected(self, tensors, params=None):
-        src0 = tensors["src0"][: VALID[0], : VALID[1]]
-        src1 = tensors["src1"][: VALID[0], : VALID[1]]
+        valid = [M, N] if self.op_name == "add_relu" else VALID
+        src0 = tensors["src0"][: valid[0], : valid[1]]
+        src1 = tensors["src1"][: valid[0], : valid[1]]
         if self.op_name == "axpy":
             expected = src1 + src0 * 2
         elif self.op_name == "add_relu":
@@ -178,7 +179,7 @@ class MathFusedCase(PTOTestCase):
         else:
             expected = torch.pow(src0, 2)
         tensors["out"].zero_()
-        tensors["out"][: VALID[0], : VALID[1]] = expected
+        tensors["out"][: valid[0], : valid[1]] = expected
 
 
 @pytest.mark.platforms("a2a3")
