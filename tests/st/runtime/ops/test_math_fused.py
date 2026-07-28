@@ -95,8 +95,8 @@ def _pow_program():
         ) -> pl.Tensor[[M, N], pl.FP32]:
             base = pl.load(src0, [0, 0], [M, N], valid_shapes=VALID)
             exp = pl.load(src1, [0, 0], [M, N], valid_shapes=VALID)
-            tmp = pl.tile.create([M, N], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            tmp = pl.tile.set_validshape(tmp, VALID[0], VALID[1])
+            tmp_raw = pl.tile.create([M, N], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            tmp = pl.tile.set_validshape(tmp_raw, VALID[0], VALID[1])
             result = pl.tile.pow(base, exp, tmp, high_precision=True)
             return pl.store(result, [0, 0], out)
 
@@ -123,8 +123,8 @@ def _pows_program():
             out: pl.InOut[pl.Tensor[[M, N], pl.FP32]],
         ) -> pl.Tensor[[M, N], pl.FP32]:
             base = pl.load(src0, [0, 0], [M, N], valid_shapes=VALID)
-            tmp = pl.tile.create([M, N], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
-            tmp = pl.tile.set_validshape(tmp, VALID[0], VALID[1])
+            tmp_raw = pl.tile.create([M, N], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
+            tmp = pl.tile.set_validshape(tmp_raw, VALID[0], VALID[1])
             result = pl.tile.pows(base, 2.0, tmp)
             return pl.store(result, [0, 0], out)
 
