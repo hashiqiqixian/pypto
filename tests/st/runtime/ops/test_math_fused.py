@@ -97,7 +97,7 @@ def _pow_program():
             exp = pl.load(src1, [0, 0], [M, N], valid_shapes=VALID)
             tmp_raw = pl.tile.create([M, N], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec)
             tmp = pl.tile.set_validshape(tmp_raw, 11, 13)
-            result = pl.tile.pow(base, exp, tmp, high_precision=True)
+            result = pl.tile.pow(base, exp, tmp)
             return pl.store(result, [0, 0], out)
 
         @pl.function(type=pl.FunctionType.Orchestration)
