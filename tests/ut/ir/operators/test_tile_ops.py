@@ -3456,13 +3456,13 @@ class TestTileBitwiseArithmeticOps:
             @pl.function(type=pl.FunctionType.InCore)
             def main(
                 self,
-                a: pl.Tensor[[128, 128], pl.UINT32],
+                a: pl.Tensor[[128, 128], pl.INT32],
                 scalar: pl.Scalar[pl.INT32],
-                output: pl.Tensor[[128, 128], pl.UINT32],
-            ) -> pl.Tensor[[128, 128], pl.UINT32]:
-                tile_a: pl.Tile[[16, 16], pl.UINT32] = pl.load(a, [0, 0], [16, 16])
-                tile_c: pl.Tile[[16, 16], pl.UINT32] = pl.shls(tile_a, scalar)
-                result: pl.Tensor[[128, 128], pl.UINT32] = pl.store(tile_c, [0, 0], output)
+                output: pl.Tensor[[128, 128], pl.INT32],
+            ) -> pl.Tensor[[128, 128], pl.INT32]:
+                tile_a: pl.Tile[[16, 16], pl.INT32] = pl.load(a, [0, 0], [16, 16])
+                tile_c: pl.Tile[[16, 16], pl.INT32] = pl.shls(tile_a, scalar)
+                result: pl.Tensor[[128, 128], pl.INT32] = pl.store(tile_c, [0, 0], output)
                 return result
 
         ir_str = str(Program)
@@ -3535,13 +3535,13 @@ class TestTileBitwiseArithmeticOps:
             @pl.function(type=pl.FunctionType.InCore)
             def main(
                 self,
-                a: pl.Tensor[[128, 128], pl.UINT32],
+                a: pl.Tensor[[128, 128], pl.INT32],
                 scalar: pl.Scalar[pl.INT32],
-                output: pl.Tensor[[128, 128], pl.UINT32],
-            ) -> pl.Tensor[[128, 128], pl.UINT32]:
-                tile_a: pl.Tile[[16, 16], pl.UINT32] = pl.load(a, [0, 0], [16, 16])
-                tile_c: pl.Tile[[16, 16], pl.UINT32] = pl.shrs(tile_a, scalar)
-                result: pl.Tensor[[128, 128], pl.UINT32] = pl.store(tile_c, [0, 0], output)
+                output: pl.Tensor[[128, 128], pl.INT32],
+            ) -> pl.Tensor[[128, 128], pl.INT32]:
+                tile_a: pl.Tile[[16, 16], pl.INT32] = pl.load(a, [0, 0], [16, 16])
+                tile_c: pl.Tile[[16, 16], pl.INT32] = pl.shrs(tile_a, scalar)
+                result: pl.Tensor[[128, 128], pl.INT32] = pl.store(tile_c, [0, 0], output)
                 return result
 
         ir_str = str(Program)
