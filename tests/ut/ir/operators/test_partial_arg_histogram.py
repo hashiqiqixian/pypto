@@ -49,8 +49,8 @@ def test_partial_arg_contract_returns_value_and_index_tiles(op, value_dtype, ind
     assert isinstance(index_type, ir.TileType)
     assert value_type.dtype == value_dtype
     assert index_type.dtype == index_dtype
-    assert [dim.value for dim in value_type.tile_view.valid_shape] == [8, 16]
-    assert [dim.value for dim in index_type.tile_view.valid_shape] == [8, 16]
+    assert [dim.value for dim in value_type.get_effective_tile_view().valid_shape] == [8, 16]
+    assert [dim.value for dim in index_type.get_effective_tile_view().valid_shape] == [8, 16]
 
 
 @pytest.mark.parametrize("op", [tile.part_argmax, tile.part_argmin])
@@ -79,7 +79,7 @@ def test_histogram_contract_uint16(byte):
     assert isinstance(call.type, ir.TileType)
     assert call.type.dtype == DataType.UINT32
     assert [dim.value for dim in call.type.shape] == [8, 256]
-    assert [dim.value for dim in call.type.tile_view.valid_shape] == [7, 256]
+    assert [dim.value for dim in call.type.get_effective_tile_view().valid_shape] == [7, 256]
 
 
 @pytest.mark.parametrize("byte,rows", [(0, 3), (1, 2), (2, 1), (3, 1)])
