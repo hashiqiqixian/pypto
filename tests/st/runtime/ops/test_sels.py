@@ -420,6 +420,8 @@ class TestTileSels:
         [
             pytest.param((1, 64), id="one-row"),
             pytest.param((64, 16), id="tall-narrow"),
+            pytest.param((2, 256), id="packed-32-byte-boundary"),
+            pytest.param((2, 257), id="packed-33-byte-boundary"),
         ],
     )
     def test_boundary_physical_shapes(self, test_runner, platform, physical_shape):

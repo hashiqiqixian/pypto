@@ -219,7 +219,7 @@ packed predicate mask；A2/A3 上如需得到数值结果，请配合 `sel` 和�
 | `cmp` | `(lhs: Tile, rhs: Tile, cmp_type: int = 0) -> Tile` | 比较两个 tile |
 | `cmps` | `(lhs: Tile, rhs: int \| float \| Scalar, cmp_type: int = 0) -> Tile` | tile 与标量比较 |
 | `sel` | `(mask: Tile, lhs: Tile, rhs: Tile, tmp: Tile) -> Tile` | 选择：`mask 为真取 lhs，否则取 rhs`；`tmp` 是 TSEL scratch |
-| `sels` | `(lhs: Tile, rhs: Tile, select_mode: int \| float \| Scalar) -> Tile` | 按标量模式选择 |
+| `sels` | `(mask: Tile, src: Tile, tmp: Tile, scalar: int \| float \| Scalar) -> Tile` | `mask` 为真时选择 `src`，否则选择 `scalar`；`mask` 的有效行数和每行 packed 字节数必须足以覆盖 `src`；A2/A3 支持有符号/无符号 16/32 位整数及 FP16/FP32，A5 还支持有符号/无符号 8 位整数 |
 
 ## 位运算（`pl.tile.*`）
 
@@ -251,7 +251,7 @@ packed predicate mask；A2/A3 上如需得到数值结果，请配合 `sel` 和�
 | ---- | ---- | ---- |
 | `relu` | `(tile: Tile) -> Tile` | ReLU：`max(0, x)` |
 | `lrelu` | `(tile: Tile, slope: int \| float \| Scalar) -> Tile` | 带标量斜率的 Leaky ReLU |
-| `prelu` | `(tile: Tile, slope: Tile, tmp: Tile) -> Tile` | 参数化 ReLU（需要 tmp） |
+| `prelu` | `(tile: Tile, slope: Tile, tmp: Tile) -> Tile` | FP16/FP32 参数化 ReLU；A2/A3 要求 `tile`、`slope`、`tmp`、结果的内存区间两两不重叠，并需要 UINT8 packed-mask 临时空间；A5 不向 intrinsic 传入 `tmp`，允许 `tile`/`slope` 重叠及 `tmp`/结果 alias，但结果仍须与有效输入分离 |
 
 ## 形状操作（`pl.tile.*`）
 

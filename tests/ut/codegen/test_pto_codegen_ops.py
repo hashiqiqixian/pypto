@@ -15,6 +15,7 @@ each operation type, compiles them through the PassManager and PTOCodegen,
 and verifies the generated orchestration code.
 """
 
+import re
 import warnings
 
 import pypto
@@ -759,12 +760,18 @@ class TestB02SelectionAndPreluCodegen:
         return line
 
     @staticmethod
-    def _ins_operand_count(line: str) -> int:
-        ins_start = line.find("ins(")
-        ins_end = line.find(")", ins_start)
-        assert ins_start != -1 and ins_end != -1, f"ins(...) clause not found in: {line}"
-        operands = line[ins_start + len("ins(") : ins_end].split(":", 1)[0]
-        return operands.count(",") + 1
+    def _ins_outs_ssas(line: str) -> tuple[list[str], list[str]]:
+        match = re.fullmatch(r"\s*pto\.\w+\s+ins\((.*?)\)\s+outs\((.*?)\)\s*", line)
+        assert match, f"expected exact PTO ins(...)/outs(...) form, got: {line}"
+        ins = re.findall(r"%[\w.$-]+", match.group(1).split(":", 1)[0])
+        outs = re.findall(r"%[\w.$-]+", match.group(2).split(":", 1)[0])
+        return ins, outs
+
+    @staticmethod
+    def _assert_named_ssas(ssas: list[str], expected_names: list[str]) -> None:
+        assert len(ssas) == len(expected_names)
+        for ssa, expected_name in zip(ssas, expected_names, strict=True):
+            assert expected_name in ssa, f"expected {expected_name!r} SSA at this position, got {ssa!r}"
 
     def test_tsels_emits_mask_src_tmp_and_typed_scalar(self):
         @pl.program
@@ -782,8 +789,14 @@ class TestB02SelectionAndPreluCodegen:
                 return pl.store(result, [0, 0], out)
 
         for backend_type in (BackendType.Ascend910B, BackendType.Ascend950):
-            line = self._op_line(self._generate_mlir(Prog, backend_type), "pto.tsels")
-            assert self._ins_operand_count(line) == 4
+            mlir = self._generate_mlir(Prog, backend_type)
+            line = self._op_line(mlir, "pto.tsels")
+            ins, outs = self._ins_outs_ssas(line)
+            scalar = re.search(r"^\s*(%[\w.$-]+)\s*=\s*arith\.constant -3 : i32\s*$", mlir, re.MULTILINE)
+            assert scalar
+            self._assert_named_ssas(ins[:3], ["mask", "src_tile", "tmp"])
+            assert ins[3:] == [scalar.group(1)]
+            self._assert_named_ssas(outs, ["result"])
             assert "i32" in line
 
     def test_tsels_unsigned_src_emits_signed_bit_compatible_scalar(self):
@@ -803,10 +816,18 @@ class TestB02SelectionAndPreluCodegen:
 
         mlir = self._generate_mlir(Prog)
         line = self._op_line(mlir, "pto.tsels")
-        assert self._ins_operand_count(line) == 4
+        ins, outs = self._ins_outs_ssas(line)
+        scalar = re.search(
+            r"^\s*(%[\w.$-]+)\s*=\s*arith\.constant -2147483637 : i32\s*$",
+            mlir,
+            re.MULTILINE,
+        )
+        assert scalar
+        self._assert_named_ssas(ins[:3], ["mask", "src_tile", "tmp"])
+        assert ins[3:] == [scalar.group(1)]
+        self._assert_named_ssas(outs, ["result"])
         assert "ui32" in line
         assert "i32" in line
-        assert "arith.constant -2147483637 : i32" in mlir
 
     def test_tsels_rejects_int8_on_a2a3(self):
         @pl.program
@@ -826,7 +847,7 @@ class TestB02SelectionAndPreluCodegen:
         with pytest.raises(ValueError, match="only supported on the 'a5' backend"):
             self._generate_mlir(Prog)
 
-    def test_tprelu_emits_src_slope_and_tmp(self):
+    def test_tprelu_emits_target_specific_exact_operands(self):
         @pl.program
         class Prog:
             @pl.function(type=pl.FunctionType.InCore)
@@ -842,8 +863,15 @@ class TestB02SelectionAndPreluCodegen:
                 result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
                 return pl.store(result, [0, 0], out)
 
-        line = self._op_line(self._generate_mlir(Prog), "pto.tprelu")
-        assert self._ins_operand_count(line) == 3
+        a3_line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend910B), "pto.tprelu")
+        a3_ins, a3_outs = self._ins_outs_ssas(a3_line)
+        self._assert_named_ssas(a3_ins, ["src_tile", "slope_tile", "tmp"])
+        self._assert_named_ssas(a3_outs, ["result"])
+
+        a5_line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
+        a5_ins, a5_outs = self._ins_outs_ssas(a5_line)
+        self._assert_named_ssas(a5_ins, ["src_tile", "slope_tile"])
+        self._assert_named_ssas(a5_outs, ["result"])
 
     def test_tprelu_signed_scratch_is_a5_only(self):
         """A2/A3 requires UINT8 scratch even though the pinned verifier accepts signed i8."""
@@ -866,7 +894,63 @@ class TestB02SelectionAndPreluCodegen:
         with pytest.raises(ValueError, match="A2/A3 requires UINT8 tmp scratch"):
             self._generate_mlir(Prog, BackendType.Ascend910B)
         line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
-        assert self._ins_operand_count(line) == 3
+        ins, outs = self._ins_outs_ssas(line)
+        self._assert_named_ssas(ins, ["src_tile", "slope_tile"])
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tprelu_a3_rejects_overlapping_views_but_a5_accepts_them(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 24], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                base: pl.Tile[[16, 24], pl.FP32] = pl.load(src, [0, 0], [16, 24])
+                src_view: pl.Tile[[16, 16], pl.FP32] = pl.tile.slice(base, [16, 16], [0, 0])
+                slope_view: pl.Tile[[16, 16], pl.FP32] = pl.tile.slice(base, [16, 16], [0, 8])
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.tile.create([17, 32], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_view, slope_view, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="src overlaps slope"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        mlir = self._generate_mlir(Prog, BackendType.Ascend950)
+        line = self._op_line(mlir, "pto.tprelu")
+        ins, outs = self._ins_outs_ssas(line)
+        subview_results = [
+            subview_line.split("=", 1)[0].strip()
+            for subview_line in mlir.splitlines()
+            if "= pto.subview " in subview_line
+        ]
+        assert ins == subview_results[:2]
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tprelu_undersized_tmp_is_a3_only_validation(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(slope, [0, 0], [16, 16])
+                tmp: pl.Tile[[1, 1], pl.UINT8] = pl.tile.create([1, 1], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="physical rows"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
+        ins, outs = self._ins_outs_ssas(line)
+        self._assert_named_ssas(ins, ["src_tile", "slope_tile"])
+        self._assert_named_ssas(outs, ["result"])
 
 
 class TestTileReadWriteOffsetCodegen:

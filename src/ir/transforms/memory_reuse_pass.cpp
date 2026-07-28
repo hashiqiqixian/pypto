@@ -309,6 +309,13 @@ inline bool SubtreeWritesBase(const StmtPtr& stmt, const Var* target_base) {
   return c.bases.count(target_base) > 0;
 }
 
+bool IsA5Prelu(const CallPtr& call) {
+  if (!IsOp(call, "tile.prelu")) return false;
+  if (!backend::BackendConfig::IsConfigured()) return false;
+  const auto* ctx = PassContext::Current();
+  return ctx != nullptr && ctx->GetBackendHandler()->GetPtoTargetArch() == "a5";
+}
+
 /// Plans top-down retypes. Produces (old Var -> new Type) map.
 class TopDownRetargeter {
  public:
@@ -593,7 +600,10 @@ class TopDownRetargeter {
     if (HasKwarg(*call, "target_memory") && !TargetMemoryKwargMatches(*call, target_memory)) {
       return false;
     }
-    if (!entry.IsInplaceSafe() && CallReadsBase(*call, target->base_.get())) return false;
+    if (!entry.IsInplaceSafe()) {
+      const size_t read_arg_count = IsA5Prelu(call) ? 2 : call->args_.size();
+      if (CallReadsBase(*call, target->base_.get(), read_arg_count)) return false;
+    }
 
     // Unconstrained: check liveness, then plan retype.  (Skipped for if-phi
     // branch coalescing, where branch exclusivity is a stronger guarantee.)
@@ -605,9 +615,11 @@ class TopDownRetargeter {
   /// True if any argument of the call is a TileType Var whose MemRef base
   /// is `target_base`.  Used to detect would-be in-place execution before
   /// we retype the output onto the same buffer.
-  static bool CallReadsBase(const Call& call, const Var* target_base) {
+  static bool CallReadsBase(const Call& call, const Var* target_base, size_t arg_count) {
     SubtreeReadBaseCollector c;
-    for (const auto& arg : call.args_) c.VisitExpr(arg);
+    for (size_t i = 0; i < std::min(arg_count, call.args_.size()); ++i) {
+      c.VisitExpr(call.args_[i]);
+    }
     return c.bases.count(target_base) > 0;
   }
 
@@ -1576,8 +1588,10 @@ class ForbidAliasCollector : public IRVisitor {
           }
         };
         if (!entry.IsInplaceSafe()) {
-          // src != dst required: the output must not alias any input operand.
-          for (size_t i = 0; i < call->args_.size(); ++i) forbid_arg(i);
+          // Non-in-place ops forbid output aliasing active inputs. A5 TPRELU
+          // omits tmp (arg 2), so only src and slope remain active.
+          const size_t forbidden_arg_count = IsA5Prelu(call) ? 2 : call->args_.size();
+          for (size_t i = 0; i < forbidden_arg_count; ++i) forbid_arg(i);
         } else {
           for (size_t i : entry.ForbidOutputAliasArgs()) forbid_arg(i);
         }

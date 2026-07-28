@@ -15,6 +15,7 @@
  */
 
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -30,9 +31,11 @@
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memref.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
+#include "pypto/ir/type_inference.h"
 #include "src/backend/common/pto_ops_internal.h"
 
 namespace pypto {
@@ -370,13 +373,83 @@ static std::string MakeSelsCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
 static std::string MakePreluCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
   CheckArity(op, "pto.tprelu", 3);
+  auto src_type = As<ir::TileType>(op->args_[0]->GetType());
+  auto slope_type = As<ir::TileType>(op->args_[1]->GetType());
   auto tmp_type = As<ir::TileType>(op->args_[2]->GetType());
-  INTERNAL_CHECK(tmp_type);
-  if (codegen.GetBackendHandler()->GetPtoTargetArch() != "a5") {
-    CHECK_SPAN(tmp_type->dtype_ == DataType::UINT8, op->args_[2]->span_)
-        << "tile.prelu on A2/A3 requires UINT8 tmp scratch, but got " << tmp_type->dtype_.ToString();
+  INTERNAL_CHECK(src_type && slope_type && tmp_type);
+
+  auto dst_var = codegen.GetCurrentResultVar();
+  INTERNAL_CHECK_SPAN(dst_var, op->span_) << "Internal error: tile.prelu requires an assignment target";
+  auto dst_type = As<ir::TileType>(dst_var->GetType());
+  INTERNAL_CHECK_SPAN(dst_type, op->span_) << "Internal error: tile.prelu result must be a TileType";
+
+  if (codegen.GetBackendHandler()->GetPtoTargetArch() == "a5") {
+    INTERNAL_CHECK_SPAN(src_type->memref_.has_value(), op->span_)
+        << "Internal error: tile.prelu src must carry a MemRef before PTO codegen";
+    INTERNAL_CHECK_SPAN(slope_type->memref_.has_value(), op->span_)
+        << "Internal error: tile.prelu slope must carry a MemRef before PTO codegen";
+    INTERNAL_CHECK_SPAN(dst_type->memref_.has_value(), op->span_)
+        << "Internal error: tile.prelu dst must carry a MemRef before PTO codegen";
+    CHECK_SPAN(!ir::MemRef::MayAlias(*src_type->memref_, *dst_type->memref_), op->span_)
+        << "tile.prelu on A5 requires dst not to overlap src";
+    CHECK_SPAN(!ir::MemRef::MayAlias(*slope_type->memref_, *dst_type->memref_), op->span_)
+        << "tile.prelu on A5 requires dst not to overlap slope";
+    EmitInsOuts(codegen, "pto.tprelu",
+                {{codegen.GetExprAsCode(op->args_[0]), codegen.GetExprTypeAnnotation(op->args_[0])},
+                 {codegen.GetExprAsCode(op->args_[1]), codegen.GetExprTypeAnnotation(op->args_[1])}});
+    return "";
   }
-  return MakeNaryCodegenPTO("pto.tprelu", 3, op, codegen_base);
+
+  CHECK_SPAN(tmp_type->dtype_ == DataType::UINT8, op->args_[2]->span_)
+      << "tile.prelu on A2/A3 requires UINT8 tmp scratch, but got " << tmp_type->dtype_.ToString();
+  const auto src_valid_shape = ir::GetValidShape(src_type);
+  const auto tmp_valid_shape = ir::GetValidShape(tmp_type);
+  const auto required_rows =
+      ir::MakeAdd(src_valid_shape[0], std::make_shared<ir::ConstInt>(1, DataType::INDEX, op->span_), op->span_);
+  ir::ExprPtr required_cols;
+  if (auto const_cols = As<ir::ConstInt>(src_valid_shape[1])) {
+    required_cols =
+        std::make_shared<ir::ConstInt>((const_cols->value_ + 7) / 8, DataType::INDEX, const_cols->span_);
+  } else {
+    required_cols = ir::MakeFloorDiv(
+        ir::MakeAdd(src_valid_shape[1],
+                    std::make_shared<ir::ConstInt>(7, DataType::INDEX, src_valid_shape[1]->span_),
+                    src_valid_shape[1]->span_),
+        std::make_shared<ir::ConstInt>(8, DataType::INDEX, src_valid_shape[1]->span_),
+        src_valid_shape[1]->span_);
+  }
+  CHECK_SPAN(ir::ProveValidExtentLessEqual(required_rows, tmp_type->shape_[0]) !=
+                 ir::ProofResult::kFalse,
+             op->args_[2]->span_)
+      << "tile.prelu on A2/A3 requires UINT8 tmp physical rows >= src valid rows + 1";
+  CHECK_SPAN(ir::ProveValidExtentLessEqual(required_cols, tmp_valid_shape[1]) !=
+                 ir::ProofResult::kFalse,
+             op->args_[2]->span_)
+      << "tile.prelu on A2/A3 requires UINT8 tmp valid columns >= ceil(src valid columns / 8)";
+
+  std::vector<std::pair<std::string_view, std::shared_ptr<const ir::TileType>>> operands = {
+      {"src", src_type}, {"slope", slope_type}, {"tmp", tmp_type}, {"dst", dst_type}};
+  std::vector<std::pair<std::string_view, ir::MemRefPtr>> regions;
+  regions.reserve(operands.size());
+  for (const auto& [name, type] : operands) {
+    INTERNAL_CHECK_SPAN(type->memref_.has_value(), op->span_)
+        << "Internal error: tile.prelu " << name << " must carry a MemRef before PTO codegen";
+    regions.emplace_back(name, *type->memref_);
+  }
+  for (size_t i = 0; i < regions.size(); ++i) {
+    for (size_t j = i + 1; j < regions.size(); ++j) {
+      CHECK_SPAN(!ir::MemRef::MayAlias(regions[i].second, regions[j].second), op->span_)
+          << "tile.prelu on A2/A3 requires src, slope, tmp, and dst to use pairwise non-overlapping "
+             "memory regions, but "
+          << regions[i].first << " overlaps " << regions[j].first;
+    }
+  }
+
+  EmitInsOuts(codegen, "pto.tprelu",
+              {{codegen.GetExprAsCode(op->args_[0]), codegen.GetExprTypeAnnotation(op->args_[0])},
+               {codegen.GetExprAsCode(op->args_[1]), codegen.GetExprTypeAnnotation(op->args_[1])},
+               {codegen.GetExprAsCode(op->args_[2]), codegen.GetExprTypeAnnotation(op->args_[2])}});
+  return "";
 }
 
 struct SimpleOpEntry {
@@ -533,7 +606,8 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   if (exclude_ops.count("tile.prelu") == 0) {
     auto entry = backend.RegisterOp("tile.prelu");
     entry.f_codegen(MakePreluCodegenPTO);
-    for (size_t i = 0; i < 3; ++i) {
+    const size_t emitted_input_count = backend.GetHandler()->GetPtoTargetArch() == "a5" ? 2 : 3;
+    for (size_t i = 0; i < emitted_input_count; ++i) {
       entry.set_input_layout(i, ir::TileLayout::row_major);
     }
     entry.set_output_layout(ir::TileLayout::row_major);

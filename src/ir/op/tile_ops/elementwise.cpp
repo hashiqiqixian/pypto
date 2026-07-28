@@ -863,8 +863,7 @@ REGISTER_OP("tile.xors")
 
 // Type deduction for tile.prelu (Src x Slope x Tmp -> Tile).
 // TPRELU requires src, slope, and dst to share their dtype, physical shape, and
-// valid region. A2/A3 requires an 8-bit integer scratch tile with packed-mask
-// extents; A5 keeps tmp only as an ABI placeholder and accepts any tile dtype.
+// valid region. Target-specific tmp and alias rules are checked during codegen.
 TypePtr DeduceTilePreluType(const std::vector<ExprPtr>& args,
                             const std::vector<std::pair<std::string, std::any>>& kwargs,
                             const std::string& op_name) {
@@ -880,9 +879,6 @@ TypePtr DeduceTilePreluType(const std::vector<ExprPtr>& args,
   CHECK_SPAN(slope_type, args[1]->span_)
       << "The operator " << op_name << " requires slope to be a TileType, but got "
       << args[1]->GetType()->TypeName();
-  CHECK_SPAN(args[0] != args[1], args[1]->span_)
-      << "The operator " << op_name
-      << " requires src and slope to be distinct tiles because A2/A3 TPRELU forbids overlapping inputs";
   CHECK_SPAN(tmp_type, args[2]->span_)
       << "The operator " << op_name << " requires tmp to be a TileType, but got "
       << args[2]->GetType()->TypeName();
@@ -922,24 +918,6 @@ TypePtr DeduceTilePreluType(const std::vector<ExprPtr>& args,
   CHECK_SPAN(tmp_type->shape_.size() == 2, args[2]->span_)
       << "The operator " << op_name << " requires a rank-2 tmp tile, but got rank "
       << tmp_type->shape_.size();
-  if (tmp_type->dtype_ == DataType::INT8 || tmp_type->dtype_ == DataType::UINT8) {
-    const auto tmp_valid_shape = GetValidShape(tmp_type);
-    const auto required_rows = MakeAdd(src_valid_shape[0], MakeIndexConst(1), args[2]->span_);
-    // PTOAS reserves an extra physical scratch row, while the packed predicate
-    // bytes must be inside the scratch tile's usable (valid) column extent.
-    const auto required_cols = MakeCeilDivIndex(src_valid_shape[1], kPackedPredicateBitsPerByte);
-    CHECK_SPAN(ProveValidExtentLessEqual(required_rows, tmp_type->shape_[0]) != ProofResult::kFalse,
-               args[2]->span_)
-        << "The operator " << op_name
-        << " requires 8-bit integer tmp physical rows >= src valid rows + 1, but got tmp shape "
-        << FormatShape(tmp_type->shape_) << " and src valid_shape " << FormatShape(src_valid_shape);
-    CHECK_SPAN(ProveValidExtentLessEqual(required_cols, tmp_valid_shape[1]) != ProofResult::kFalse,
-               args[2]->span_)
-        << "The operator " << op_name
-        << " requires 8-bit integer tmp valid columns >= ceil(src valid columns / 8), but got tmp "
-           "valid_shape "
-        << FormatShape(tmp_valid_shape) << " and src valid_shape " << FormatShape(src_valid_shape);
-  }
 
   TileView tile_view;
   tile_view.valid_shape = src_valid_shape;
@@ -1147,8 +1125,29 @@ TypePtr DeduceTileSelsType(const std::vector<ExprPtr>& args,
       << "The operator " << op_name << " requires scalar dtype " << expected_scalar_dtype.ToString()
       << " for src dtype " << src_type->dtype_.ToString() << ", but got " << scalar_type->dtype_.ToString();
 
+  const auto mask_valid_shape = GetValidShape(mask_type);
+  const auto src_valid_shape = GetValidShape(src_type);
+  CHECK_SPAN(ProveValidExtentLessEqual(src_valid_shape[0], mask_valid_shape[0]) == ProofResult::kTrue,
+             args[0]->span_)
+      << "The operator " << op_name
+      << " requires mask carrier rows to cover src valid rows, but got mask valid_shape "
+      << FormatShape(mask_valid_shape) << " and src valid_shape " << FormatShape(src_valid_shape);
+  const auto required_mask_bytes =
+      MakeCeilDivIndex(src_valid_shape[1], kPackedPredicateBitsPerByte);
+  const auto mask_row_bytes = MakeMul(
+      mask_valid_shape[1],
+      MakeIndexConst(static_cast<int64_t>(mask_type->dtype_.GetByte()), args[0]->span_),
+      args[0]->span_);
+  CHECK_SPAN(ProveValidExtentLessEqual(required_mask_bytes, mask_row_bytes) == ProofResult::kTrue,
+             args[0]->span_)
+      << "The operator " << op_name
+      << " requires each mask carrier row to hold at least ceil(src valid columns / 8) packed bytes, "
+         "but got mask valid_shape "
+      << FormatShape(mask_valid_shape) << " with dtype " << mask_type->dtype_.ToString()
+      << " and src valid_shape " << FormatShape(src_valid_shape);
+
   TileView tile_view;
-  tile_view.valid_shape = GetValidShape(src_type);
+  tile_view.valid_shape = src_valid_shape;
   InheritTileViewLayout(tile_view, src_type);
   return std::make_shared<TileType>(src_type->shape_, src_type->dtype_, std::nullopt, tile_view);
 }

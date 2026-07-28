@@ -73,6 +73,8 @@ program_optimized = reuse_pass(program)
   | `tile.fmod`, `tile.fmods` | `not_inplace_safe` | `TFMOD`/`TFMODS` compute `a - trunc(a/b)*b` by overwriting `dst = a/b` first, then re-reading the original `src0` (`a`) for the final subtraction; when `dst == src0` that subtraction sees the already-clobbered quotient and yields `0` for every element |
   | `tile.transpose` | `not_inplace_safe` | `pto.ttrans` is not in-place safe: the a2a3 unaligned scalar path writes `dst` directly from `src` (no tmp staging), so `dst == src` corrupts the data mid-write. The output always gets a fresh buffer (also enforced in InitMemRef, which never inherits the input's buffer for it). |
   | `tile.sel` | `forbid_output_alias(0)` (mask), `(3)` (tmp) | `TSEL` reads the predicate mask + tmp scratch while writing `dst` |
+  | `tile.sels` | `forbid_output_alias(0)` (mask), `(2)` (tmp) | `TSELS` reads the predicate mask + tmp scratch while writing `dst`; reusing `src` remains legal |
+  | `tile.prelu` | target-aware | A2/A3 is `not_inplace_safe` because `TPRELU` reads `src`, `slope`, and `tmp` while writing `dst`; A5 omits `tmp`, so `dst` may reuse `tmp` but not the active `src`/`slope` inputs |
   | `tile.{row,col}_expand{,_mul,_add,_sub,_div}` | `forbid_output_alias(1)` (broadcast vector) | the row/col vector (arg 1) is re-read for **every** output row/col, so an output aliasing it is overwritten after the first row/col |
   | `tile.cast` (widening only) | output ≠ input buffer (conditional, in `ForbidAliasCollector`) | wider output's write cursor outruns the read cursor (see above) |
 
@@ -240,7 +242,8 @@ passes.def("memory_reuse", &pass::MemoryReuse, "Memory reuse optimization");
 - Tests cross-dtype / cross-`TileView` reuse (now permitted: BF16↔FP32, fillpad output↔input, divergent `valid_shape`)
 - Tests the no-alias guard (`TestForbidOutputAlias` + `TestInplaceOps`), one case per constraint above:
   - `tile.recip` / `tile.rsqrt` / `tile.row_sum` — output must not alias input (`not_inplace_safe`)
-  - `tile.sel` — output must not alias the mask / tmp (`forbid_output_alias`)
+  - `tile.sel` / `tile.sels` — output must not alias the mask / tmp (`forbid_output_alias`)
+  - `tile.prelu` — A2/A3 output must not alias any input; A5 output may alias only the unused `tmp`
   - `tile.col_expand_mul` — output must not alias the broadcast vector
   - widening `tile.cast` — output must not alias the (narrower) input
   - a forbidden operand reached through a VIEW is still honored (physical-buffer resolution)

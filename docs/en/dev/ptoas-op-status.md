@@ -100,7 +100,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tpartargmax | TPARTARGMAX | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
 | pto.tpartargmin | TPARTARGMIN | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING: lacks a complete frontend/codegen/ST path |
 | pto.tpartmul | TPARTMUL | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.tprelu | TPRELU | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
+| pto.tprelu | TPRELU | tile | ✅ | ✅ | ❌ | ✅ | — | canonical 3-input path; verified on A2/A3 hardware, A5 hardware verification pending |
 | pto.tadds | TADDS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tsubs | TSUBS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | verified on A2/A3 hardware; A5 hardware verification pending |
 | pto.tmuls | TMULS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
@@ -165,7 +165,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.tcmp | TCMP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tcmps | TCMPS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tsel | TSEL | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ❌ | — | frontend/codegen path exists; same-name ST is missing |
+| pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ✅ | — | canonical 4-input path; verified on A2/A3 hardware, A5 hardware verification pending |
 | **Bitwise Operations (11)** |  |  |  |  |  |  |  |  |
 | pto.tand | TAND | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | pto.tor | TOR | tile | ✅ | ✅ | ❌ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |

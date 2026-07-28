@@ -86,7 +86,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tpartargmax | TPARTARGMAX | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
 | pto.tpartargmin | TPARTARGMIN | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
 | pto.tpartmul | TPARTMUL | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.tprelu | TPRELU | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
+| pto.tprelu | TPRELU | tile | ✅ | ✅ | ❌ | ✅ | — | 已补齐规范 3 输入链路；A2/A3 真机已验证，A5 真机待验证 |
 | pto.tadds | TADDS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tsubs | TSUBS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 真机已验证；A5 真机待验证 |
 | pto.tmuls | TMULS | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
@@ -151,7 +151,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tcmp | TCMP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tcmps | TCMPS | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tsel | TSEL | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ❌ | — | 前端/codegen 已有，缺同名 ST |
+| pto.tsels | TSELS | tile | ✅ | ✅ | ❌ | ✅ | — | 已补齐规范 4 输入链路；A2/A3 真机已验证，A5 真机待验证 |
 | **位运算（11）** |  |  |  |  |  |  |  |  |
 | pto.tand | TAND | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
 | pto.tor | TOR | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |

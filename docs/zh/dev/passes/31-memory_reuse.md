@@ -73,6 +73,8 @@ program_optimized = reuse_pass(program)
   | `tile.fmod`、`tile.fmods` | `not_inplace_safe` | `TFMOD`/`TFMODS` 按 `a - trunc(a/b)*b` 计算，先用 `dst = a/b` 覆盖输出，再重新读取原始 `src0`（`a`）做最后的减法；当 `dst == src0` 时该减法读到的是已被覆盖的商，导致每个元素都算成 `0` |
   | `tile.transpose` | `not_inplace_safe` | `pto.ttrans` 非 in-place 安全：a2a3 非对齐标量路径直接从 `src` 写 `dst`（不经 tmp 暂存），`dst == src` 会边写边读损坏数据。输出始终分配新 buffer（InitMemRef 也不会为其继承输入的 buffer）。 |
   | `tile.sel` | `forbid_output_alias(0)`（mask）、`(3)`（tmp） | `TSEL` 在写 `dst` 时读取 mask + tmp scratch |
+  | `tile.sels` | `forbid_output_alias(0)`（mask）、`(2)`（tmp） | `TSELS` 在写 `dst` 时读取 mask + tmp scratch；仍允许复用 `src` |
+  | `tile.prelu` | 感知 target | A2/A3 的 `TPRELU` 在写 `dst` 时读取 `src`、`slope` 与 `tmp`，因此是 `not_inplace_safe`；A5 不传入 `tmp`，所以 `dst` 可复用 `tmp`，但不可复用仍参与运算的 `src`/`slope` |
   | `tile.{row,col}_expand{,_mul,_add,_sub,_div}` | `forbid_output_alias(1)`（广播向量） | 行/列向量（arg 1）会被**每个**输出行/列重读,输出若 alias 它则在第一行/列后被覆盖 |
   | `tile.cast`（仅升精度） | 输出 ≠ 输入缓冲区（条件式,在 `ForbidAliasCollector`） | 更宽的输出写指针超前于读指针（见上） |
 
@@ -233,7 +235,8 @@ passes.def("memory_reuse", &pass::MemoryReuse, "Memory reuse optimization");
 - 测试跨 dtype / 跨 `TileView` 复用（现已允许：BF16↔FP32、fillpad 输出↔输入、`valid_shape` 不同）
 - 测试 no-alias 守护（`TestForbidOutputAlias` + `TestInplaceOps`），上表每条约束一个用例：
   - `tile.recip` / `tile.rsqrt` / `tile.row_sum` —— 输出不得 alias 输入（`not_inplace_safe`）
-  - `tile.sel` —— 输出不得 alias mask / tmp（`forbid_output_alias`）
+  - `tile.sel` / `tile.sels` —— 输出不得 alias mask / tmp（`forbid_output_alias`）
+  - `tile.prelu` —— A2/A3 输出不得 alias 任一输入；A5 输出仅可 alias 未使用的 `tmp`
   - `tile.col_expand_mul` —— 输出不得 alias 广播向量
   - 升精度 `tile.cast` —— 输出不得 alias（更窄的）输入
   - 经 VIEW 间接到达的禁止操作数也被遵守（物理缓冲区解析）

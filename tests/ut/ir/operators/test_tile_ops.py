@@ -3636,26 +3636,27 @@ class TestTileBitwiseArithmeticOps:
         assert [dim.value for dim in result.shape if isinstance(dim, ir.ConstInt)] == [16, 16]
         assert _valid_of(result) == [8, 12]
 
-    def test_tile_prelu_accepts_arbitrary_placeholder_tmp_for_a5(self):
-        """A5 keeps tmp only as a tile-typed ABI placeholder."""
+    def test_tile_prelu_defers_target_specific_tmp_validation(self):
+        """IR deduction accepts a small UINT8 placeholder; A2/A3 validates it in codegen."""
         span = ir.Span.unknown()
         src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
         slope = ir.Var("slope", ir.TileType([16, 16], DataType.FP32), span)
-        tmp = ir.Var("tmp", ir.TileType([1, 1], DataType.INT32), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 1], DataType.UINT8), span)
 
         result = tile.prelu(src, slope, tmp).type
 
         assert isinstance(result, ir.TileType)
         assert result.dtype == DataType.FP32
 
-    def test_tile_prelu_rejects_same_src_and_slope(self):
-        """A2/A3 requires source, slope, scratch, and destination storage to be distinct."""
+    def test_tile_prelu_defers_alias_validation_to_target_codegen(self):
+        """Expression identity is not an alias proof, and A5 permits overlapping operands."""
         span = ir.Span.unknown()
         src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
         tmp = ir.Var("tmp", ir.TileType([17, 32], DataType.UINT8), span)
 
-        with pytest.raises(ValueError, match="src and slope to be distinct"):
-            tile.prelu(src, src, tmp)
+        result = tile.prelu(src, src, tmp)
+
+        assert isinstance(result.type, ir.TileType)
 
     @pytest.mark.parametrize(
         "slope_type,error",
@@ -3678,25 +3679,14 @@ class TestTileBitwiseArithmeticOps:
         with pytest.raises(ValueError, match=error):
             tile.prelu(src, slope, tmp)
 
-    @pytest.mark.parametrize(
-        "tmp_type,error",
-        [
-            (ir.TileType([16], DataType.UINT8), "rank-2 tmp"),
-            (ir.TileType([16, 32], DataType.UINT8), "physical rows"),
-            (
-                ir.TileType([17, 1], DataType.UINT8, tile_view=ir.TileView(valid_shape=[17, 1])),
-                "valid columns",
-            ),
-        ],
-    )
-    def test_tile_prelu_rejects_invalid_tmp(self, tmp_type, error):
-        """TPRELU rejects invalid scratch dtype, rank, and minimum extents."""
+    def test_tile_prelu_rejects_non_rank2_tmp(self):
+        """The target-independent ABI still requires a rank-2 tile placeholder."""
         span = ir.Span.unknown()
         src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
         slope = ir.Var("slope", ir.TileType([16, 16], DataType.FP32), span)
-        tmp = ir.Var("tmp", tmp_type, span)
+        tmp = ir.Var("tmp", ir.TileType([16], DataType.UINT8), span)
 
-        with pytest.raises(ValueError, match=error):
+        with pytest.raises(ValueError, match="rank-2 tmp"):
             tile.prelu(src, slope, tmp)
 
     def test_tile_not(self):
@@ -3913,6 +3903,59 @@ class TestTileBitwiseArithmeticOps:
 
         with pytest.raises(ValueError, match=error):
             tile.sels(mask, src, tmp, -1.0)
+
+    @pytest.mark.parametrize(
+        "mask_type,error",
+        [
+            (
+                ir.TileType([7, 64], DataType.UINT8),
+                "mask carrier rows",
+            ),
+            (
+                ir.TileType([8, 32], DataType.UINT8),
+                "each mask carrier row",
+            ),
+        ],
+    )
+    def test_tile_sels_rejects_mask_too_small_for_src_valid_shape(self, mask_type, error):
+        """A packed mask must cover every valid source row and column bit."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", mask_type, span)
+        src = ir.Var("src", ir.TileType([8, 257], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        with pytest.raises(ValueError, match=error):
+            tile.sels(mask, src, tmp, -1.0)
+
+    def test_tile_sels_accepts_provable_dynamic_mask_coverage(self):
+        """Shared symbolic rows and the exact packed-byte expression are provably safe."""
+        span = ir.Span.unknown()
+        valid_rows = ir.Var("valid_rows", ir.ScalarType(DataType.INDEX), span)
+        valid_cols = ir.Var("valid_cols", ir.ScalarType(DataType.INDEX), span)
+        packed_cols = (valid_cols + 7) // 8
+        mask = ir.Var(
+            "mask",
+            ir.TileType(
+                [16, 64],
+                DataType.UINT8,
+                tile_view=ir.TileView(valid_shape=[valid_rows, packed_cols]),
+            ),
+            span,
+        )
+        src = ir.Var(
+            "src",
+            ir.TileType(
+                [16, 512],
+                DataType.FP32,
+                tile_view=ir.TileView(valid_shape=[valid_rows, valid_cols]),
+            ),
+            span,
+        )
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        result = tile.sels(mask, src, tmp, -1.0)
+
+        assert isinstance(result.type, ir.TileType)
 
     def test_tile_sel(self):
         """Test tile.sel operator - per-element selection between two tiles via mask tile."""
