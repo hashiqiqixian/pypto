@@ -921,8 +921,7 @@ REGISTER_OP("tile.concat")
 
 static TypePtr DeduceTileConcatIdxType(const std::vector<ExprPtr>& args) {
   CHECK(args.size() == 5)
-      << "tile.concat_idx requires 5 arguments (src0, src1, src0_idx, src1_idx, dst), got "
-      << args.size();
+      << "tile.concat_idx requires 5 arguments (src0, src1, src0_idx, src1_idx, dst), got " << args.size();
   auto src0 = As<TileType>(args[0]->GetType());
   auto src1 = As<TileType>(args[1]->GetType());
   auto idx0 = As<TileType>(args[2]->GetType());
@@ -931,8 +930,19 @@ static TypePtr DeduceTileConcatIdxType(const std::vector<ExprPtr>& args) {
   CHECK(src0 && src1 && idx0 && idx1 && dst) << "tile.concat_idx requires five TileType operands";
   CHECK(src0->dtype_ == src1->dtype_ && src0->dtype_ == dst->dtype_)
       << "tile.concat_idx requires src0, src1, and dst to have the same dtype";
-  CHECK(idx0->dtype_ == DataType::INT32 && idx1->dtype_ == DataType::INT32)
-      << "tile.concat_idx requires INT32 index tiles";
+  const auto is_data_dtype = [](DataType dtype) {
+    return dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
+           dtype == DataType::UINT16 || dtype == DataType::INT32 || dtype == DataType::UINT32 ||
+           dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32;
+  };
+  const auto is_index_dtype = [](DataType dtype) {
+    return dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
+           dtype == DataType::UINT16 || dtype == DataType::INT32 || dtype == DataType::UINT32;
+  };
+  CHECK(is_data_dtype(src0->dtype_))
+      << "tile.concat_idx requires 8/16/32-bit integer, FP16, BF16, or FP32 data tiles";
+  CHECK(idx0->dtype_ == idx1->dtype_ && is_index_dtype(idx0->dtype_))
+      << "tile.concat_idx requires matching 8/16/32-bit integer index tiles";
   CHECK(src0->shape_.size() == 2 && src1->shape_.size() == 2 && idx0->shape_.size() == 2 &&
         idx1->shape_.size() == 2 && dst->shape_.size() == 2)
       << "tile.concat_idx requires rank-2 tiles";

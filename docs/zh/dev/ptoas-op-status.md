@@ -166,7 +166,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tshrs | TSHRS | tile | ✅ | ✅ | ❌ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
 | **数据重排（15）** |  |  |  |  |  |  |  |  |
 | pto.tconcat | TCONCAT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.tconcatidx | TCONCAT (indexed) | tile | ✅ | ✅ | ❌ | ❌ | — | 已增加前端与精确 codegen；PTOAS v0.53 可编译，但 A2/A3 执行稳定触发 CCU 指令地址异常 |
+| pto.tconcatidx | TCONCAT (indexed) | tile | ✅ | ✅ | ❌ | ❌ | — | 已增加前端、精确 codegen 及完整 dtype/index/valid-shape ST 矩阵；PTOAS v0.53 可编译，但 A2/A3 执行稳定触发 CCU 指令地址异常；pinned A2/A3 的零长度分段路径还会发生 repeat count 下溢 |
 | pto.tgather | TGATHER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tgatherb | TGATHERB | tile | ✅ | ❌ | ❌ | ❌ | — | 已有 backend hook，缺 IR/Python 前端与 ST |
 | pto.tscatter | TSCATTER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
