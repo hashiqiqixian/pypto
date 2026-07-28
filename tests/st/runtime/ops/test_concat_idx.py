@@ -31,13 +31,13 @@ def _src1() -> torch.Tensor:
 
 def _idx0() -> torch.Tensor:
     result = torch.zeros((M, IDX_COLS), dtype=torch.int32)
-    result[:, 0] = torch.tensor([0, 1, 7, 16, 31, 32, 48, 64], dtype=torch.int32)
+    result[:, 0] = torch.tensor([1, 4, 8, 16, 24, 32, 40, 48], dtype=torch.int32)
     return result
 
 
 def _idx1() -> torch.Tensor:
     result = torch.zeros((M, IDX_COLS), dtype=torch.int32)
-    result[:, 0] = torch.tensor([64, 40, 20, 16, 8, 32, 30, 0], dtype=torch.int32)
+    result[:, 0] = torch.tensor([1, 8, 16, 16, 24, 24, 16, 8], dtype=torch.int32)
     return result
 
 
@@ -79,7 +79,7 @@ class ConcatIdxCase(PTOTestCase):
         super().__init__(platform=platform)
 
     def get_name(self) -> str:
-        return "concat_idx_per_row_boundaries"
+        return "concat_idx_per_row_counts"
 
     def define_tensors(self) -> list[TensorSpec]:
         return [
