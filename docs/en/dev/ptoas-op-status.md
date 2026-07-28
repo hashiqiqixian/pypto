@@ -123,7 +123,7 @@ for lowering/compiler plumbing, plus other dialects such as VPTO, VMI, and SIMT.
 | pto.trecip | TRECIP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.trelu | TRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tlrelu | TLRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.taddrelu | VADDRELU | tile | ✅ | ✅ | ✅ | ❌ | — | exact fused lowering and ST added; hardware verification pending |
+| pto.taddrelu | VADDRELU | tile | ✅ | ✅ | ✅ | ❌ | — | exact emission covered; PTOAS v0.53 A2/A3 legalization still marks the op illegal |
 | pto.tfmod | TFMOD | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | pto.tfmods | TFMODS | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | path exists; historical ISA/semantic issue requires revalidation against the current pin |
 | pto.tpow | TPOW | tile | ✅ | ✅ | ✅ | ❌ | — | integer/no-tmp and floating/tmp precision paths added; hardware verification pending |

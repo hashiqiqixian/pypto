@@ -184,7 +184,7 @@ class MathFusedCase(PTOTestCase):
 
 @pytest.mark.platforms("a2a3")
 @pytest.mark.parametrize("platform", [pytest.param("a2a3", id="a2a3")])
-@pytest.mark.parametrize("op_name", ["axpy", "add_relu", "pow", "pows"])
+@pytest.mark.parametrize("op_name", ["axpy", "pow", "pows"])
 def test_math_fused(test_runner, platform, op_name):
     result = test_runner.run(MathFusedCase(op_name, platform=platform))
     assert result.passed, f"Test failed: {result.error}"

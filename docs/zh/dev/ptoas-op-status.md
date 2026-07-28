@@ -109,7 +109,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.trecip | TRECIP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.trelu | TRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.tlrelu | TLRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
-| pto.taddrelu | VADDRELU | tile | ✅ | ✅ | ✅ | ❌ | — | 已增加精确融合 lowering 与 ST；真机待验证 |
+| pto.taddrelu | VADDRELU | tile | ✅ | ✅ | ✅ | ❌ | — | 已覆盖精确发射；PTOAS v0.53 A2/A3 legalization 仍将该 op 标记为非法 |
 | pto.tfmod | TFMOD | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
 | pto.tfmods | TFMODS | tile+tensor | ✅ | ✅ | ✅ | ❌ | — | 已有链路；历史 ISA/语义问题，需按当前 pin 复验 |
 | pto.tpow | TPOW | tile | ✅ | ✅ | ✅ | ❌ | — | 已增加整数无 tmp 与浮点 tmp/precision 路径；真机待验证 |

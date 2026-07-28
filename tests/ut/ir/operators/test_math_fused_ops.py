@@ -9,6 +9,7 @@
 
 """Type contracts for TAXPY, TADDRELU, TPOW, and TPOWS."""
 
+import pypto.language as pl
 import pytest
 from pypto import ir
 from pypto.ir.op import tile_ops as tile
@@ -24,6 +25,14 @@ def _tile(name, dtype=DataType.FP32, valid_shape=(7, 13)):
     return ir.Var(name, ir.TileType([8, 16], dtype, tile_view=view), ir.Span.unknown())
 
 
+def _const_values(shape):
+    values = []
+    for dim in shape:
+        assert isinstance(dim, ir.ConstInt)
+        values.append(dim.value)
+    return values
+
+
 def test_axpy_and_add_relu_preserve_destination_contract():
     src = _tile("src", DataType.FP16)
     dst = _tile("dst", DataType.FP32)
@@ -32,7 +41,7 @@ def test_axpy_and_add_relu_preserve_destination_contract():
     fused = tile.add_relu(dst, _tile("rhs"))
 
     assert axpy.type.dtype == DataType.FP32
-    assert [dim.value for dim in axpy.type.get_effective_tile_view().valid_shape] == [7, 13]
+    assert _const_values(axpy.type.get_effective_tile_view().valid_shape) == [7, 13]
     assert fused.type.dtype == DataType.FP32
 
 
@@ -64,3 +73,32 @@ def test_pow_rejects_wrong_tmp_contract():
         tile.pow(_tile("ibase", DataType.INT32), _tile("iexp", DataType.INT32), _tile("tmp", DataType.INT32))
     with pytest.raises(ValueError, match="high_precision"):
         tile.pows(_tile("ibase", DataType.INT32), 2, high_precision=True)
+
+
+def test_add_relu_emits_exact_pto_op(tmp_path):
+    @pl.program
+    class AddReluProgram:
+        @pl.function(type=pl.FunctionType.InCore)
+        def kernel(
+            self,
+            src0: pl.Tensor[[16, 16], pl.FP32],
+            src1: pl.Tensor[[16, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            lhs = pl.load(src0, [0, 0], [16, 16])
+            rhs = pl.load(src1, [0, 0], [16, 16])
+            return pl.store(pl.tile.add_relu(lhs, rhs), [0, 0], out)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def orchestrator(
+            self,
+            src0: pl.Tensor[[16, 16], pl.FP32],
+            src1: pl.Tensor[[16, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+        ) -> pl.Tensor[[16, 16], pl.FP32]:
+            return self.kernel(src0, src1, out)
+
+    ir.compile(AddReluProgram, output_dir=str(tmp_path), skip_ptoas=True, platform="a2a3")
+    pto_files = list(tmp_path.rglob("*.pto"))
+    assert pto_files
+    assert any("pto.taddrelu" in path.read_text() for path in pto_files)
