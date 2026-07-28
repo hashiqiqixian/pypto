@@ -165,6 +165,7 @@ from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import (
     AtomicType,
+    Call,
     Expr,
     MemorySpace,
     PadValue,
