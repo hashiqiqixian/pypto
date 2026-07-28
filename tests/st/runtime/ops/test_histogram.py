@@ -16,8 +16,8 @@ import pytest
 import torch
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
 
-M = 8
-N = 16
+M = 32
+N = 32
 
 
 def _src16() -> torch.Tensor:
