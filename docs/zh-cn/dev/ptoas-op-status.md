@@ -231,7 +231,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.get_block_num | get_block_num | tile+tensor | ✅ | ✅ | ✅ | — | — | codegen 转为 wrapper 参数，不发同名 PTO op |
 | pto.get_subblock_num | get_subblockdim | internal | ✅ | — | — | — | — | codegen 转为 wrapper 参数，不发同名 PTO op |
 | **调试（3）** |  |  |  |  |  |  |  |  |
-| pto.tprint | TPRINT | tile | ✅ | ✅ | ❌ | ❌ | — | 已增加基础 Vec tile 前端与精确 codegen；固定 PTO-ISA `83d01313` 缺少 `TPRINT`，阻塞设备代码编译及输出内容 ST |
+| pto.tprint | TPRINT | tile | ✅ | ✅ | ❌ | ❌ | — | 已增加基础 Vec tile 前端与精确 codegen；设备编译需要 `_DEBUG` 和 `--cce-enable-print`，当前 runtime compiler 无法按 kernel 请求这两个选项 |
 | pto.print | cce::printf | internal | ✅ | — | — | — | — | 内部/调试辅助，不独立建 ST |
 | pto.trap | trap | internal | ✅ | — | — | — | — | 内部/调试辅助，不独立建 ST |
 | **通信（14）** |  |  |  |  |  |  |  |  |
