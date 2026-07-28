@@ -37,7 +37,7 @@ def _src32() -> torch.Tensor:
 
 
 def _idx32(rows: int) -> torch.Tensor:
-    values = torch.tensor([0x56, 0x34, 0x12], dtype=torch.uint8).reshape(3, 1)
+    values = torch.tensor([0x12, 0x34, 0x56], dtype=torch.uint8).reshape(3, 1)
     return values[:rows].expand(rows, N).contiguous()
 
 
@@ -145,11 +145,14 @@ class HistogramTestCase(PTOTestCase):
 
         values = (src[0] >> (8 * self._byte)) & 0xFF
         if self._byte < 3:
+            selected = torch.ones(N, dtype=torch.bool)
             for filter_byte in range(self._byte + 1, 4):
                 idx_row = 3 - filter_byte
-                values = values[
-                    ((src[0] >> (8 * filter_byte)) & 0xFF) == tensors["idx"][idx_row, 0].to(torch.int64)
-                ]
+                selected &= (
+                    ((src[0] >> (8 * filter_byte)) & 0xFF)
+                    == tensors["idx"][idx_row, 0].to(torch.int64)
+                )
+            values = values[selected]
         tensors["out"][0] = _cumulative(values)
 
 
