@@ -83,9 +83,7 @@ class MgatherRowTestCase(PTOTestCase):
                 idx_tile: pl.Tile[[1, INDEX_ROWS], pl.INT32] = pl.load(
                     idx, [0, 0], [1, INDEX_ROWS], valid_shapes=[1, valid_rows]
                 )
-                result: pl.Tile[[INDEX_ROWS, COLS], dtype] = pl.tile.mgather(
-                    mem, idx_tile, coalesce="row"
-                )
+                result: pl.Tile[[INDEX_ROWS, COLS], dtype] = pl.tile.mgather(mem, idx_tile, coalesce="row")
                 return pl.store(result, [0, 0], out)
 
             @pl.function(type=pl.FunctionType.Orchestration)
@@ -154,9 +152,7 @@ class MgatherElemTestCase(PTOTestCase):
                 idx_tile: pl.Tile[[ELEM_M, ELEM_N], pl.INT32] = pl.load(
                     idx, [0, 0], [ELEM_M, ELEM_N], valid_shapes=valid_shape
                 )
-                result: pl.Tile[[ELEM_M, ELEM_N], pl.FP32] = pl.tile.mgather(
-                    mem, idx_tile, coalesce="elem"
-                )
+                result: pl.Tile[[ELEM_M, ELEM_N], pl.FP32] = pl.tile.mgather(mem, idx_tile, coalesce="elem")
                 return pl.store(result, [0, 0], out)
 
             @pl.function(type=pl.FunctionType.Orchestration)

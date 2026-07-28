@@ -3288,9 +3288,7 @@ class TestB03TriAndGatherCodegen:
                 out: pl.Tensor[[16, 32], pl.FP32],
             ) -> pl.Tensor[[16, 32], pl.FP32]:
                 idx_tile: pl.Tile[[1, 16], pl.INT32] = pl.load(idx, [0, 0], [1, 16])
-                gathered: pl.Tile[[16, 32], pl.FP32] = pl.tile.mgather(
-                    mem, idx_tile, coalesce="row"
-                )
+                gathered: pl.Tile[[16, 32], pl.FP32] = pl.tile.mgather(mem, idx_tile, coalesce="row")
                 return pl.store(gathered, [0, 0], out)
 
         mlir = self._generate_mlir(Prog)
@@ -3310,9 +3308,7 @@ class TestB03TriAndGatherCodegen:
                 out: pl.Tensor[[8, 32], pl.FP32],
             ) -> pl.Tensor[[8, 32], pl.FP32]:
                 idx_tile: pl.Tile[[8, 32], pl.INT32] = pl.load(idx, [0, 0], [8, 32])
-                gathered: pl.Tile[[8, 32], pl.FP32] = pl.tile.mgather(
-                    mem, idx_tile, coalesce="elem"
-                )
+                gathered: pl.Tile[[8, 32], pl.FP32] = pl.tile.mgather(mem, idx_tile, coalesce="elem")
                 return pl.store(gathered, [0, 0], out)
 
         mlir = self._generate_mlir(Prog)
