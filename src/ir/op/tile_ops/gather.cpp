@@ -162,7 +162,7 @@ static TypePtr DeduceTileGatherbType(const std::vector<ExprPtr>& args,
       << " requires offset columns to be a positive multiple of 8 (32-byte UINT32 row), but got "
       << offset_cols->value_;
 
-  const size_t element_bytes = src_type->dtype_.GetByte();
+  const auto element_bytes = src_type->dtype_.GetByte();
   CHECK(element_bytes != 0 && 32 % element_bytes == 0)
       << "The operator " << op_name
       << " requires a byte-addressable src dtype that divides 32 bytes, but got "
