@@ -28,9 +28,13 @@ class PrintProgram:
         src: pl.Tensor[[M, N], pl.FP32],
         out: pl.Out[pl.Tensor[[M, N], pl.FP32]],
     ) -> pl.Tensor[[M, N], pl.FP32]:
-        tile = pl.load(src, [0, 0], [M, N])
-        pl.tile.print(tile)
-        return pl.store(tile, [0, 0], out)
+        printed = pl.load(src, [0, 0], [M, N])
+        pl.tile.print(printed)
+        # TPRINT is a debugging sink, so do not rely on its source tile being
+        # reusable by later operations. Reload the data used for the ordinary
+        # output check.
+        stored = pl.load(src, [0, 0], [M, N])
+        return pl.store(stored, [0, 0], out)
 
     @pl.function(type=pl.FunctionType.Orchestration)
     def orchestrator(
