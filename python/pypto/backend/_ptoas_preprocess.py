@@ -10,7 +10,9 @@
 """Shared preprocessing for C++ emitted by PTOAS."""
 
 import re
+from bisect import bisect_left
 
+_IDENTIFIER_RE = re.compile(r"\b[A-Za-z_]\w*\b")
 _PTOAS_UB_POINTER_ALIAS_RE = re.compile(
     r"^\s*__ubuf__\s+.+?\*\s*(?P<alias>[A-Za-z_]\w*)\s*="
     r"\s*(?P<wrapper>[A-Za-z_]\w*)\.data\(\);\s*$"
@@ -38,25 +40,35 @@ def _restore_mgather_wrapper_operands(content: str) -> str:
     """
     lines = content.splitlines(keepends=True)
     aliases: dict[str, list[tuple[str, int]]] = {}
+    identifier_occurrences: dict[str, list[int]] = {}
     for line_index, line in enumerate(lines):
+        for identifier in _IDENTIFIER_RE.findall(line):
+            identifier_occurrences.setdefault(identifier, []).append(line_index)
         for pattern in (_PTOAS_UB_POINTER_ALIAS_RE, _PTOAS_GM_POINTER_ALIAS_RE):
             if match := pattern.match(line):
                 aliases.setdefault(match.group("alias"), []).append((match.group("wrapper"), line_index))
                 break
+    alias_definition_lines = {
+        alias: [line_index for _, line_index in definitions] for alias, definitions in aliases.items()
+    }
 
     def find_unique_definition(alias: str, call_line_index: int) -> tuple[str, int] | None:
         definitions = aliases.get(alias, [])
-        preceding = [
-            (wrapper, line_index) for wrapper, line_index in definitions if line_index < call_line_index
-        ]
-        if not preceding:
+        definition_lines = alias_definition_lines.get(alias, [])
+        definition_position = bisect_left(definition_lines, call_line_index) - 1
+        if definition_position < 0:
             return None
 
-        definition = preceding[-1]
-        following_lines = [line_index for _, line_index in definitions if line_index > definition[1]]
-        scope_end = following_lines[0] if following_lines else len(lines)
-        scoped_content = "".join(lines[definition[1] : scope_end])
-        if len(re.findall(rf"\b{re.escape(alias)}\b", scoped_content)) != 2:
+        definition = definitions[definition_position]
+        scope_end = (
+            definition_lines[definition_position + 1]
+            if definition_position + 1 < len(definition_lines)
+            else len(lines)
+        )
+        occurrence_lines = identifier_occurrences.get(alias, [])
+        occurrence_start = bisect_left(occurrence_lines, definition[1])
+        occurrence_end = bisect_left(occurrence_lines, scope_end)
+        if occurrence_end - occurrence_start != 2:
             return None
         return definition
 

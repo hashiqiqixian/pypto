@@ -1033,17 +1033,17 @@ class TestPreprocessPtoasOutput:
         assert "__gm__ float* table_ptr = (__gm__ float*) table;" in result
 
     def test_restores_reused_local_names_in_multiple_functions(self):
-        function_template = (
-            "AICORE void {function_name}() {{\n"
-            "  __ubuf__ float* v1 = {function_name}_dst.data();\n"
-            "  __gm__ float* v2 = (__gm__ float*) {function_name}_table;\n"
-            "  __ubuf__ int32_t* v3 = {function_name}_idx.data();\n"
-            "  MGATHER(v1, v2, v3);\n"
-            "}}\n"
-        )
-        source = function_template.format(function_name="first") + function_template.format(
-            function_name="second"
-        )
+        def make_function(function_name):
+            return (
+                f"AICORE void {function_name}() {{\n"
+                f"  __ubuf__ float* v1 = {function_name}_dst.data();\n"
+                f"  __gm__ float* v2 = (__gm__ float*) {function_name}_table;\n"
+                f"  __ubuf__ int32_t* v3 = {function_name}_idx.data();\n"
+                "  MGATHER(v1, v2, v3);\n"
+                "}\n"
+            )
+
+        source = make_function("first") + make_function("second")
 
         result = _preprocess_ptoas_output(source)
 
