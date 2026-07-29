@@ -62,17 +62,28 @@ def test_float_pow_forms_require_and_accept_tmp(high_precision):
     assert scalar_power.type.dtype == DataType.FP32
 
 
-def test_integer_pow_forms_omit_tmp():
-    base = _tile("base", DataType.INT32)
-    exp = _tile("exp", DataType.INT32)
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        DataType.INT8,
+        DataType.UINT8,
+        DataType.INT16,
+        DataType.UINT16,
+        DataType.INT32,
+        DataType.UINT32,
+    ],
+)
+def test_integer_pow_forms_omit_tmp(dtype):
+    base = _tile("base", dtype)
+    exp = _tile("exp", dtype)
 
     power = tile.pow(base, exp)
     scalar_power = tile.pows(base, 3)
 
     assert isinstance(power.type, ir.TileType)
     assert isinstance(scalar_power.type, ir.TileType)
-    assert power.type.dtype == DataType.INT32
-    assert scalar_power.type.dtype == DataType.INT32
+    assert power.type.dtype == dtype
+    assert scalar_power.type.dtype == dtype
 
 
 def test_pow_rejects_wrong_tmp_contract():

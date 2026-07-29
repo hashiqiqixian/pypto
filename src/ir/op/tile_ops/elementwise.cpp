@@ -509,7 +509,8 @@ static TypePtr DeduceTileAxpyType(const std::vector<ExprPtr>& args) {
 }
 
 static bool IsTilePowDType(DataType dtype) {
-  return dtype == DataType::INT8 || dtype == DataType::INT16 || dtype == DataType::INT32 ||
+  return dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
+         dtype == DataType::UINT16 || dtype == DataType::INT32 || dtype == DataType::UINT32 ||
          dtype == DataType::FP16 || dtype == DataType::FP32 || dtype == DataType::BF16;
 }
 

@@ -530,9 +530,15 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   };
   reg("tile.axpy",
       [](const CallPtr& op, codegen::CodegenBase& codegen) { return MakeAxpyCodegenPTO(op, codegen); });
-  reg("tile.add_relu", [](const CallPtr& op, codegen::CodegenBase& codegen) {
-    return MakeNaryCodegenPTO("pto.taddrelu", 2, op, codegen);
-  });
+  if (exclude_ops.count("tile.add_relu") == 0) {
+    auto entry = backend.RegisterOp("tile.add_relu");
+    entry.f_codegen([](const CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeNaryCodegenPTO("pto.taddrelu", 2, op, codegen);
+    });
+    entry.set_input_layout(0, ir::TileLayout::row_major);
+    entry.set_input_layout(1, ir::TileLayout::row_major);
+    entry.set_output_layout(ir::TileLayout::row_major);
+  }
   reg("tile.pow", [](const CallPtr& op, codegen::CodegenBase& codegen) {
     return MakePowCodegenPTO("pto.tpow", op, codegen);
   });
