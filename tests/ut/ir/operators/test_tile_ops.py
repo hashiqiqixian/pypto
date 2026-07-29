@@ -3549,21 +3549,15 @@ class TestTileBitwiseArithmeticOps:
 
     @pytest.mark.parametrize(
         "dtype",
-        [
-            DataType.INT8,
-            DataType.UINT8,
-            DataType.INT16,
-            DataType.UINT16,
-            DataType.INT32,
-            DataType.UINT32,
-        ],
+        [DataType.INT8, DataType.UINT8, DataType.INT16, DataType.UINT16, DataType.INT32, DataType.UINT32],
     )
+    @pytest.mark.parametrize("valid_shape", [[8, 16], [7, 16], [8, 13], [7, 13]])
     @pytest.mark.parametrize("op", [tile.shl, tile.shr])
-    def test_shift_contract_binary_accepts_supported_widths_and_preserves_view(self, dtype, op):
-        """Tile shift ops preserve src type and require one shared valid region."""
+    def test_shift_contract_binary_accepts_supported_widths_and_preserves_view(self, dtype, valid_shape, op):
+        """Tile shifts preserve src type/layout across full/row/col/combined valid regions."""
         span = ir.Span.unknown()
         view = ir.TileView(
-            valid_shape=[7, 13],
+            valid_shape=valid_shape,
             blayout=ir.TileLayout.row_major,
             slayout=ir.TileLayout.none_box,
         )
@@ -3575,18 +3569,31 @@ class TestTileBitwiseArithmeticOps:
         assert _tile_result_dtype(call) == dtype
         assert isinstance(call.type, ir.TileType)
         assert call.type.shape == [8, 16]
-        assert _valid_of(call.type) == [7, 13]
+        assert _valid_of(call.type) == valid_shape
+        result_view = call.type.get_effective_tile_view()
+        assert result_view.blayout == ir.TileLayout.row_major
+        assert result_view.slayout == ir.TileLayout.none_box
 
-    @pytest.mark.parametrize("dtype", [DataType.INT8, DataType.INT16, DataType.INT32])
+    @pytest.mark.parametrize(
+        "dtype,scalar_dtype",
+        [
+            (DataType.INT8, DataType.INT8),
+            (DataType.UINT8, DataType.INT8),
+            (DataType.INT16, DataType.INT16),
+            (DataType.UINT16, DataType.INT16),
+            (DataType.INT32, DataType.INT32),
+            (DataType.UINT32, DataType.INT32),
+        ],
+    )
     @pytest.mark.parametrize("op", [tile.shls, tile.shrs])
-    def test_shift_contract_scalar_literal_matches_tile_dtype(self, dtype, op):
-        """Scalar literal sugar uses the exact tile dtype required by PTO-ISA."""
+    def test_shift_contract_scalar_literal_uses_signless_same_width_dtype(self, dtype, scalar_dtype, op):
+        """Scalar literal sugar uses PTOAS's signless count with the tile width."""
         span = ir.Span.unknown()
         src = ir.Var("src", ir.TileType([8, 16], dtype), span)
 
         call = op(src, 1)
 
-        assert _operand_dtype(call.args[1]) == dtype
+        assert _operand_dtype(call.args[1]) == scalar_dtype
         assert _tile_result_dtype(call) == dtype
 
     @pytest.mark.parametrize("op", [tile.shl, tile.shr])
@@ -3603,24 +3610,52 @@ class TestTileBitwiseArithmeticOps:
             op(full, broadcast)
 
     @pytest.mark.parametrize("op", [tile.shls, tile.shrs])
-    def test_shift_contract_scalar_rejects_explicit_dtype_mismatch(self, op):
-        """A typed scalar shift count must exactly match the source dtype."""
+    def test_shift_contract_scalar_rejects_width_mismatch(self, op):
+        """A typed scalar shift count must use the source element width."""
         span = ir.Span.unknown()
         src = ir.Var("src", ir.TileType([8, 16], DataType.INT16), span)
         shift = ir.ConstInt(1, DataType.INT32, span)
 
-        with pytest.raises(ValueError, match=r"same dtype"):
+        with pytest.raises(ValueError, match=r"same bit width"):
             op(src, shift)
 
     @pytest.mark.parametrize("dtype", [DataType.UINT8, DataType.UINT16, DataType.UINT32])
     @pytest.mark.parametrize("op", [tile.shls, tile.shrs])
-    def test_shift_contract_scalar_rejects_unsigned_ptoas_encoding_gap(self, dtype, op):
-        """PTOAS scalar operands cannot encode PyPTO's explicit unsigned scalar types."""
+    def test_shift_contract_scalar_rejects_explicit_unsigned_count(self, dtype, op):
+        """PTOAS accepts signless scalar operands, not explicit unsigned scalar types."""
+        span = ir.Span.unknown()
+        signed_dtype = {
+            DataType.UINT8: DataType.INT8,
+            DataType.UINT16: DataType.INT16,
+            DataType.UINT32: DataType.INT32,
+        }[dtype]
+        src = ir.Var("src", ir.TileType([8, 16], signed_dtype), span)
+        shift = ir.ConstInt(1, dtype, span)
+
+        with pytest.raises(ValueError, match=r"signless scalar shift count"):
+            op(src, shift)
+
+    @pytest.mark.parametrize("dtype", [DataType.INT8, DataType.UINT8, DataType.INT16, DataType.UINT16])
+    @pytest.mark.parametrize("op", [tile.shls, tile.shrs])
+    def test_shift_contract_scalar_accepts_legal_count_boundaries(self, dtype, op):
+        """Constant counts accept both legal endpoints, zero and width minus one."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([8, 16], dtype), span)
+        width = dtype.get_bit()
+
+        for count in (0, width - 1):
+            assert _tile_result_dtype(op(src, count)) == dtype
+
+    @pytest.mark.parametrize("dtype", [DataType.INT8, DataType.UINT16, DataType.INT32])
+    @pytest.mark.parametrize("op", [tile.shls, tile.shrs])
+    def test_shift_contract_scalar_rejects_counts_outside_legal_range(self, dtype, op):
+        """Constant counts reject negative values and the first value past the width."""
         span = ir.Span.unknown()
         src = ir.Var("src", ir.TileType([8, 16], dtype), span)
 
-        with pytest.raises(ValueError, match=r"INT8, INT16, INT32"):
-            op(src, 1)
+        for count in (-1, dtype.get_bit()):
+            with pytest.raises(ValueError, match=r"constant shift count in"):
+                op(src, count)
 
     @pytest.mark.parametrize("op", [tile.shl, tile.shr, tile.shls, tile.shrs])
     def test_shift_contract_rejects_unsupported_integer_width(self, op):
@@ -3829,13 +3864,13 @@ class TestTileBitwiseArithmeticOps:
 
 
 class TestTileScalarOperandDtype:
-    """A constant scalar operand of a tile x scalar op adopts the tile dtype.
+    """A constant scalar operand adopts the paired tile's PTOAS-compatible dtype.
 
     Regression: a DSL bare int literal is parsed to ``ConstInt(v, INDEX)``, and
     ``index`` is not a legal operand type for any ``pto.t*s`` instruction. The
     tile scalar wrappers must re-stamp such placeholders to the tile element
-    dtype (``_normalize_scalar_operand``), reject non-constant ``index`` values,
-    and leave already-typed / non-constant operands untouched.
+    dtype (or the same-width signed dtype for shift counts), reject non-constant
+    ``index`` values, and leave already-typed / non-constant operands untouched.
     """
 
     # Every tile x scalar wrapper that normalizes a constant operand. Each entry
@@ -3949,15 +3984,17 @@ class TestTileScalarOperandDtype:
             call = fn(self._int_tile(DataType.INT16), 255)
             assert _operand_dtype(call.args[1]) == DataType.INT16
 
-    def test_narrow_shift_literal_adopts_tile_dtype(self):
-        """Shift counts follow the tile dtype, including narrow int tiles.
-
-        The scalar follows the tile element type required by PTO-ISA/PTOAS.
-        """
-        for dtype in (DataType.INT8, DataType.INT16):
+    def test_narrow_shift_literal_adopts_signless_same_width_dtype(self):
+        """Shift counts use the signed same-width PTOAS scalar representation."""
+        for dtype, scalar_dtype in (
+            (DataType.INT8, DataType.INT8),
+            (DataType.UINT8, DataType.INT8),
+            (DataType.INT16, DataType.INT16),
+            (DataType.UINT16, DataType.INT16),
+        ):
             for fn in (tile.shls, tile.shrs):
                 call = fn(self._int_tile(dtype), 3)
-                assert _operand_dtype(call.args[1]) == dtype, f"{fn.__name__} on {dtype}"
+                assert _operand_dtype(call.args[1]) == scalar_dtype, f"{fn.__name__} on {dtype}"
 
     def test_ir_level_restamps_index_const(self):
         """A hand-built ConstInt(INDEX) operand (parser output) is re-stamped."""

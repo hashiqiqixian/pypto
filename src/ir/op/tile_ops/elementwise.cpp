@@ -78,12 +78,6 @@ static bool IsShiftDataType(DataType dtype) {
          dtype == DataType::UINT16 || dtype == DataType::INT32 || dtype == DataType::UINT32;
 }
 
-static bool IsShiftScalarDataType(DataType dtype) {
-  // PTOAS models scalar shift counts as signless integers. Explicit PyPTO
-  // unsigned scalar types lower to ui8/ui16/ui32 and are rejected by PTOAS.
-  return dtype == DataType::INT8 || dtype == DataType::INT16 || dtype == DataType::INT32;
-}
-
 static std::shared_ptr<TileType> MakePackedPredicateTileType(
     const std::vector<ExprPtr>& logical_shape, const std::shared_ptr<const TileType>& source_tile_type) {
   INTERNAL_CHECK(!logical_shape.empty())
@@ -245,13 +239,20 @@ TypePtr DeduceTileOpShiftScalarType(const std::vector<ExprPtr>& args,
              << args[0]->GetType()->TypeName();
   CHECK(shift) << "The operator " << op_name << " requires second argument to be a ScalarType, but got "
                << args[1]->GetType()->TypeName();
-  CHECK(IsShiftScalarDataType(src->dtype_))
-      << "The operator " << op_name << " requires tile/scalar dtype in {INT8, INT16, INT32}, but got "
-      << src->dtype_.ToString();
-  CHECK(shift->dtype_ == src->dtype_)
+  CHECK(IsShiftDataType(src->dtype_))
       << "The operator " << op_name
-      << " requires src, scalar, and dst to have the same dtype, but scalar has " << shift->dtype_.ToString()
-      << " and src has " << src->dtype_.ToString();
+      << " requires tile dtype in {INT8, UINT8, INT16, UINT16, INT32, UINT32}, but got "
+      << src->dtype_.ToString();
+  CHECK(shift->dtype_.IsSignedInt() && shift->dtype_.GetBit() == src->dtype_.GetBit())
+      << "The operator " << op_name
+      << " requires a signless scalar shift count with the same bit width as src, but scalar has "
+      << shift->dtype_.ToString() << " and src has " << src->dtype_.ToString();
+  if (auto constant = As<ConstInt>(args[1])) {
+    const int64_t shift_value = constant->value_;
+    CHECK(shift_value >= 0 && static_cast<uint64_t>(shift_value) < src->dtype_.GetBit())
+        << "The operator " << op_name << " requires a constant shift count in [0, "
+        << (src->dtype_.GetBit() - 1) << "], but got " << shift_value;
+  }
 
   TileView tile_view;
   tile_view.valid_shape = GetValidShape(src);

@@ -16,27 +16,50 @@ import pytest
 import torch
 from harness.core.harness import DataType, PTOTestCase, TensorSpec
 
-M = 16
-N = 64
-VALID_SHAPE = (11, 47)
+M = 32
+N = 32
+
+_VALID_SHAPES = {
+    "full": (M, N),
+    "rows": (17, N),
+    "cols": (M, 23),
+    "combined": (17, 23),
+}
 
 _PL_DT = {
+    DataType.INT8: pl.INT8,
+    DataType.UINT8: pl.UINT8,
     DataType.INT16: pl.INT16,
     DataType.UINT16: pl.UINT16,
+    DataType.INT32: pl.INT32,
+    DataType.UINT32: pl.UINT32,
 }
 
 _WIDTH = {
+    DataType.INT8: 8,
+    DataType.UINT8: 8,
     DataType.INT16: 16,
     DataType.UINT16: 16,
+    DataType.INT32: 32,
+    DataType.UINT32: 32,
 }
+
+_SIGNED_DTYPES = {DataType.INT8, DataType.INT16, DataType.INT32}
+_ALL_DTYPES = tuple(_PL_DT)
+_A2A3_SCALAR_DTYPES = (
+    DataType.INT16,
+    DataType.UINT16,
+    DataType.INT32,
+    DataType.UINT32,
+)
 
 
 def _values(dtype: DataType) -> torch.Tensor:
     width = _WIDTH[dtype]
-    if dtype == DataType.INT16:
-        values = [-32768, -17, -1, 0, 1, 17, 16383]
+    if dtype in _SIGNED_DTYPES:
+        values = [-(1 << (width - 1)), -17, -1, 0, 1, 17, (1 << (width - 1)) - 1]
     else:
-        values = [0, 1, 17, (1 << (width - 1)), (1 << width) - 1]
+        values = [0, 1, 17, 1 << (width - 1), (1 << width) - 1]
     index = torch.arange(M * N, dtype=torch.int64).reshape(M, N).remainder(len(values))
     result = torch.zeros((M, N), dtype=torch.int64)
     for i, value in enumerate(values):
@@ -54,9 +77,9 @@ def _shift_counts(dtype: DataType) -> torch.Tensor:
     return result.to(dtype.torch_dtype).contiguous()
 
 
-def _make_program(op_name: str, dtype: DataType, scalar: int | None):
+def _make_program(op_name: str, dtype: DataType, scalar: int | None, valid_shape: tuple[int, int]):
     pl_dtype = _PL_DT[dtype]
-    valid = list(VALID_SHAPE)
+    valid = list(valid_shape)
 
     if op_name == "shl":
 
@@ -164,15 +187,26 @@ class ShiftCase(PTOTestCase):
 
     __test__ = False
 
-    def __init__(self, *, op_name: str, dtype: DataType, scalar: int | None = None):
+    def __init__(
+        self,
+        *,
+        op_name: str,
+        dtype: DataType,
+        valid_name: str,
+        valid_shape: tuple[int, int],
+        scalar: int | None = None,
+    ):
         super().__init__()
         self.op_name = op_name
         self.dtype = dtype
+        self.valid_name = valid_name
+        self.valid_shape = valid_shape
         self.scalar = scalar
 
     def get_name(self) -> str:
         scalar_tag = f"_s{self.scalar}" if self.scalar is not None else ""
-        return f"tile_{self.op_name}_{self.dtype.value}_v{VALID_SHAPE[0]}x{VALID_SHAPE[1]}{scalar_tag}"
+        rows, cols = self.valid_shape
+        return f"tile_{self.op_name}_{self.dtype.value}_{self.valid_name}_v{rows}x{cols}{scalar_tag}"
 
     def define_tensors(self) -> list[TensorSpec]:
         specs = [TensorSpec("src", [M, N], self.dtype, init_value=lambda: _values(self.dtype))]
@@ -184,10 +218,10 @@ class ShiftCase(PTOTestCase):
         return specs
 
     def get_program(self) -> Any:
-        return _make_program(self.op_name, self.dtype, self.scalar)
+        return _make_program(self.op_name, self.dtype, self.scalar, self.valid_shape)
 
     def compute_expected(self, tensors: dict[str, torch.Tensor], params=None) -> None:
-        rows, cols = VALID_SHAPE
+        rows, cols = self.valid_shape
         width = _WIDTH[self.dtype]
         src = tensors["src"][:rows, :cols].to(torch.int64)
         shift: torch.Tensor | int
@@ -199,11 +233,11 @@ class ShiftCase(PTOTestCase):
         if self.op_name in {"shl", "shls"}:
             mask = (1 << width) - 1
             value = torch.bitwise_left_shift(src, shift) & mask
-            if self.dtype == DataType.INT16:
+            if self.dtype in _SIGNED_DTYPES:
                 sign = 1 << (width - 1)
                 value = (value ^ sign) - sign
         else:
-            if self.dtype == DataType.UINT16:
+            if self.dtype not in _SIGNED_DTYPES:
                 src = src & ((1 << width) - 1)
             value = torch.bitwise_right_shift(src, shift)
 
@@ -212,25 +246,105 @@ class ShiftCase(PTOTestCase):
         tensors["out"][:] = expected
 
 
-_CASES = [
-    *[
-        pytest.param(op_name, dtype, None, id=f"t{op_name}-{dtype.value}-counts-0-1-15")
-        for op_name in ("shl", "shr")
-        for dtype in (DataType.INT16, DataType.UINT16)
-    ],
-    *[
-        pytest.param(op_name, DataType.INT16, scalar, id=f"t{op_name}-int16-s{scalar}")
-        for op_name in ("shls", "shrs")
-        for scalar in (0, 15)
-    ],
+_TILE_CASES = [
+    pytest.param(op_name, dtype, valid_name, valid_shape, id=f"t{op_name}-{dtype.value}-{valid_name}")
+    for op_name in ("shl", "shr")
+    for dtype in _ALL_DTYPES
+    for valid_name, valid_shape in _VALID_SHAPES.items()
+]
+
+_A5_SCALAR_CASES = [
+    pytest.param(
+        op_name,
+        dtype,
+        valid_name,
+        valid_shape,
+        scalar,
+        id=f"t{op_name}-{dtype.value}-{valid_name}-s{scalar}",
+    )
+    for op_name in ("shls", "shrs")
+    for dtype in _ALL_DTYPES
+    for valid_name, valid_shape in _VALID_SHAPES.items()
+    for scalar in (0, _WIDTH[dtype] - 1)
+]
+
+# Pinned pto-isa a2/a3 TShiftCheck compares dst valid rows with src valid
+# columns. Until that upstream typo is fixed, only square valid regions can be
+# exercised by scalar shifts. The full and square-subview cases retain A2/A3
+# coverage without claiming the blocked row-only/col-only shapes pass.
+_A2A3_SAFE_VALID_SHAPES = {
+    "full": (M, N),
+    "square_combined": (17, 17),
+}
+
+_A2A3_SCALAR_CASES = [
+    pytest.param(
+        op_name,
+        dtype,
+        valid_name,
+        valid_shape,
+        scalar,
+        id=f"t{op_name}-{dtype.value}-{valid_name}-s{scalar}",
+    )
+    for op_name in ("shls", "shrs")
+    for dtype in _A2A3_SCALAR_DTYPES
+    for valid_name, valid_shape in _A2A3_SAFE_VALID_SHAPES.items()
+    for scalar in (0, _WIDTH[dtype] - 1)
 ]
 
 
-class TestShiftFamily:
-    """A2/A3 same-name coverage for four tile shift instructions."""
+class TestShiftTileFamily:
+    """A2/A3 and A5 coverage for tile-tile shifts."""
+
+    @pytest.mark.platforms("a2a3", "a5")
+    @pytest.mark.parametrize("op_name,dtype,valid_name,valid_shape", _TILE_CASES)
+    def test_shift(self, test_runner, op_name, dtype, valid_name, valid_shape):
+        result = test_runner.run(
+            ShiftCase(
+                op_name=op_name,
+                dtype=dtype,
+                valid_name=valid_name,
+                valid_shape=valid_shape,
+            )
+        )
+        assert result.passed, f"Test failed: {result.error}"
+
+
+class TestShiftScalarA5Family:
+    """A5 coverage for every scalar-shift width and valid-shape mode."""
+
+    @pytest.mark.platforms("a5")
+    @pytest.mark.parametrize("op_name,dtype,valid_name,valid_shape,scalar", _A5_SCALAR_CASES)
+    def test_shift(self, test_runner, op_name, dtype, valid_name, valid_shape, scalar):
+        result = test_runner.run(
+            ShiftCase(
+                op_name=op_name,
+                dtype=dtype,
+                valid_name=valid_name,
+                valid_shape=valid_shape,
+                scalar=scalar,
+            )
+        )
+        assert result.passed, f"Test failed: {result.error}"
+
+
+class TestShiftScalarA2A3Family:
+    """A2/A3 scalar coverage limited to shapes accepted by pinned pto-isa."""
 
     @pytest.mark.platforms("a2a3")
-    @pytest.mark.parametrize("op_name,dtype,scalar", _CASES)
-    def test_shift(self, test_runner, op_name, dtype, scalar):
-        result = test_runner.run(ShiftCase(op_name=op_name, dtype=dtype, scalar=scalar))
+    @pytest.mark.parametrize("op_name,dtype,valid_name,valid_shape,scalar", _A2A3_SCALAR_CASES)
+    def test_shift(self, test_runner, op_name, dtype, valid_name, valid_shape, scalar):
+        result = test_runner.run(
+            ShiftCase(
+                op_name=op_name,
+                dtype=dtype,
+                valid_name=valid_name,
+                valid_shape=valid_shape,
+                scalar=scalar,
+            )
+        )
         assert result.passed, f"Test failed: {result.error}"
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
