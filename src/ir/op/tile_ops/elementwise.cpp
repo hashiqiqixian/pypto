@@ -30,7 +30,6 @@
 #include <utility>
 #include <vector>
 
-#include "pypto/core/any_cast.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
 #include "pypto/ir/expr.h"
@@ -503,16 +502,17 @@ static TypePtr DeduceTilePartArgType(const std::vector<ExprPtr>& args, const std
   CHECK(src0_dominates || src1_dominates)
       << "The operator " << op_name
       << " requires one source valid_shape to contain the other source valid_shape";
-  const auto& result_valid = src0_dominates ? src0_valid : src1_valid;
+  const bool use_src0 = src0_dominates;
+  const auto& result_valid = use_src0 ? src0_valid : src1_valid;
 
   TileView value_view;
   value_view.valid_shape = result_valid;
-  InheritTileViewLayout(value_view, types[0]);
+  InheritTileViewLayout(value_view, use_src0 ? types[0] : types[1]);
   auto value_type = std::make_shared<TileType>(types[0]->shape_, types[0]->dtype_, std::nullopt, value_view);
 
   TileView index_view;
   index_view.valid_shape = result_valid;
-  InheritTileViewLayout(index_view, types[2]);
+  InheritTileViewLayout(index_view, use_src0 ? types[2] : types[3]);
   auto index_type = std::make_shared<TileType>(types[2]->shape_, types[2]->dtype_, std::nullopt, index_view);
   return std::make_shared<TupleType>(std::vector<TypePtr>{value_type, index_type});
 }
@@ -568,10 +568,7 @@ static TypePtr DeduceTileHistogramType(const std::vector<ExprPtr>& args,
   CHECK(idx->dtype_ == DataType::UINT8)
       << "The operator tile.histogram requires UINT8 idx, but got " << idx->dtype_.ToString();
 
-  int byte = 1;
-  for (const auto& [key, value] : kwargs) {
-    if (key == "byte") byte = AnyCast<int>(value, "kwarg key: byte");
-  }
+  const int byte = GetKwargOr<int>(kwargs, "byte", 1);
   CHECK(byte >= 0 && byte <= 3) << "The operator tile.histogram requires byte in [0, 3], but got " << byte;
 
   const TileView src_view = tile_view_semantics::GetEffectiveTileView(*src);

@@ -14,6 +14,7 @@
  * @brief PTO codegen registration for elementwise / compute tile ops.
  */
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <memory>
@@ -379,16 +380,28 @@ static std::string MakePartArgCodegenPTO(const std::string& pto_op_name, const C
   for (size_t i = 0; i < inputs.size(); ++i) {
     inputs[i] = codegen.GetExprAsCode(op->args_[i]);
     input_types[i] = codegen.GetExprTypeAnnotation(op->args_[i]);
+    INTERNAL_CHECK_SPAN(!inputs[i].empty(), op->args_[i]->span_)
+        << "Internal error: " << op->op_->name_ << " input " << i << " requires an SSA value";
   }
   const std::string dst = codegen.GetVarName(element_vars[0]);
   const std::string dst_idx = codegen.GetVarName(element_vars[1]);
   const std::string dst_type = codegen.GetTileBufTypeStringFromTileType(result_types[0]);
   const std::string dst_idx_type = codegen.GetTileBufTypeStringFromTileType(result_types[1]);
+  INTERNAL_CHECK_SPAN(!dst.empty() && !dst_idx.empty(), op->span_)
+      << "Internal error: " << op->op_->name_ << " requires value and index outputs";
 
   std::ostringstream oss;
-  oss << pto_op_name << " ins(" << inputs[0] << ", " << inputs[1] << ", " << inputs[2] << ", " << inputs[3]
-      << " : " << input_types[0] << ", " << input_types[1] << ", " << input_types[2] << ", " << input_types[3]
-      << ") outs(" << dst << ", " << dst_idx << " : " << dst_type << ", " << dst_idx_type << ")";
+  oss << pto_op_name << " ins(" << inputs[0] << ", " << inputs[1] << ", " << inputs[2] << ", " << inputs[3];
+  if (std::all_of(input_types.begin(), input_types.end(),
+                  [](const std::string& type) { return !type.empty(); })) {
+    oss << " : " << input_types[0] << ", " << input_types[1] << ", " << input_types[2] << ", "
+        << input_types[3];
+  }
+  oss << ") outs(" << dst << ", " << dst_idx;
+  if (!dst_type.empty() && !dst_idx_type.empty()) {
+    oss << " : " << dst_type << ", " << dst_idx_type;
+  }
+  oss << ")";
   codegen.Emit(oss.str());
   return "";
 }
@@ -404,10 +417,19 @@ static std::string MakeHistogramCodegenPTO(const CallPtr& op, codegen::CodegenBa
   std::string idx_type = codegen.GetExprTypeAnnotation(op->args_[1]);
   std::string dst = codegen.GetCurrentResultTarget();
   std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
+  INTERNAL_CHECK_SPAN(!src.empty() && !idx.empty() && !dst.empty(), op->span_)
+      << "Internal error: tile.histogram requires input and output SSA values";
 
   std::ostringstream oss;
-  oss << "pto.thistogram ins(" << src << ", " << idx << " : " << src_type << ", " << idx_type << ") outs("
-      << dst << " : " << dst_type << ") {byte = " << byte << " : i32}";
+  oss << "pto.thistogram ins(" << src << ", " << idx;
+  if (!src_type.empty() && !idx_type.empty()) {
+    oss << " : " << src_type << ", " << idx_type;
+  }
+  oss << ") outs(" << dst;
+  if (!dst_type.empty()) {
+    oss << " : " << dst_type;
+  }
+  oss << ") {byte = " << byte << " : i32}";
   codegen.Emit(oss.str());
   return "";
 }
@@ -561,12 +583,19 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
     backend.RegisterOp(op_name).f_codegen(std::move(fn));
   };
 
-  reg("tile.part_argmax", [](const CallPtr& op, codegen::CodegenBase& codegen) {
-    return MakePartArgCodegenPTO("pto.tpartargmax", op, codegen);
-  });
-  reg("tile.part_argmin", [](const CallPtr& op, codegen::CodegenBase& codegen) {
-    return MakePartArgCodegenPTO("pto.tpartargmin", op, codegen);
-  });
+  auto register_part_arg = [&](const char* op_name, const char* pto_op_name) {
+    if (exclude_ops.count(op_name) > 0) return;
+    auto entry = backend.RegisterOp(op_name);
+    entry.f_codegen([pto_op = std::string(pto_op_name)](const CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakePartArgCodegenPTO(pto_op, op, codegen);
+    });
+    for (size_t i = 0; i < 4; ++i) {
+      entry.set_input_layout(i, ir::TileLayout::row_major);
+    }
+    entry.set_output_layout(ir::TileLayout::row_major);
+  };
+  register_part_arg("tile.part_argmax", "pto.tpartargmax");
+  register_part_arg("tile.part_argmin", "pto.tpartargmin");
   reg("tile.histogram",
       [](const CallPtr& op, codegen::CodegenBase& codegen) { return MakeHistogramCodegenPTO(op, codegen); });
 

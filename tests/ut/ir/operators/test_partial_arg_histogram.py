@@ -60,6 +60,22 @@ def test_partial_arg_contract_returns_value_and_index_tiles(op, value_dtype, ind
     assert _const_values(index_type.get_effective_tile_view().valid_shape) == [8, 16]
 
 
+def test_partial_arg_result_layout_follows_dominating_source_pair():
+    src0 = _tile("src0", DataType.FP32, (7, 13), ir.TileLayout.col_major)
+    src1 = _tile("src1", DataType.FP32, (8, 16))
+    idx0 = _tile("idx0", DataType.INT32, (7, 13), ir.TileLayout.col_major)
+    idx1 = _tile("idx1", DataType.INT32, (8, 16))
+
+    result_type = tile.part_argmax(src0, src1, idx0, idx1).type
+    assert isinstance(result_type, ir.TupleType)
+    value_type, index_type = result_type.types
+    assert isinstance(value_type, ir.TileType)
+    assert isinstance(index_type, ir.TileType)
+
+    assert value_type.get_effective_tile_view().blayout == ir.TileLayout.row_major
+    assert index_type.get_effective_tile_view().blayout == ir.TileLayout.row_major
+
+
 @pytest.mark.parametrize("op", [tile.part_argmax, tile.part_argmin])
 def test_partial_arg_contract_rejects_mismatched_pairs_and_crossing_valid_shapes(op):
     src0 = _tile("src0", DataType.FP32, (8, 12))
