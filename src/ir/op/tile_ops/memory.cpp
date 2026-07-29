@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <any>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -633,10 +634,12 @@ TypePtr DeduceTileTriType(const std::vector<ExprPtr>& args,
       << args.size();
 
   DataType dtype = GetKwarg<DataType>(kwargs, "dtype");
-  CHECK(dtype == DataType::INT16 || dtype == DataType::INT32 || dtype == DataType::UINT16 ||
-        dtype == DataType::UINT32 || dtype == DataType::FP16 || dtype == DataType::FP32)
+  CHECK(dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
+        dtype == DataType::INT32 || dtype == DataType::UINT16 || dtype == DataType::UINT32 ||
+        dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32)
       << "The operator " << op_name
-      << " requires dtype to be one of {INT16, INT32, UINT16, UINT32, FP16, FP32}, but got "
+      << " requires dtype to be one of {INT8, UINT8, INT16, INT32, UINT16, UINT32, FP16, BF16, FP32}, "
+         "but got "
       << dtype.ToString();
 
   auto diagonal_type = As<ScalarType>(args[0]->GetType());
@@ -1053,19 +1056,47 @@ REGISTER_OP("tile.mscatter")
 namespace {
 constexpr int kMgatherCoalesceRow = 0;
 constexpr int kMgatherCoalesceElem = 1;
+constexpr int kMgatherGatherOobUndefined = 0;
+constexpr int kMgatherGatherOobZero = 3;
 
 bool IsMgatherElementDtype(const DataType& dtype) {
   return dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
          dtype == DataType::UINT16 || dtype == DataType::INT32 || dtype == DataType::UINT32 ||
-         dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32;
+         dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32 ||
+         dtype == DataType::FP8E4M3FN || dtype == DataType::FP8E5M2 || dtype == DataType::HF8;
+}
+
+bool IsStaticContiguousTensor(const TensorType& type) {
+  if (!type.tensor_view_.has_value()) return true;
+  const TensorView& view = *type.tensor_view_;
+  if (view.layout != TensorLayout::ND) return false;
+  if (view.stride.empty()) return true;
+  if (view.stride.size() != type.shape_.size()) return false;
+
+  int64_t expected_stride = 1;
+  for (size_t offset = 0; offset < type.shape_.size(); ++offset) {
+    const size_t dim_index = type.shape_.size() - 1 - offset;
+    auto stride = As<ConstInt>(view.stride[dim_index]);
+    auto dim = As<ConstInt>(type.shape_[dim_index]);
+    if (!stride || !dim) return false;
+    if (dim->value_ != 1 && stride->value_ != expected_stride) return false;
+    expected_stride *= dim->value_;
+  }
+  return true;
+}
+
+bool IsNdTensor(const TensorType& type) {
+  return !type.tensor_view_.has_value() || type.tensor_view_->layout == TensorLayout::ND;
 }
 }  // namespace
 
 TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
                               const std::vector<std::pair<std::string, std::any>>& kwargs,
                               const std::string& op_name) {
-  CHECK(args.size() == 2) << "The operator " << op_name << " requires 2 arguments (mem, idx), but got "
-                          << args.size();
+  CHECK(args.size() >= 2 && args.size() <= 4)
+      << "The operator " << op_name
+      << " requires (mem, idx), optionally followed by scratch and/or valid_shape, but got " << args.size()
+      << " arguments";
 
   auto mem_type = AsTensorTypeLike(args[0]->GetType());
   CHECK(mem_type) << "The operator " << op_name
@@ -1073,60 +1104,168 @@ TypePtr DeduceTileMgatherType(const std::vector<ExprPtr>& args,
                   << args[0]->GetType()->TypeName();
   CHECK(IsMgatherElementDtype(mem_type->dtype_))
       << "The operator " << op_name
-      << " requires mem dtype in {I8, U8, I16, U16, I32, U32, FP16, BF16, FP32}, but got "
+      << " requires mem dtype in {I8, U8, I16, U16, I32, U32, FP16, BF16, FP32, "
+         "FP8E4M3FN, FP8E5M2, HF8}, but got "
       << mem_type->dtype_.ToString();
   CHECK(!mem_type->shape_.empty()) << "The operator " << op_name
                                    << " requires mem to have at least one dimension";
 
-  auto idx_type = As<TileType>(args[1]->GetType());
-  CHECK(idx_type) << "The operator " << op_name << " requires idx to be a TileType, but got "
-                  << args[1]->GetType()->TypeName();
-  CHECK(idx_type->dtype_ == DataType::INT32)
-      << "The operator " << op_name << " requires idx dtype to be INT32, but got "
-      << idx_type->dtype_.ToString();
-  CHECK(idx_type->shape_.size() == 2)
-      << "The operator " << op_name << " requires a 2D idx tile, but got rank " << idx_type->shape_.size();
-
   int coalesce = GetKwarg<int>(kwargs, "coalesce", kMgatherCoalesceRow);
   CHECK(coalesce == kMgatherCoalesceRow || coalesce == kMgatherCoalesceElem)
       << "The operator " << op_name << " requires coalesce in {0 (row), 1 (elem)}, but got " << coalesce;
+  int gather_oob = GetKwarg<int>(kwargs, "gather_oob", kMgatherGatherOobUndefined);
+  CHECK(gather_oob >= kMgatherGatherOobUndefined && gather_oob <= kMgatherGatherOobZero)
+      << "The operator " << op_name
+      << " requires gather_oob in {0 (undefined), 1 (clamp), 2 (wrap), 3 (zero)}, but got " << gather_oob;
+  MemorySpace target_memory = GetKwarg<MemorySpace>(kwargs, "target_memory", MemorySpace::Vec);
+  CHECK(target_memory == MemorySpace::Vec || target_memory == MemorySpace::Mat)
+      << "The operator " << op_name << " requires target_memory to be Vec or Mat";
 
   std::vector<ExprPtr> output_shape;
   std::vector<ExprPtr> output_valid_shape;
-  const TileView idx_view = tile_view_semantics::GetEffectiveTileView(*idx_type);
-  if (coalesce == kMgatherCoalesceElem) {
-    output_shape = idx_type->shape_;
-    output_valid_shape = idx_view.valid_shape;
+  TileView tile_view;
+  if (target_memory == MemorySpace::Vec) {
+    CHECK(args.size() == 2) << "The operator " << op_name << " permits scratch only for Mat elem mode";
+    auto idx_type = As<TileType>(args[1]->GetType());
+    CHECK(idx_type) << "The operator " << op_name
+                    << " with Vec output requires idx to be a TileType, but got "
+                    << args[1]->GetType()->TypeName();
+    CHECK(idx_type->dtype_ == DataType::INT32)
+        << "The operator " << op_name << " requires idx dtype to be INT32, but got "
+        << idx_type->dtype_.ToString();
+    CHECK(idx_type->shape_.size() == 2)
+        << "The operator " << op_name << " requires a 2D idx tile, but got rank " << idx_type->shape_.size();
+    const TileView idx_view = tile_view_semantics::GetEffectiveTileView(*idx_type);
+    if (coalesce == kMgatherCoalesceElem) {
+      output_shape = idx_type->shape_;
+      output_valid_shape = idx_view.valid_shape;
+    } else {
+      CHECK(mem_type->shape_.size() >= 2)
+          << "The operator " << op_name
+          << " row mode requires mem rank >= 2 so rows have an element dimension, but got rank "
+          << mem_type->shape_.size();
+      auto first_dim = As<ConstInt>(idx_type->shape_[0]);
+      auto second_dim = As<ConstInt>(idx_type->shape_[1]);
+      CHECK(first_dim && second_dim) << "The operator " << op_name
+                                     << " row mode requires a static [1, R] or [R, 1] idx shape";
+      const bool row_vector = first_dim->value_ == 1;
+      const bool column_vector = second_dim->value_ == 1;
+      CHECK(row_vector || column_vector)
+          << "The operator " << op_name << " row mode requires a [1, R] or [R, 1] idx shape, but got ["
+          << first_dim->value_ << ", " << second_dim->value_ << "]";
+      const size_t row_dim = row_vector ? 1 : 0;
+      output_shape = {idx_type->shape_[row_dim], mem_type->shape_.back()};
+      CHECK(idx_view.valid_shape.size() == 2)
+          << "The operator " << op_name << " requires a 2D idx valid shape";
+      output_valid_shape = {idx_view.valid_shape[row_dim], mem_type->shape_.back()};
+    }
+    tile_view.blayout = TileLayout::row_major;
   } else {
-    auto first_dim = As<ConstInt>(idx_type->shape_[0]);
-    auto second_dim = As<ConstInt>(idx_type->shape_[1]);
-    CHECK(first_dim && second_dim) << "The operator " << op_name
-                                   << " row mode requires a static [1, R] idx shape";
-    CHECK(first_dim->value_ == 1) << "The operator " << op_name
-                                  << " row mode requires a [1, R] idx shape, but got [" << first_dim->value_
-                                  << ", " << second_dim->value_ << "]";
-    output_shape = {idx_type->shape_[1], mem_type->shape_.back()};
-
-    CHECK(idx_view.valid_shape.size() == 2) << "The operator " << op_name << " requires a 2D idx valid shape";
-    output_valid_shape = {idx_view.valid_shape[1], mem_type->shape_.back()};
+    CHECK(IsNdTensor(*mem_type)) << "The operator " << op_name
+                                 << " with Mat output requires mem to use ND tensor layout";
+    auto idx_type = AsTensorTypeLike(args[1]->GetType());
+    CHECK(idx_type) << "The operator " << op_name
+                    << " with Mat output requires idx to be a GM TensorType, but got "
+                    << args[1]->GetType()->TypeName();
+    CHECK(IsNdTensor(*idx_type)) << "The operator " << op_name
+                                 << " with Mat output requires idx to use ND tensor layout";
+    CHECK(idx_type->dtype_ == DataType::INT32)
+        << "The operator " << op_name << " requires Mat idx dtype to be INT32, but got "
+        << idx_type->dtype_.ToString();
+    CHECK(idx_type->shape_.size() == 2)
+        << "The operator " << op_name << " requires a 2D Mat idx tensor, but got rank "
+        << idx_type->shape_.size();
+    if (coalesce == kMgatherCoalesceElem) {
+      CHECK(args.size() == 3 || args.size() == 4)
+          << "The operator " << op_name
+          << " Mat elem mode requires GM scratch and optionally accepts valid_shape";
+      CHECK(args[2].get() != args[0].get() && args[2].get() != args[1].get())
+          << "The operator " << op_name
+          << " Mat elem scratch must not alias mem or idx; use a distinct GM tensor";
+      auto scratch_type = AsTensorTypeLike(args[2]->GetType());
+      CHECK(scratch_type) << "The operator " << op_name << " Mat elem scratch must be a GM tensor";
+      CHECK(scratch_type->dtype_ == mem_type->dtype_)
+          << "The operator " << op_name << " Mat elem scratch dtype must match mem dtype";
+      CHECK(IsStaticContiguousTensor(*scratch_type))
+          << "The operator " << op_name << " Mat elem scratch must be a contiguous ND tensor";
+      output_shape = idx_type->shape_;
+      int64_t output_elements = 1;
+      for (const auto& dim : output_shape) {
+        auto constant = As<ConstInt>(dim);
+        CHECK(constant) << "The operator " << op_name << " Mat elem output shape must be static";
+        output_elements *= constant->value_;
+      }
+      int64_t scratch_elements = 1;
+      for (const auto& dim : scratch_type->shape_) {
+        auto constant = As<ConstInt>(dim);
+        CHECK(constant) << "The operator " << op_name << " Mat elem scratch shape must be static";
+        scratch_elements *= constant->value_;
+      }
+      CHECK(scratch_elements >= output_elements)
+          << "The operator " << op_name << " Mat elem scratch requires at least " << output_elements
+          << " elements, but got " << scratch_elements;
+    } else {
+      CHECK(args.size() == 2 || args.size() == 3)
+          << "The operator " << op_name << " Mat row mode accepts only an optional valid_shape";
+      CHECK(mem_type->shape_.size() >= 2)
+          << "The operator " << op_name << " Mat row mode requires mem rank >= 2";
+      auto first_dim = As<ConstInt>(idx_type->shape_[0]);
+      CHECK(first_dim && first_dim->value_ == 1)
+          << "The operator " << op_name << " Mat row mode requires a [1, R] GM idx tensor";
+      output_shape = {idx_type->shape_[1], mem_type->shape_.back()};
+    }
+    auto output_rows = As<ConstInt>(output_shape[0]);
+    auto output_cols = As<ConstInt>(output_shape[1]);
+    CHECK(output_rows && output_cols) << "The operator " << op_name << " Mat output shape must be static";
+    const int64_t element_bytes = static_cast<int64_t>(mem_type->dtype_.GetByte());
+    CHECK(element_bytes > 0) << "The operator " << op_name << " requires a byte-addressable mem dtype";
+    const int64_t c0 = 32 / element_bytes;
+    CHECK(output_rows->value_ % 16 == 0)
+        << "The operator " << op_name << " Mat output rows must be a multiple of 16";
+    CHECK(output_cols->value_ % c0 == 0)
+        << "The operator " << op_name << " Mat output cols must be a multiple of " << c0;
+    output_valid_shape = output_shape;
+    const size_t valid_shape_index = coalesce == kMgatherCoalesceElem ? 3 : 2;
+    if (args.size() > valid_shape_index) {
+      auto valid_shape = As<MakeTuple>(args[valid_shape_index]);
+      CHECK(valid_shape) << "The operator " << op_name
+                         << " Mat valid_shape must be a MakeTuple of compile-time constants";
+      CHECK(valid_shape->elements_.size() == output_shape.size())
+          << "The operator " << op_name << " Mat valid_shape must have rank " << output_shape.size()
+          << ", but got " << valid_shape->elements_.size();
+      output_valid_shape.clear();
+      for (size_t i = 0; i < valid_shape->elements_.size(); ++i) {
+        auto valid_dim = As<ConstInt>(valid_shape->elements_[i]);
+        auto physical_dim = As<ConstInt>(output_shape[i]);
+        CHECK(valid_dim) << "The operator " << op_name << " Mat valid_shape element " << i
+                         << " must be a compile-time constant";
+        CHECK(valid_dim->value_ > 0 && valid_dim->value_ <= physical_dim->value_)
+            << "The operator " << op_name << " requires 0 < Mat valid_shape[" << i << "] <= output_shape["
+            << i << "], but got " << valid_dim->value_ << " and " << physical_dim->value_;
+        output_valid_shape.push_back(valid_shape->elements_[i]);
+      }
+    }
+    tile_view.blayout = TileLayout::col_major;
+    tile_view.slayout = TileLayout::row_major;
   }
 
-  TileView tile_view;
   tile_view.valid_shape = output_valid_shape;
-  tile_view.blayout = TileLayout::row_major;
   return std::make_shared<TileType>(output_shape, mem_type->dtype_, std::nullopt, tile_view);
 }
 
 REGISTER_OP("tile.mgather")
     .set_op_category("TileOp")
     .set_description(
-        "Gather-load rows or elements from a GM tensor into a fresh VEC tile "
+        "Gather-load rows or elements from a GM tensor into a fresh Vec or Mat tile "
         "(maps to pto.mgather)")
     .add_argument("mem", "GM source table (TensorType or DistributedTensorType)")
-    .add_argument("idx", "Index tile (INT32, 2D)")
+    .add_argument("idx", "INT32 2D index tile for Vec, or GM tensor for Mat")
+    .add_argument("scratch", "Optional GM scratch tensor for Mat elem mode")
+    .add_argument("valid_shape", "Optional 2D written region for Mat output")
     .set_attr<int>("coalesce")
-    .set_input_memory(1, MemorySpace::Vec)
-    .set_output_memory(MemorySpace::Vec)
+    .set_attr<int>("gather_oob")
+    .set_attr<MemorySpace>("target_memory")
+    .set_output_memory_from_kwarg("target_memory", MemorySpace::Vec)
     .not_inplace_safe()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {

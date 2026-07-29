@@ -17,7 +17,7 @@ Accessed as ``pl.tile.*``
 
 import warnings
 from collections.abc import Sequence
-from typing import Any, TypeVar, overload
+from typing import Any, Literal, TypeVar, overload
 
 __all__ = [
     "MemRefType",
@@ -2512,13 +2512,19 @@ def gather(src: Tile, indices: Tile, tmp: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
-def gatherb(src: Tile, offset: Tile) -> Tile:
+def gatherb(
+    src: Tile,
+    offset: Tile,
+    *,
+    output_dtype: int | DataType | None = None,
+) -> Tile:
     """Gather 32-byte blocks from ``src`` by UINT32 byte offsets.
 
     Each offset selects one 32-byte source block. One offset column expands to
-    ``32 / sizeof(src.dtype)`` output elements.
+    ``32 / sizeof(output_dtype)`` output elements. ``output_dtype`` defaults to
+    ``src.dtype`` and may select another supported byte interpretation.
     """
-    return Tile(expr=_ir_ops.gatherb(src.unwrap(), offset.unwrap()))
+    return Tile(expr=_ir_ops.gatherb(src.unwrap(), offset.unwrap(), output_dtype=output_dtype))
 
 
 def gather_mask(
@@ -2691,16 +2697,82 @@ def mscatter(src: Tile, idx: Tile, output_tensor: _TensorT) -> _TensorT:
     return output_tensor.__class__(expr=call_expr)
 
 
-def mgather(mem: Tensor, idx: Tile, coalesce: str | int = "row") -> Tile:
-    """Gather-load rows or elements from a GM tensor into a fresh Vec tile.
+@overload
+def mgather(
+    mem: Tensor,
+    idx: Tile,
+    coalesce: str | int = ...,
+    *,
+    gather_oob: str | int = ...,
+    target_memory: Literal[MemorySpace.Vec] = ...,
+    scratch: None = ...,
+    valid_shape: None = ...,
+) -> Tile: ...
+
+
+@overload
+def mgather(
+    mem: Tensor,
+    idx: Tensor,
+    coalesce: Literal["row", 0] = ...,
+    *,
+    gather_oob: str | int = ...,
+    target_memory: Literal[MemorySpace.Mat],
+    scratch: None = ...,
+    valid_shape: Sequence[int] | None = ...,
+) -> Tile: ...
+
+
+@overload
+def mgather(
+    mem: Tensor,
+    idx: Tensor,
+    coalesce: Literal["elem", 1],
+    *,
+    gather_oob: str | int = ...,
+    target_memory: Literal[MemorySpace.Mat],
+    scratch: Tensor,
+    valid_shape: Sequence[int] | None = ...,
+) -> Tile: ...
+
+
+def mgather(
+    mem: Tensor,
+    idx: Tile | Tensor,
+    coalesce: str | int = "row",
+    *,
+    gather_oob: str | int = "undefined",
+    target_memory: MemorySpace = MemorySpace.Vec,
+    scratch: Tensor | None = None,
+    valid_shape: Sequence[int] | None = None,
+) -> Tile:
+    """Gather-load rows or elements from a GM tensor into a fresh Vec or Mat tile.
 
     Args:
         mem: Source tensor in GM.
-        idx: Two-dimensional INT32 index tile.
+        idx: Two-dimensional INT32 index tile for Vec output, or GM tensor for
+            Mat output.
         coalesce: ``"row"``/``0`` for row gather or ``"elem"``/``1`` for flat
             element gather. Integer values support printed-IR round trips.
+        gather_oob: Out-of-bounds handling: ``"undefined"``, ``"clamp"``,
+            ``"wrap"``, ``"zero"``, or the corresponding integer ``0..3``.
+        target_memory: ``MemorySpace.Vec`` (default) or ``MemorySpace.Mat``.
+        scratch: Same-dtype GM workspace required by Mat element gather and
+            forbidden by the other forms.
+        valid_shape: Optional two-dimensional written region for Mat output.
+            Vec output derives its valid region from the index tile.
     """
-    return Tile(expr=_ir_ops.mgather(mem.unwrap(), idx.unwrap(), coalesce=coalesce))
+    return Tile(
+        expr=_ir_ops.mgather(
+            mem.unwrap(),
+            idx.unwrap(),
+            coalesce=coalesce,
+            gather_oob=gather_oob,
+            target_memory=target_memory,
+            scratch=None if scratch is None else scratch.unwrap(),
+            valid_shape=valid_shape,
+        )
+    )
 
 
 @overload

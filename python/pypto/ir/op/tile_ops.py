@@ -420,6 +420,7 @@ def mscatter(
 
 
 _MGATHER_COALESCE = {"row": 0, "elem": 1}
+_MGATHER_GATHER_OOB = {"undefined": 0, "clamp": 1, "wrap": 2, "zero": 3}
 
 
 def _resolve_mgather_coalesce(coalesce: str | int) -> int:
@@ -433,23 +434,60 @@ def _resolve_mgather_coalesce(coalesce: str | int) -> int:
     raise ValueError(f"mgather coalesce must be 'row', 'elem', 0, or 1, got {coalesce!r}")
 
 
+def _resolve_mgather_gather_oob(gather_oob: str | int) -> int:
+    if isinstance(gather_oob, str):
+        try:
+            return _MGATHER_GATHER_OOB[gather_oob]
+        except KeyError as e:
+            raise ValueError(
+                "mgather gather_oob must be 'undefined', 'clamp', 'wrap', 'zero', or int 0-3, "
+                f"got {gather_oob!r}"
+            ) from e
+    if isinstance(gather_oob, int) and not isinstance(gather_oob, bool) and gather_oob in range(4):
+        return gather_oob
+    raise ValueError(
+        f"mgather gather_oob must be 'undefined', 'clamp', 'wrap', 'zero', or int 0-3, got {gather_oob!r}"
+    )
+
+
 def mgather(
     mem: Expr,
     idx: Expr,
     coalesce: str | int = "row",
     span: Span | None = None,
+    *,
+    gather_oob: str | int = "undefined",
+    target_memory: MemorySpace = MemorySpace.Vec,
+    scratch: Expr | None = None,
+    valid_shape: Sequence[int | Expr] | _ir_core.MakeTuple | None = None,
 ) -> Call:
-    """Gather-load indexed rows or elements from a GM tensor.
+    """Gather-load indexed rows or elements from a GM tensor into Vec or Mat.
 
-    ``coalesce="row"`` produces ``dst[r, j] = mem[idx[r], j]`` from a
-    row-major ``[1, R]`` index tile. ``coalesce="elem"`` flat-indexes ``mem``
-    and preserves the index tile's shape and valid shape.
+    Vec output uses a 2D INT32 index tile. Mat output uses a GM INT32 index
+    tensor and produces canonical NZ layout; its element mode additionally
+    requires a same-dtype GM scratch tensor.
+    ``gather_oob`` selects undefined, clamp, wrap, or zero handling.
     """
+    if target_memory not in (MemorySpace.Vec, MemorySpace.Mat):
+        raise ValueError(
+            f"mgather target_memory must be MemorySpace.Vec or MemorySpace.Mat, got {target_memory}"
+        )
     actual_span = _get_span_or_capture(span)
+    kwargs: dict[str, Any] = {"coalesce": _resolve_mgather_coalesce(coalesce)}
+    if target_memory != MemorySpace.Vec:
+        kwargs["target_memory"] = target_memory
+    resolved_gather_oob = _resolve_mgather_gather_oob(gather_oob)
+    if resolved_gather_oob != 0:
+        kwargs["gather_oob"] = resolved_gather_oob
+    args = [mem, idx]
+    if scratch is not None:
+        args.append(scratch)
+    if valid_shape is not None:
+        args.append(_to_make_tuple(valid_shape, actual_span))
     return _ir_core.create_op_call(
         "tile.mgather",
-        [mem, idx],
-        {"coalesce": _resolve_mgather_coalesce(coalesce)},
+        args,
+        kwargs,
         actual_span,
     )
 
@@ -2952,15 +2990,18 @@ def gatherb(
     src: Expr,
     offset: Expr,
     span: Span | None = None,
+    *,
+    output_dtype: int | DataType | None = None,
 ) -> Call:
     """Gather 32-byte source blocks by UINT32 byte offsets (``pto.tgatherb``).
 
     Each offset selects the first byte of one 32-byte block. The output shape
-    is ``[offset_rows, offset_cols * (32 / sizeof(src.dtype))]``; the offset
+    is ``[offset_rows, offset_cols * (32 / sizeof(output_dtype))]``; the offset
     valid shape is expanded by the same factor.
     """
     actual_span = _get_span_or_capture(span)
-    return _ir_core.create_op_call("tile.gatherb", [src, offset], {}, actual_span)
+    kwargs = {} if output_dtype is None else {"output_dtype": output_dtype}
+    return _ir_core.create_op_call("tile.gatherb", [src, offset], kwargs, actual_span)
 
 
 def gather_mask(

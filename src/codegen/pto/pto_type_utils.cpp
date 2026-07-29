@@ -46,6 +46,8 @@ std::string DataTypeToMLIR(DataType dtype) {
     // EmitC maps loc=scaling + !pto.f8E8M0 → TileType::ScaleLeft/ScaleRight
     // (ui8 would wrongly become Fixpipe TileType::Scaling).
     return "!pto.f8E8M0";
+  } else if (dtype == DataType::HF8) {
+    return "!pto.hif8";
   } else if (dtype == DataType::FP4) {
     // MXFP4 E2M1 packed form used by pto-isa / PTOAS for MX matmul. Bare
     // `f4E2M1x2` does not parse in PTOAS (the bare-keyword parser lacks it);

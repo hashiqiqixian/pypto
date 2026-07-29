@@ -5657,6 +5657,13 @@ class TestB03TriAndGatherOps:
         view = None if valid_shape is None else ir.TileView(valid_shape=valid_shape)
         return ir.Var(name, ir.TileType(shape, dtype, tile_view=view), span)
 
+    @staticmethod
+    def _assert_program_round_trip(program):
+        printed = str(program)
+        reparsed = pl.parse_program(printed)
+        ir.assert_structural_equal(program, reparsed)
+        return printed
+
     def test_tri_preserves_physical_and_partial_valid_shape(self):
         call = tile.tri(1, [16, 32], valid_shape=[9, 21], dtype=DataType.FP16, upper=True)
 
@@ -5699,6 +5706,37 @@ class TestB03TriAndGatherOps:
         assert _valid_of(result_type) == [5, 144]
         assert result_type.dtype == DataType.FP16
 
+    def test_gatherb_supports_distinct_output_dtype(self):
+        src = self._tile("src", [16, 64], DataType.FP16, [16, 64])
+        offset = self._tile("offset", [8, 16], DataType.UINT32, [5, 9])
+
+        result_type = tile.gatherb(src, offset, output_dtype=DataType.FP32).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [8, 128]
+        assert _valid_of(result_type) == [5, 72]
+        assert result_type.dtype == DataType.FP32
+
+    def test_gatherb_scales_symbolic_valid_columns(self):
+        span = ir.Span.unknown()
+        valid_cols = ir.Var("valid_cols", ir.ScalarType(DataType.INDEX), span)
+        src = self._tile("src", [16, 64], DataType.FP16, [16, 64])
+        offset_type = ir.TileType(
+            [8, 16],
+            DataType.UINT32,
+            tile_view=ir.TileView(valid_shape=[5, valid_cols]),
+        )
+        offset = ir.Var("offset", offset_type, span)
+
+        result_type = tile.gatherb(src, offset).type
+
+        assert isinstance(result_type, ir.TileType)
+        valid_shape = result_type.get_effective_tile_view().valid_shape
+        assert isinstance(valid_shape[1], ir.Mul)
+        assert valid_shape[1].left is valid_cols
+        assert isinstance(valid_shape[1].right, ir.ConstInt)
+        assert valid_shape[1].right.value == 16
+
     def test_gatherb_rejects_non_uint32_offsets(self):
         src = self._tile("src", [8, 16], DataType.FP16)
         offset = self._tile("offset", [8, 16], DataType.INT32)
@@ -5739,6 +5777,325 @@ class TestB03TriAndGatherOps:
         assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [8, 32]
         assert _valid_of(result_type) == [5, 19]
 
+    def test_mgather_mat_row_uses_gm_index_and_nz_result(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP16), span)
+        idx = ir.Var("idx", ir.TensorType([1, 16], DataType.INT32), span)
+
+        call = tile.mgather(mem, idx, target_memory=ir.MemorySpace.Mat)
+
+        assert dict(call.kwargs) == {
+            "coalesce": 0,
+            "target_memory": ir.MemorySpace.Mat,
+        }
+        result_type = call.type
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [16, 32]
+        view = result_type.get_effective_tile_view()
+        assert view.blayout == ir.TileLayout.col_major
+        assert view.slayout == ir.TileLayout.row_major
+
+    @pytest.mark.parametrize("coalesce", ["row", "elem"])
+    def test_mgather_mat_preserves_explicit_valid_shape(self, coalesce):
+        span = ir.Span.unknown()
+        mem_shape = [64, 32] if coalesce == "row" else [512]
+        mem = ir.Var("mem", ir.TensorType(mem_shape, DataType.FP16), span)
+        idx_shape = [1, 16] if coalesce == "row" else [16, 32]
+        idx = ir.Var("idx", ir.TensorType(idx_shape, DataType.INT32), span)
+        scratch = ir.Var("scratch", ir.TensorType([512], DataType.FP16), span) if coalesce == "elem" else None
+
+        result_type = tile.mgather(
+            mem,
+            idx,
+            coalesce=coalesce,
+            target_memory=ir.MemorySpace.Mat,
+            scratch=scratch,
+            valid_shape=[9, 21],
+        ).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [16, 32]
+        assert _valid_of(result_type) == [9, 21]
+
+    def test_mgather_mat_row_valid_shape_round_trips(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], pl.FP16],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                eye: pl.Tensor[[16, 16], pl.FP16],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                gathered = pl.tile.mgather(
+                    mem,
+                    idx,
+                    target_memory=pl.MemorySpace.Mat,
+                    valid_shape=[9, 21],
+                )
+                eye_tile = pl.load(
+                    eye, [0, 0], [16, 16], valid_shapes=[16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                product = pl.matmul(eye_tile, gathered)
+                return pl.store(product, [0, 0], out)
+
+        printed = self._assert_program_round_trip(Prog)
+        assert "valid_shape=[9, 21]" in printed
+
+    def test_mgather_mat_elem_scratch_round_trips(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[512], pl.FP16],
+                idx: pl.Tensor[[16, 32], pl.INT32],
+                scratch: pl.Tensor[[512], pl.FP16],
+                eye: pl.Tensor[[16, 16], pl.FP16],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                gathered = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="elem",
+                    target_memory=pl.MemorySpace.Mat,
+                    scratch=scratch,
+                )
+                eye_tile = pl.load(
+                    eye, [0, 0], [16, 16], valid_shapes=[16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                product = pl.matmul(eye_tile, gathered)
+                return pl.store(product, [0, 0], out)
+
+        printed = self._assert_program_round_trip(Prog)
+        assert "scratch=scratch" in printed
+
+    def test_mgather_mat_elem_scratch_and_valid_shape_round_trip(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[512], pl.FP16],
+                idx: pl.Tensor[[16, 32], pl.INT32],
+                scratch: pl.Tensor[[512], pl.FP16],
+                eye: pl.Tensor[[16, 16], pl.FP16],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                gathered = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="elem",
+                    target_memory=pl.MemorySpace.Mat,
+                    scratch=scratch,
+                    valid_shape=[9, 21],
+                )
+                eye_tile = pl.load(eye, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat)
+                product = pl.matmul(eye_tile, gathered)
+                return pl.store(product, [0, 0], out)
+
+        printed = self._assert_program_round_trip(Prog)
+        assert "scratch=scratch" in printed
+        assert "valid_shape=[9, 21]" in printed
+
+    def test_mgather_mat_rejects_invalid_valid_shape(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP16), span)
+        idx = ir.Var("idx", ir.TensorType([1, 16], DataType.INT32), span)
+
+        with pytest.raises(ValueError, match="valid_shape must have rank 2"):
+            tile.mgather(
+                mem,
+                idx,
+                target_memory=ir.MemorySpace.Mat,
+                valid_shape=[9],
+            )
+        with pytest.raises(ValueError, match=r"0 < Mat valid_shape\[1\]"):
+            tile.mgather(
+                mem,
+                idx,
+                target_memory=ir.MemorySpace.Mat,
+                valid_shape=[9, 33],
+            )
+
+    def test_mgather_mat_rejects_non_nd_source(self):
+        span = ir.Span.unknown()
+        dn_view = ir.TensorView(stride=[], layout=ir.TensorLayout.DN)
+        mem = ir.Var(
+            "mem",
+            ir.TensorType([64, 32], DataType.FP16, tensor_view=dn_view),
+            span,
+        )
+        idx = ir.Var("idx", ir.TensorType([1, 16], DataType.INT32), span)
+
+        with pytest.raises(ValueError, match="requires mem to use ND tensor layout"):
+            tile.mgather(mem, idx, target_memory=ir.MemorySpace.Mat)
+
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP16), span)
+        idx = ir.Var(
+            "idx",
+            ir.TensorType([1, 16], DataType.INT32, tensor_view=dn_view),
+            span,
+        )
+        with pytest.raises(ValueError, match="requires idx to use ND tensor layout"):
+            tile.mgather(mem, idx, target_memory=ir.MemorySpace.Mat)
+
+    def test_mgather_mat_elem_requires_matching_gm_scratch(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([256], DataType.FP16), span)
+        idx = ir.Var("idx", ir.TensorType([16, 16], DataType.INT32), span)
+        scratch = ir.Var("scratch", ir.TensorType([256], DataType.FP16), span)
+
+        result_type = tile.mgather(
+            mem,
+            idx,
+            coalesce="elem",
+            target_memory=ir.MemorySpace.Mat,
+            scratch=scratch,
+        ).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [16, 16]
+        with pytest.raises(ValueError, match="requires GM scratch"):
+            tile.mgather(mem, idx, coalesce="elem", target_memory=ir.MemorySpace.Mat)
+
+        wrong_scratch = ir.Var("wrong", ir.TensorType([256], DataType.INT32), span)
+        with pytest.raises(ValueError, match="dtype must match"):
+            tile.mgather(
+                mem,
+                idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=wrong_scratch,
+            )
+
+        short_scratch = ir.Var("short", ir.TensorType([255], DataType.FP16), span)
+        with pytest.raises(ValueError, match="at least 256 elements"):
+            tile.mgather(
+                mem,
+                idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=short_scratch,
+            )
+
+        noncontiguous_view = ir.TensorView(stride=[32, 1], layout=ir.TensorLayout.ND)
+        noncontiguous_scratch = ir.Var(
+            "noncontiguous",
+            ir.TensorType([16, 16], DataType.FP16, tensor_view=noncontiguous_view),
+            span,
+        )
+        with pytest.raises(ValueError, match="contiguous ND"):
+            tile.mgather(
+                mem,
+                idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=noncontiguous_scratch,
+            )
+
+        singleton_view = ir.TensorView(stride=[512, 1], layout=ir.TensorLayout.ND)
+        singleton_scratch = ir.Var(
+            "singleton",
+            ir.TensorType([1, 256], DataType.FP16, tensor_view=singleton_view),
+            span,
+        )
+        singleton_result = tile.mgather(
+            mem,
+            idx,
+            coalesce="elem",
+            target_memory=ir.MemorySpace.Mat,
+            scratch=singleton_scratch,
+        )
+        assert isinstance(singleton_result.type, ir.TileType)
+
+    def test_mgather_mat_elem_rejects_direct_scratch_aliases(self):
+        span = ir.Span.unknown()
+        fp_mem = ir.Var("fp_mem", ir.TensorType([256], DataType.FP16), span)
+        idx = ir.Var("idx", ir.TensorType([16, 16], DataType.INT32), span)
+
+        with pytest.raises(ValueError, match="must not alias mem or idx"):
+            tile.mgather(
+                fp_mem,
+                idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=fp_mem,
+            )
+
+        int_mem = ir.Var("int_mem", ir.TensorType([256], DataType.INT32), span)
+        with pytest.raises(ValueError, match="must not alias mem or idx"):
+            tile.mgather(
+                int_mem,
+                idx,
+                coalesce="elem",
+                target_memory=ir.MemorySpace.Mat,
+                scratch=idx,
+            )
+
+    def test_mgather_rejects_scratch_outside_mat_elem(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP16), span)
+        vec_idx = self._tile("vec_idx", [1, 16], DataType.INT32)
+        mat_idx = ir.Var("mat_idx", ir.TensorType([1, 16], DataType.INT32), span)
+        scratch = ir.Var("scratch", ir.TensorType([512], DataType.FP16), span)
+
+        with pytest.raises(ValueError, match="permits scratch only for Mat elem mode"):
+            tile.mgather(mem, vec_idx, scratch=scratch)
+        with pytest.raises(ValueError, match="Mat row mode accepts only an optional valid_shape"):
+            tile.mgather(
+                mem,
+                mat_idx,
+                target_memory=ir.MemorySpace.Mat,
+                scratch=scratch,
+                valid_shape=[16, 32],
+            )
+
+    def test_mgather_mat_rejects_non_nz_aligned_result(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 17], DataType.FP16), span)
+        idx = ir.Var("idx", ir.TensorType([1, 15], DataType.INT32), span)
+
+        with pytest.raises(ValueError, match="rows must be a multiple of 16"):
+            tile.mgather(mem, idx, target_memory=ir.MemorySpace.Mat)
+
+        idx = ir.Var("idx", ir.TensorType([1, 16], DataType.INT32), span)
+        with pytest.raises(ValueError, match="cols must be a multiple of 16"):
+            tile.mgather(mem, idx, target_memory=ir.MemorySpace.Mat)
+
+    def test_mgather_memory_space_selects_index_contract(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx_tile = self._tile("idx_tile", [1, 16], DataType.INT32)
+        idx_tensor = ir.Var("idx_tensor", ir.TensorType([1, 16], DataType.INT32), span)
+
+        with pytest.raises(ValueError, match="GM TensorType"):
+            tile.mgather(mem, idx_tile, target_memory=ir.MemorySpace.Mat)
+        with pytest.raises(ValueError, match="TileType"):
+            tile.mgather(mem, idx_tensor)
+
+    @pytest.mark.parametrize("target_memory", [ir.MemorySpace.Vec, ir.MemorySpace.Mat])
+    def test_mgather_rejects_uint32_index_for_pinned_ptoas(self, target_memory):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx = (
+            self._tile("idx", [1, 16], DataType.UINT32)
+            if target_memory == ir.MemorySpace.Vec
+            else ir.Var("idx", ir.TensorType([1, 16], DataType.UINT32), span)
+        )
+
+        with pytest.raises(ValueError, match="INT32"):
+            tile.mgather(mem, idx, target_memory=target_memory)
+
+    def test_mgather_row_rejects_rank_one_mem(self):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([256], DataType.INT16), span)
+        idx = self._tile("idx", [1, 8], DataType.INT32)
+
+        with pytest.raises(ValueError, match="mem rank >= 2"):
+            tile.mgather(mem, idx, coalesce="row")
+
     @pytest.mark.parametrize(
         "dtype",
         [
@@ -5751,22 +6108,33 @@ class TestB03TriAndGatherOps:
             DataType.FP16,
             DataType.BF16,
             DataType.FP32,
+            DataType.FP8E4M3FN,
+            DataType.FP8E5M2,
+            DataType.HF8,
         ],
     )
-    def test_mgather_supported_payload_dtypes(self, dtype):
+    @pytest.mark.parametrize("target_memory", [ir.MemorySpace.Vec, ir.MemorySpace.Mat])
+    def test_mgather_supported_payload_dtypes(self, dtype, target_memory):
         span = ir.Span.unknown()
         mem = ir.Var("mem", ir.TensorType([64, 32], dtype), span)
-        idx = self._tile("idx", [1, 8], DataType.INT32)
+        idx = (
+            self._tile("idx", [1, 16], DataType.INT32)
+            if target_memory == ir.MemorySpace.Vec
+            else ir.Var("idx", ir.TensorType([1, 16], DataType.INT32), span)
+        )
 
-        assert _tile_result_dtype(tile.mgather(mem, idx)) == dtype
+        assert _tile_result_dtype(tile.mgather(mem, idx, target_memory=target_memory)) == dtype
 
-    def test_mgather_row_rejects_column_vector_index(self):
+    def test_mgather_row_accepts_a5_column_vector_index(self):
         span = ir.Span.unknown()
         mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
-        idx = self._tile("idx", [8, 1], DataType.INT32)
+        idx = self._tile("idx", [8, 1], DataType.INT32, [5, 1])
 
-        with pytest.raises(ValueError, match=r"\[1, R\]"):
-            tile.mgather(mem, idx)
+        result_type = tile.mgather(mem, idx).type
+
+        assert isinstance(result_type, ir.TileType)
+        assert [dim.value for dim in result_type.shape if isinstance(dim, ir.ConstInt)] == [8, 32]
+        assert _valid_of(result_type) == [5, 32]
 
     @pytest.mark.parametrize(("coalesce", "expected"), [(0, 0), (1, 1)])
     def test_mgather_accepts_printed_integer_coalesce(self, coalesce, expected):
@@ -5788,6 +6156,25 @@ class TestB03TriAndGatherOps:
             tile.mgather(mem, idx, coalesce=2)
         with pytest.raises(ValueError, match="coalesce"):
             tile.mgather(mem, idx, coalesce=True)
+
+    @pytest.mark.parametrize(("gather_oob", "expected"), [("clamp", 1), ("wrap", 2), ("zero", 3), (2, 2)])
+    def test_mgather_accepts_out_of_bounds_modes(self, gather_oob, expected):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx = self._tile("idx", [1, 8], DataType.INT32)
+
+        call = tile.mgather(mem, idx, gather_oob=gather_oob)
+
+        assert dict(call.kwargs) == {"coalesce": 0, "gather_oob": expected}
+
+    @pytest.mark.parametrize("gather_oob", ["invalid", 4, True])
+    def test_mgather_rejects_invalid_out_of_bounds_mode(self, gather_oob):
+        span = ir.Span.unknown()
+        mem = ir.Var("mem", ir.TensorType([64, 32], DataType.FP32), span)
+        idx = self._tile("idx", [1, 8], DataType.INT32)
+
+        with pytest.raises(ValueError, match="gather_oob"):
+            tile.mgather(mem, idx, gather_oob=gather_oob)
 
 
 if __name__ == "__main__":

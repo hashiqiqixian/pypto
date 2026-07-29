@@ -997,6 +997,11 @@ class TestPreprocessPtoasOutput:
         result = _preprocess_ptoas_output(SAMPLE_PTOAS_OUTPUT)
         assert "ptoas_bitcast" in result
 
+    def test_mgather_preprocess_fast_path_preserves_unrelated_content(self):
+        source = "AICORE void kernel() {\n  TSTORE(v3);\n}\n"
+
+        assert _preprocess_ptoas_output(source) == "static __aicore__ void kernel() {\n  TSTORE(v3);\n}\n"
+
     def test_restores_mgather_wrapper_operands(self):
         result = _preprocess_ptoas_output(
             "AICORE void kernel() {\n"
@@ -1031,6 +1036,37 @@ class TestPreprocessPtoasOutput:
         assert "consume(dst_ptr);" in result
         assert "MGATHER(dst_ptr, table_ptr, idx_ptr);" in result
         assert "__gm__ float* table_ptr = (__gm__ float*) table;" in result
+
+    def test_restores_four_operand_mat_elem_mgather(self):
+        result = _preprocess_ptoas_output(
+            "AICORE void kernel() {\n"
+            "  __cbuf__ float* dst_ptr = dst_tile.data();\n"
+            "  __gm__ float* table_ptr = (__gm__ float*) table;\n"
+            "  __gm__ int32_t* idx_ptr = (__gm__ int32_t*) indices;\n"
+            "  __gm__ float* scratch_ptr = (__gm__ float*) scratch;\n"
+            "  MGATHER<pto::Coalesce::Elem>(dst_ptr, table_ptr, idx_ptr, scratch_ptr);\n"
+            "}\n"
+        )
+
+        assert "MGATHER<pto::Coalesce::Elem>(dst_tile, table, indices, scratch);" in result
+        assert "_ptr" not in result
+
+    def test_restores_mat_elem_with_direct_scratch_wrapper(self):
+        result = _preprocess_ptoas_output(
+            "AICORE void kernel() {\n"
+            "  __cbuf__ float* dst_ptr = dst_tile.data();\n"
+            "  __gm__ float* table_ptr = (__gm__ float*) table;\n"
+            "  __gm__ int32_t* idx_ptr = (__gm__ int32_t*) indices;\n"
+            "  GlobalTensor<float, Shape, Stride> scratch;\n"
+            "  MGATHER<pto::Coalesce::Elem>(dst_ptr, table_ptr, idx_ptr, scratch);\n"
+            "}\n"
+        )
+
+        assert "MGATHER<pto::Coalesce::Elem>(dst_tile, table, indices, scratch);" in result
+        assert "dst_ptr" not in result
+        assert "table_ptr" not in result
+        assert "idx_ptr" not in result
+        assert "GlobalTensor<float, Shape, Stride> scratch;" in result
 
     def test_restores_reused_local_names_in_multiple_functions(self):
         def make_function(function_name):

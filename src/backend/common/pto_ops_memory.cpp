@@ -35,6 +35,7 @@
 #include "pypto/ir/comm.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
+#include "pypto/ir/memref.h"
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/type.h"
@@ -333,11 +334,11 @@ static std::string MakeTileMscatterCodegenPTO(const CallPtr& op, codegen::Codege
   return "";
 }
 
-// tile.mgather(mem, idx) -> pto.mgather (fresh-output VEC tile).
+// tile.mgather(mem, idx[, scratch]) -> pto.mgather (fresh Vec or Mat tile).
 static std::string MakeTileMgatherCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
-  INTERNAL_CHECK(op->args_.size() == 2)
-      << "tile.mgather requires 2 arguments (mem, idx), got " << op->args_.size();
+  INTERNAL_CHECK(op->args_.size() >= 2 && op->args_.size() <= 4)
+      << "tile.mgather requires 2 to 4 arguments, got " << op->args_.size();
 
   auto mem = AsVarLike(op->args_[0]);
   INTERNAL_CHECK(mem) << "tile.mgather mem must be a Var or IterArg";
@@ -351,50 +352,131 @@ static std::string MakeTileMgatherCodegenPTO(const CallPtr& op, codegen::Codegen
   INTERNAL_CHECK(coalesce == 0 || coalesce == 1)
       << "tile.mgather coalesce must be 0 (row) or 1 (elem), got " << coalesce;
   const char* coalesce_name = coalesce == 1 ? "elem" : "row";
+  const int gather_oob = op->GetKwarg<int>("gather_oob", 0);
+  INTERNAL_CHECK(gather_oob >= 0 && gather_oob <= 3)
+      << "tile.mgather gather_oob must be in [0, 3], got " << gather_oob;
+  static constexpr const char* kGatherOobNames[] = {"undefined", "clamp", "wrap", "zero"};
+  const ir::MemorySpace target_memory = op->GetKwarg<ir::MemorySpace>("target_memory", ir::MemorySpace::Vec);
+  const auto* handler = codegen.GetBackendHandler();
+  INTERNAL_CHECK(handler) << "tile.mgather requires a backend handler";
+  const bool is_a2a3 = handler->GetPtoTargetArch() == "a2a3";
 
-  const std::string idx_name = codegen.GetVarName(idx);
-  const std::string idx_type = codegen.GetExprTypeAnnotation(op->args_[1]);
-  const std::string dtype = codegen.GetTypeString(tensor_type->dtype_);
-  const std::string tensor_view = codegen.GetOrCreateTensorView(mem);
-  const std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
+  if (is_a2a3 && (tensor_type->dtype_ == DataType::FP8E4M3FN ||
+                  tensor_type->dtype_ == DataType::FP8E5M2 || tensor_type->dtype_ == DataType::HF8)) {
+    CHECK_SPAN(false, op->span_)
+        << "tile.mgather dtype " << tensor_type->dtype_.ToString()
+        << " is not supported on the 'a2a3' backend; use the A5 backend";
+  }
 
-  std::string partition_type = "!pto.partition_tensor_view<";
-  std::string partition_view = codegen.NewNamedTemp(mem->name_hint_ + "_pview");
-  std::ostringstream partition_line;
-  partition_line << partition_view << " = pto.partition_view " << tensor_view << ", offsets = [";
-  for (size_t i = 0; i < tensor_type->shape_.size(); ++i) {
-    if (i > 0) partition_line << ", ";
-    partition_line << codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INDEX);
-  }
-  partition_line << "], sizes = [";
-  for (size_t i = 0; i < tensor_type->shape_.size(); ++i) {
-    if (i > 0) {
-      partition_line << ", ";
-      partition_type += "x";
+  auto result_type = As<ir::TileType>(op->GetType());
+  INTERNAL_CHECK(result_type) << "tile.mgather result must be a TileType";
+  if (is_a2a3 && target_memory == ir::MemorySpace::Vec) {
+    auto idx_tile = As<ir::TileType>(idx->GetType());
+    INTERNAL_CHECK(idx_tile) << "tile.mgather Vec idx must be a TileType";
+    auto idx_rows = As<ir::ConstInt>(idx_tile->shape_[0]);
+    if (coalesce == 0) {
+      CHECK_SPAN(idx_rows && idx_rows->value_ == 1, op->span_)
+          << "tile.mgather row mode on the 'a2a3' backend requires idx shape [1, R]";
     }
-    if (auto dim = As<ir::ConstInt>(tensor_type->shape_[i])) {
-      partition_line << codegen.GetOrEmitConstant(dim->value_, DataType::INDEX);
-      partition_type += std::to_string(dim->value_);
-    } else {
-      partition_line << codegen.GetExprAsCode(tensor_type->shape_[i]);
-      partition_type += "?";
-    }
+    CHECK_SPAN(!tensor_type->tensor_view_.has_value() ||
+                   tensor_type->tensor_view_->layout == ir::TensorLayout::ND,
+               op->span_)
+        << "tile.mgather Vec output on the 'a2a3' backend currently requires an ND source tensor";
+    const auto& result_view = ir::tile_view_semantics::GetEffectiveTileView(*result_type);
+    CHECK_SPAN(result_view.blayout == ir::TileLayout::row_major &&
+                   result_view.slayout == ir::TileLayout::none_box,
+               op->span_)
+        << "tile.mgather Vec output from an ND tensor on the 'a2a3' backend requires "
+           "row_major/none layout";
+    auto result_cols = As<ir::ConstInt>(result_type->shape_[1]);
+    INTERNAL_CHECK(result_cols) << "tile.mgather Vec output columns must be static";
+    CHECK_SPAN((result_cols->value_ * static_cast<int64_t>(tensor_type->dtype_.GetByte())) % 32 == 0,
+               op->span_)
+        << "tile.mgather Vec output on the 'a2a3' backend requires each physical row to be "
+           "32-byte aligned";
   }
-  partition_line << "]";
-  partition_type += "x" + dtype + ">";
-  partition_line << " : " << tensor_view_type << " -> " << partition_type;
-  codegen.Emit(partition_line.str());
+
+  auto emit_full_partition = [&](const ir::VarPtr& tensor) {
+    auto type = AsTensorTypeLike(tensor->GetType());
+    INTERNAL_CHECK(type) << "tile.mgather GM operand must be tensor-like";
+    const std::string dtype = codegen.GetTypeString(type->dtype_);
+    const std::string tensor_view = codegen.GetOrCreateTensorView(tensor);
+    const std::string tensor_view_type = codegen.GetTensorViewTypeString(type.get());
+    std::vector<std::string> dims;
+    std::vector<std::string> offsets;
+    std::vector<std::string> sizes;
+    dims.reserve(type->shape_.size());
+    offsets.reserve(type->shape_.size());
+    sizes.reserve(type->shape_.size());
+    for (const auto& dim : type->shape_) {
+      offsets.push_back(codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INDEX));
+      if (auto constant = As<ir::ConstInt>(dim)) {
+        dims.push_back(std::to_string(constant->value_));
+        sizes.push_back(codegen.GetOrEmitConstant(constant->value_, DataType::INDEX));
+      } else {
+        dims.emplace_back("?");
+        sizes.push_back(codegen.GetExprAsCode(dim));
+      }
+    }
+    const std::string partition_type = MakePartitionTensorViewType(dims, dtype);
+    const std::string partition_view = EmitPartitionViewPTO(tensor->name_hint_, tensor_view, tensor_view_type,
+                                                            partition_type, offsets, sizes, codegen);
+    return std::pair<std::string, std::string>{partition_view, partition_type};
+  };
+
+  const auto [mem_view, mem_view_type] = emit_full_partition(mem);
+  std::string idx_name;
+  std::string idx_type;
+  std::string scratch_name;
+  std::string scratch_type;
+  if (target_memory == ir::MemorySpace::Mat) {
+    const auto [view, type] = emit_full_partition(idx);
+    idx_name = view;
+    idx_type = type;
+    if (coalesce == 1) {
+      INTERNAL_CHECK(op->args_.size() >= 3) << "tile.mgather Mat elem mode requires scratch";
+      auto scratch = AsVarLike(op->args_[2]);
+      INTERNAL_CHECK(scratch) << "tile.mgather scratch must be a Var or IterArg";
+      CHECK_SPAN(scratch.get() != mem.get() && scratch.get() != idx.get(), op->span_)
+          << "tile.mgather Mat elem scratch must not alias mem or idx";
+      auto scratch_tensor_type = AsTensorTypeLike(scratch->GetType());
+      INTERNAL_CHECK(scratch_tensor_type) << "tile.mgather scratch must be tensor-like";
+      if (scratch_tensor_type->memref_.has_value() && tensor_type->memref_.has_value()) {
+        CHECK_SPAN(!ir::MemRef::MayAlias(*scratch_tensor_type->memref_, *tensor_type->memref_), op->span_)
+            << "tile.mgather Mat elem scratch must not overlap mem";
+      }
+      auto idx_tensor_type = AsTensorTypeLike(idx->GetType());
+      INTERNAL_CHECK(idx_tensor_type) << "tile.mgather Mat idx must be tensor-like";
+      if (scratch_tensor_type->memref_.has_value() && idx_tensor_type->memref_.has_value()) {
+        CHECK_SPAN(!ir::MemRef::MayAlias(*scratch_tensor_type->memref_, *idx_tensor_type->memref_),
+                   op->span_)
+            << "tile.mgather Mat elem scratch must not overlap idx";
+      }
+      const auto [scratch_view, type] = emit_full_partition(scratch);
+      scratch_name = scratch_view;
+      scratch_type = type;
+    }
+  } else {
+    idx_name = codegen.GetVarName(idx);
+    idx_type = codegen.GetExprTypeAnnotation(op->args_[1]);
+  }
 
   const std::string dst = codegen.GetCurrentResultTarget();
   const std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
   std::ostringstream mgather_line;
-  mgather_line << "pto.mgather ins(" << partition_view << ", " << idx_name;
+  mgather_line << "pto.mgather ins(" << mem_view << ", " << idx_name;
+  if (!scratch_name.empty()) mgather_line << ", " << scratch_name;
   if (!idx_type.empty()) {
-    mgather_line << " : " << partition_type << ", " << idx_type;
+    mgather_line << " : " << mem_view_type << ", " << idx_type;
+    if (!scratch_type.empty()) mgather_line << ", " << scratch_type;
   }
   mgather_line << ") outs(" << dst;
   if (!dst_type.empty()) mgather_line << " : " << dst_type;
-  mgather_line << ") {coalesce = #pto<coalesce " << coalesce_name << ">}";
+  mgather_line << ") {coalesce = #pto<coalesce " << coalesce_name << ">";
+  if (gather_oob != 0) {
+    mgather_line << ", gatherOob = #pto<gather_oob " << kGatherOobNames[gather_oob] << ">";
+  }
+  mgather_line << "}";
   codegen.Emit(mgather_line.str());
   return "";
 }
@@ -857,12 +939,9 @@ void RegisterMemoryOps(Backend& backend, const std::unordered_set<std::string>& 
   }
 
   if (exclude_ops.count("tile.mgather") == 0) {
-    backend.RegisterOp("tile.mgather")
-        .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
-          return MakeTileMgatherCodegenPTO(op, codegen);
-        })
-        .set_input_layout(1, ir::TileLayout::row_major)
-        .set_output_layout(ir::TileLayout::row_major);
+    backend.RegisterOp("tile.mgather").f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+      return MakeTileMgatherCodegenPTO(op, codegen);
+    });
   }
 
   reg("tile.alloc", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {

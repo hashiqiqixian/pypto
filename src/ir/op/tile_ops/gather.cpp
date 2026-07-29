@@ -128,14 +128,29 @@ static TypePtr DeduceTileGatherbType(const std::vector<ExprPtr>& args,
   auto src_type = As<TileType>(args[0]->GetType());
   CHECK(src_type) << "The operator " << op_name << " requires src to be a TileType, but got "
                   << args[0]->GetType()->TypeName();
-  CHECK(src_type->dtype_ == DataType::INT8 || src_type->dtype_ == DataType::UINT8 ||
-        src_type->dtype_ == DataType::INT16 || src_type->dtype_ == DataType::UINT16 ||
-        src_type->dtype_ == DataType::INT32 || src_type->dtype_ == DataType::UINT32 ||
-        src_type->dtype_ == DataType::FP16 || src_type->dtype_ == DataType::BF16 ||
-        src_type->dtype_ == DataType::FP32)
+  auto is_gatherb_dtype = [](const DataType& dtype) {
+    return dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
+           dtype == DataType::UINT16 || dtype == DataType::INT32 || dtype == DataType::UINT32 ||
+           dtype == DataType::FP16 || dtype == DataType::BF16 || dtype == DataType::FP32;
+  };
+  CHECK(is_gatherb_dtype(src_type->dtype_))
       << "The operator " << op_name
       << " requires src dtype to be an 8/16/32-bit int/uint or FP16/BF16/FP32, but got "
       << src_type->dtype_.ToString();
+  DataType output_dtype = src_type->dtype_;
+  for (const auto& [key, value] : kwargs) {
+    if (key != "output_dtype") continue;
+    if (value.type() == typeid(DataType)) {
+      output_dtype = AnyCast<DataType>(value, "kwarg key: output_dtype");
+    } else if (value.type() == typeid(int)) {
+      output_dtype = static_cast<DataType>(AnyCast<int>(value, "kwarg key: output_dtype"));
+    }
+    break;
+  }
+  CHECK(is_gatherb_dtype(output_dtype))
+      << "The operator " << op_name
+      << " requires output_dtype to be an 8/16/32-bit int/uint or FP16/BF16/FP32, but got "
+      << output_dtype.ToString();
 
   auto offset_type = As<TileType>(args[1]->GetType());
   CHECK(offset_type) << "The operator " << op_name << " requires offset to be a TileType, but got "
@@ -162,33 +177,35 @@ static TypePtr DeduceTileGatherbType(const std::vector<ExprPtr>& args,
       << " requires offset columns to be a positive multiple of 8 (32-byte UINT32 row), but got "
       << offset_cols->value_;
 
-  const auto element_bytes = src_type->dtype_.GetByte();
+  const auto element_bytes = output_dtype.GetByte();
   CHECK(element_bytes != 0 && 32 % element_bytes == 0)
       << "The operator " << op_name
-      << " requires a byte-addressable src dtype that divides 32 bytes, but got "
-      << src_type->dtype_.ToString();
+      << " requires a byte-addressable output dtype that divides 32 bytes, but got "
+      << output_dtype.ToString();
   const int64_t elements_per_block = static_cast<int64_t>(32 / element_bytes);
-  auto make_scaled_dim = [elements_per_block](const ExprPtr& dim, const char* label) -> ExprPtr {
-    auto constant = As<ConstInt>(dim);
-    CHECK(constant) << "tile.gatherb requires static " << label;
-    return std::make_shared<ConstInt>(constant->value_ * elements_per_block, DataType::INDEX,
-                                      constant->span_);
+  auto make_scaled_dim = [elements_per_block](const ExprPtr& dim) -> ExprPtr {
+    if (auto constant = As<ConstInt>(dim)) {
+      return std::make_shared<ConstInt>(constant->value_ * elements_per_block, DataType::INDEX,
+                                        constant->span_);
+    }
+    return MakeMul(
+        dim, std::make_shared<ConstInt>(elements_per_block, DataType::INDEX, Span::unknown()));
   };
 
   const auto& offset_view = tile_view_semantics::GetEffectiveTileView(*offset_type);
   std::vector<ExprPtr> output_shape = {
       offset_type->shape_[0],
-      make_scaled_dim(offset_type->shape_[1], "offset columns"),
+      make_scaled_dim(offset_type->shape_[1]),
   };
   std::vector<ExprPtr> output_valid_shape = {
       offset_view.valid_shape[0],
-      make_scaled_dim(offset_view.valid_shape[1], "offset valid columns"),
+      make_scaled_dim(offset_view.valid_shape[1]),
   };
 
   TileView tile_view;
   tile_view.valid_shape = std::move(output_valid_shape);
   tile_view.blayout = TileLayout::row_major;
-  return std::make_shared<TileType>(std::move(output_shape), src_type->dtype_, std::nullopt, tile_view);
+  return std::make_shared<TileType>(std::move(output_shape), output_dtype, std::nullopt, tile_view);
 }
 
 REGISTER_OP("tile.gatherb")
@@ -196,6 +213,7 @@ REGISTER_OP("tile.gatherb")
     .set_description("Gather 32-byte source blocks by UINT32 byte offset (maps to pto.tgatherb)")
     .add_argument("src", "Source tile (8/16/32-bit int/uint or FP16/BF16/FP32)")
     .add_argument("offset", "One UINT32 byte offset per 32-byte destination block")
+    .set_attr<DataType>("output_dtype")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
