@@ -117,12 +117,6 @@ static DataType GetBitwiseScalarDataType(DataType tile_dtype) {
   return tile_dtype;
 }
 
-static bool IsShiftScalarDataType(DataType dtype) {
-  // PTOAS models scalar shift counts as signless integers. Explicit PyPTO
-  // unsigned scalar types lower to ui8/ui16/ui32 and are rejected by PTOAS.
-  return dtype == DataType::INT8 || dtype == DataType::INT16 || dtype == DataType::INT32;
-}
-
 static std::shared_ptr<TileType> MakePackedPredicateTileType(
     const std::vector<ExprPtr>& logical_shape, const std::shared_ptr<const TileType>& source_tile_type) {
   INTERNAL_CHECK(!logical_shape.empty())
@@ -283,13 +277,20 @@ TypePtr DeduceTileOpShiftScalarType(const std::vector<ExprPtr>& args,
              << args[0]->GetType()->TypeName();
   CHECK(shift) << "The operator " << op_name << " requires second argument to be a ScalarType, but got "
                << args[1]->GetType()->TypeName();
-  CHECK(IsShiftScalarDataType(src->dtype_))
-      << "The operator " << op_name << " requires tile/scalar dtype in {INT8, INT16, INT32}, but got "
-      << src->dtype_.ToString();
-  CHECK(shift->dtype_ == src->dtype_)
+  CHECK(IsShiftDataType(src->dtype_))
       << "The operator " << op_name
-      << " requires src, scalar, and dst to have the same dtype, but scalar has " << shift->dtype_.ToString()
-      << " and src has " << src->dtype_.ToString();
+      << " requires tile dtype in {INT8, UINT8, INT16, UINT16, INT32, UINT32}, but got "
+      << src->dtype_.ToString();
+  CHECK(shift->dtype_.IsSignedInt() && shift->dtype_.GetBit() == src->dtype_.GetBit())
+      << "The operator " << op_name
+      << " requires a signless scalar shift count with the same bit width as src, but scalar has "
+      << shift->dtype_.ToString() << " and src has " << src->dtype_.ToString();
+  if (auto constant = As<ConstInt>(args[1])) {
+    const int64_t shift_value = constant->value_;
+    CHECK(shift_value >= 0 && static_cast<uint64_t>(shift_value) < src->dtype_.GetBit())
+        << "The operator " << op_name << " requires a constant shift count in [0, "
+        << (src->dtype_.GetBit() - 1) << "], but got " << shift_value;
+  }
 
   TileView tile_view;
   tile_view.valid_shape = GetValidShape(src);
@@ -337,36 +338,6 @@ TypePtr DeduceTileSubsType(const std::vector<ExprPtr>& args,
       << " requires scalar dtype in {INT8, INT16, INT32, FP16, FP32, BF16}, but got "
       << scalar_type->dtype_.ToString();
   return result_type;
-}
-
-TypePtr DeduceTileOpIntScalarBinaryType(const std::vector<ExprPtr>& args,
-                                        const std::vector<std::pair<std::string, std::any>>& kwargs,
-                                        const std::string& op_name) {
-  CHECK(args.size() == 2) << "The operator " << op_name << " requires exactly 2 arguments, but got "
-                          << args.size();
-
-  // First argument must be TileType with integer dtype.
-  auto tile_type = As<TileType>(args[0]->GetType());
-  CHECK(tile_type) << "The operator " << op_name << " requires first argument to be a TileType, but got "
-                   << args[0]->GetType()->TypeName();
-  CHECK(tile_type->dtype_.IsInt()) << "The operator " << op_name << " requires integer tile dtype, but got "
-                                   << tile_type->dtype_.ToString();
-
-  // Second argument must be ScalarType with an integer dtype per ISA spec:
-  //   %dst = tshls/tshrs/tands/tors %src, %scalar : !pto.tile<...>, i32
-  // The IR allows any integer width (INT8/16/32/64, UINT variants); codegen casts to i32.
-  auto scalar_type = As<ScalarType>(args[1]->GetType());
-  CHECK(scalar_type) << "The operator " << op_name << " requires second argument to be a ScalarType, but got "
-                     << args[1]->GetType()->TypeName();
-  CHECK(scalar_type->dtype_.IsInt()) << "The operator " << op_name
-                                     << " requires shift/bitwise scalar to be an integer type, but got "
-                                     << scalar_type->dtype_.ToString();
-
-  // Result has the same shape and dtype as the input tile; the shift amount does not change element type.
-  TileView tile_view;
-  tile_view.valid_shape = GetValidShape(tile_type);
-  InheritTileViewLayout(tile_view, tile_type);
-  return std::make_shared<TileType>(tile_type->shape_, tile_type->dtype_, std::nullopt, tile_view);
 }
 
 static void CheckRemainderTileContract(const std::shared_ptr<const TileType>& lhs,
