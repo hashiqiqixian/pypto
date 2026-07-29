@@ -879,10 +879,10 @@ class TestAutoTileMatmulL0MNTiling:
         assert "pl.tile.matmul_bias(" in printed
         assert "pl.tile.matmul_acc(" in printed
         assert "pl.tile.slice(bias_mat" not in printed
-        assert "pl.tile.load(bias," in printed
-        assert not re.search(
-            r"^\s*bias_mat:.*tile\.load\(bias, \[0, 0\], \[1, 512\]", printed, re.MULTILINE
-        ), "the original redundant full bias load must be removed"
+        assert re.search(r"pl\.tile\.load\(\s*bias,", printed)
+        assert not re.search(r"pl\.tile\.load\(\s*bias,\s*\[0, 0\],\s*\[1, 512\]", printed), (
+            "the original redundant full bias load must be removed"
+        )
         assert "pl.tile.move(" in printed and "target_memory=pl.Mem.Bias" in printed
         assert "pl.tile.extract(bias_mat" not in printed
         assert "target_memory=pl.Mem.Bias" in printed
@@ -1016,7 +1016,7 @@ class TestAutoTileMatmulL0MNTiling:
 
         After = passes.auto_tile_matmul_l0()(Before)
         printed = ir.python_print(After)
-        assert "pl.tile.load(bias, [0, 512], [1, 16], [1, 16]" in printed
+        assert re.search(r"pl\.tile\.load\(\s*bias,\s*\[0, 512\],\s*\[1, 16\],\s*\[1, 16\]", printed)
         assert "pl.tile.slice(bias_mat" not in printed
         assert "target_memory=pl.Mem.Bias" in printed
         assert "pl.tile.extract(bias_mat" not in printed
@@ -1101,7 +1101,9 @@ class TestAutoTileMatmulL0MNTiling:
 
         printed = ir.python_print(passes.auto_tile_matmul_l0()(Before))
         assert "pl.tile.matmul_bias(lhs_mat, rhs_mat, bias_mat)" not in printed
-        windows = [int(n) for n in re.findall(r"_bias_mat:.*tile\.load\(bias,.*\[1, (\d+)\]", printed)]
+        windows = [
+            int(n) for n in re.findall(r"pl\.tile\.load\(\s*bias,\s*\[[^]]+\],\s*\[1, (\d+)\]", printed)
+        ]
         assert windows and max(windows) <= 256
 
     def test_matmul_bias_nonfractal_mn_is_deferred(self):
@@ -3078,6 +3080,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
             def kernel(
                 self,
                 q: pl.Tensor[[16, 128], pl.BF16],
+                q_row: pl.Tensor[[1, 128], pl.BF16],
                 b: pl.Tensor[[128, 512], pl.BF16],
                 out: pl.Out[pl.Tensor[[16, 512], pl.FP32]],
             ) -> pl.Tensor[[16, 512], pl.FP32]:
@@ -3087,6 +3090,12 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
                 q_l0: pl.Tile[[16, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
                     q_mat, target_memory=pl.Mem.Left
                 )
+                q_row_mat: pl.Tile[[1, 128], pl.BF16, pl.Mem.Mat] = pl.tile.load(
+                    q_row, [0, 0], [1, 128], target_memory=pl.Mem.Mat
+                )
+                q_row_l0: pl.Tile[[1, 128], pl.BF16, pl.Mem.Left] = pl.tile.move(
+                    q_row_mat, target_memory=pl.Mem.Left
+                )
                 b_mat: pl.Tile[[128, 512], pl.BF16, pl.Mem.Mat] = pl.tile.load(
                     b, [0, 0], [128, 512], target_memory=pl.Mem.Mat
                 )
@@ -3094,7 +3103,7 @@ class TestAutoTileMatmulL0ExistingPipelineDbC:
                     b_l0: pl.Tile[[128, 128], pl.BF16, pl.Mem.Right] = pl.tile.extract(
                         b_mat, 0, ni, [128, 128], target_memory=pl.Mem.Right
                     )
-                    _other: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.gemv(q_l0, b_l0)
+                    _other: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.gemv(q_row_l0, b_l0)
                     c: pl.Tile[[16, 128], pl.FP32, pl.Mem.Acc] = pl.tile.matmul(q_l0, b_l0)
                     out_s: pl.Tensor[[16, 512], pl.FP32] = pl.store(c, [0, ni], out_i)
                     out_r = pl.yield_(out_s)
@@ -3534,7 +3543,7 @@ class TestAutoTileMatmulL0MatScratch:
 
         After = passes.auto_tile_matmul_l0()(Before)
         printed = ir.python_print(After)
-        assert re.search(r"^\s*bias_mat:.*tile\.load\(bias, \[0, 0\], \[1, 192\]", printed, re.MULTILINE)
+        assert re.search(r"pl\.tile\.load\(\s*bias,\s*\[0, 0\],\s*\[1, 192\]", printed)
         assert printed.count("pl.tile.matmul_bias(") == 1
         assert "pl.tile.matmul_acc(" in printed
         assert "pl.tile.assemble(" in printed
