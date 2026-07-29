@@ -739,6 +739,136 @@ class TestB01PrecisionAndRowExpandAddCodegen:
         assert self._ins_operand_count(three_operand_line) == 3
 
 
+class TestB02SelectionAndPreluCodegen:
+    """Exact PTOAS forms for TSELS and TPRELU."""
+
+    def _generate_mlir(self, program_cls, backend_type=BackendType.Ascend910B) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        funcs = list(optimized.functions.values())
+        assert funcs, "Program has no functions"
+        single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
+        return codegen.PTOCodegen().generate(single)
+
+    @staticmethod
+    def _op_line(mlir: str, op_name: str) -> str:
+        line = next((line for line in mlir.splitlines() if op_name in line), "")
+        assert line, f"{op_name} not found in MLIR:\n{mlir}"
+        return line
+
+    @staticmethod
+    def _ins_operand_count(line: str) -> int:
+        ins_start = line.find("ins(")
+        ins_end = line.find(")", ins_start)
+        assert ins_start != -1 and ins_end != -1, f"ins(...) clause not found in: {line}"
+        operands = line[ins_start + len("ins(") : ins_end].split(":", 1)[0]
+        return operands.count(",") + 1
+
+    def test_tsels_emits_mask_src_tmp_and_typed_scalar(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.INT32],
+                out: pl.Tensor[[16, 16], pl.INT32],
+            ) -> pl.Tensor[[16, 16], pl.INT32]:
+                src_tile: pl.Tile[[16, 16], pl.INT32] = pl.load(src, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=4)
+                tmp: pl.Tile[[1, 32], pl.UINT8] = pl.tile.create([1, 32], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.INT32] = pl.tile.sels(mask, src_tile, tmp, -3)
+                return pl.store(result, [0, 0], out)
+
+        for backend_type in (BackendType.Ascend910B, BackendType.Ascend950):
+            line = self._op_line(self._generate_mlir(Prog, backend_type), "pto.tsels")
+            assert self._ins_operand_count(line) == 4
+            assert "i32" in line
+
+    def test_tsels_unsigned_src_emits_signed_bit_compatible_scalar(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.UINT32],
+                out: pl.Tensor[[16, 16], pl.UINT32],
+            ) -> pl.Tensor[[16, 16], pl.UINT32]:
+                src_tile: pl.Tile[[16, 16], pl.UINT32] = pl.load(src, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=4)
+                tmp: pl.Tile[[1, 32], pl.UINT8] = pl.tile.create([1, 32], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.UINT32] = pl.tile.sels(mask, src_tile, tmp, 0x8000000B)
+                return pl.store(result, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        line = self._op_line(mlir, "pto.tsels")
+        assert self._ins_operand_count(line) == 4
+        assert "ui32" in line
+        assert "i32" in line
+        assert "arith.constant -2147483637 : i32" in mlir
+
+    def test_tsels_rejects_int8_on_a2a3(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.INT8],
+                out: pl.Tensor[[16, 16], pl.INT8],
+            ) -> pl.Tensor[[16, 16], pl.INT8]:
+                src_tile: pl.Tile[[16, 16], pl.INT8] = pl.load(src, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=4)
+                tmp: pl.Tile[[1, 1], pl.UINT8] = pl.tile.create([1, 1], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.INT8] = pl.tile.sels(mask, src_tile, tmp, -3)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="only supported on the 'a5' backend"):
+            self._generate_mlir(Prog)
+
+    def test_tprelu_emits_src_slope_and_tmp(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(slope, [0, 0], [16, 16])
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.tile.create([17, 32], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        line = self._op_line(self._generate_mlir(Prog), "pto.tprelu")
+        assert self._ins_operand_count(line) == 3
+
+    def test_tprelu_signed_scratch_is_a5_only(self):
+        """A2/A3 requires UINT8 scratch even though the pinned verifier accepts signed i8."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(slope, [0, 0], [16, 16])
+                tmp: pl.Tile[[17, 32], pl.INT8] = pl.tile.create([17, 32], dtype=pl.INT8)
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="A2/A3 requires UINT8 tmp scratch"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+        line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
+        assert self._ins_operand_count(line) == 3
+
+
 class TestTileReadWriteOffsetCodegen:
     """Tests verifying tile.read/write multi-dimensional indices generate correct flat offsets."""
 

@@ -3814,6 +3814,63 @@ class TestForbidOutputAlias:
             f"tile.sel output must not alias its tmp buffer, but both bind to {bases['dst']}"
         )
 
+    def test_sels_output_does_not_alias_mask_or_tmp(self):
+        """TSELS may reuse src, but must not overwrite its predicate or scratch."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[1, 32], pl.UINT8],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                t0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [16, 16])
+                dead: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(t0, t0)
+                src: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(b, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.cmps(dead, 0.0, cmp_type=4)
+                tmp: pl.Tile[[1, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [1, 32])
+                dst: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.sels(mask, src, tmp, -1.0)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(dst, [0, 0], out)
+                return res
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dst", "mask", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["dst"] != bases["mask"]
+        assert bases["dst"] != bases["tmp"]
+
+    def test_prelu_output_does_not_alias_any_input(self):
+        """TPRELU reads src, slope, and tmp while writing dst."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                src_in: pl.Tensor[[16, 16], pl.FP32],
+                slope_in: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[17, 32], pl.UINT8],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(src_in, [0, 0], [16, 16])
+                slope: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(slope_in, [0, 0], [16, 16])
+                tmp: pl.Tile[[17, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [17, 32])
+                dst: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.prelu(src, slope, tmp)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(dst, [0, 0], out)
+                return res
+
+        After = _run_pipeline(Before)
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dst", "src", "slope", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["dst"] != bases["src"]
+        assert bases["dst"] != bases["slope"]
+        assert bases["dst"] != bases["tmp"]
+
     def test_row_sum_output_does_not_alias_input_or_tmp(self):
         """A row reduction output must not share a buffer with its input or tmp.
 
