@@ -1517,7 +1517,10 @@ class _PersistentOrch:
         return handle
 
     def copy_to(self, worker_id: int, dst: int, src: int, size: int) -> None:
-        self.copy_calls.append((worker_id, dst, src, size))
+        raise AssertionError("persistent domain reset must use bounded copy_to_offset")
+
+    def copy_to_offset(self, worker_id: int, dst_base: int, dst_offset: int, src: int, size: int) -> None:
+        self.copy_calls.append((worker_id, dst_base + dst_offset, src, size))
 
     def scope_end(self) -> None:
         self.scope_end_count += 1

@@ -1211,9 +1211,10 @@ class DistributedWorker(Worker):
                 window_size = int(context.actual_window_size)
                 for offset in range(0, window_size, chunk_size):
                     nbytes = min(chunk_size, window_size - offset)
-                    orch.copy_to(
+                    orch.copy_to_offset(
                         int(worker_id),
-                        int(context.local_window_base) + offset,
+                        int(context.local_window_base),
+                        offset,
                         zero_ptr,
                         nbytes,
                     )
