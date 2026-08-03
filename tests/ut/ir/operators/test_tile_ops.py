@@ -3877,8 +3877,8 @@ class TestTileBitwiseArithmeticOps:
                 slope: pl.Tile[[16, 16], pl.FP32] = pl.tile.create(
                     [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
                 )
-                tmp: pl.Tile[[16, 16], pl.FP32] = pl.tile.create(
-                    [16, 16], dtype=pl.FP32, target_memory=pl.MemorySpace.Vec
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.tile.create(
+                    [17, 32], dtype=pl.UINT8, target_memory=pl.MemorySpace.Vec
                 )
                 tile_c: pl.Tile[[16, 16], pl.FP32] = pl.prelu(tile_x, slope, tmp)
                 result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_c, [0, 0], output)
@@ -3886,6 +3886,91 @@ class TestTileBitwiseArithmeticOps:
 
         ir_str = str(Program)
         assert "tile.prelu" in ir_str
+        reparsed = pl.parse_program(ir_str)
+        ir.assert_structural_equal(Program, reparsed)
+
+    def test_tile_prelu_preserves_valid_shape(self):
+        """TPRELU result mirrors the source physical and valid shapes."""
+        src = _partial_tile([16, 16], [8, 12], name="src")
+        slope = _partial_tile([16, 16], [8, 12], name="slope")
+        span = ir.Span.unknown()
+        tmp = ir.Var("tmp", ir.TileType([9, 32], DataType.UINT8), span)
+
+        result = tile.prelu(src, slope, tmp).type
+
+        assert isinstance(result, ir.TileType)
+        assert [dim.value for dim in result.shape if isinstance(dim, ir.ConstInt)] == [16, 16]
+        assert _valid_of(result) == [8, 12]
+
+    def test_tile_prelu_defers_target_specific_tmp_validation(self):
+        """IR deduction accepts a small UINT8 placeholder; A2/A3 validates it in codegen."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
+        slope = ir.Var("slope", ir.TileType([16, 16], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 1], DataType.UINT8), span)
+
+        result = tile.prelu(src, slope, tmp).type
+
+        assert isinstance(result, ir.TileType)
+        assert result.dtype == DataType.FP32
+
+    def test_tile_prelu_defers_alias_validation_to_target_codegen(self):
+        """Expression identity is not an alias proof, and A5 permits overlapping operands."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([17, 32], DataType.UINT8), span)
+
+        result = tile.prelu(src, src, tmp)
+
+        assert isinstance(result.type, ir.TileType)
+
+    @pytest.mark.parametrize(
+        "slope_type,error",
+        [
+            (ir.TileType([8, 16], DataType.FP32), "physical shape"),
+            (ir.TileType([16, 16], DataType.FP16), "slope dtype"),
+            (
+                ir.TileType([16, 16], DataType.FP32, tile_view=ir.TileView(valid_shape=[8, 16])),
+                "valid_shape",
+            ),
+        ],
+    )
+    def test_tile_prelu_rejects_incompatible_slope(self, slope_type, error):
+        """TPRELU rejects slope contracts that PTOAS cannot assemble."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
+        slope = ir.Var("slope", slope_type, span)
+        tmp = ir.Var("tmp", ir.TileType([17, 32], DataType.UINT8), span)
+
+        with pytest.raises(ValueError, match=error):
+            tile.prelu(src, slope, tmp)
+
+    def test_tile_prelu_rejects_non_rank2_tmp(self):
+        """The target-independent ABI still requires a rank-2 tile placeholder."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
+        slope = ir.Var("slope", ir.TileType([16, 16], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([16], DataType.UINT8), span)
+
+        with pytest.raises(ValueError, match="rank-2 tmp"):
+            tile.prelu(src, slope, tmp)
+
+    @pytest.mark.parametrize(
+        ("src_type", "tmp_type", "error"),
+        [
+            (ir.TileType([16, 16], DataType.INT32), ir.TileType([17, 32], DataType.UINT8), "src dtype"),
+            (ir.TileType([256], DataType.FP32), ir.TileType([17, 32], DataType.UINT8), "rank-2 src"),
+        ],
+    )
+    def test_tile_prelu_rejects_invalid_src_contract(self, src_type, tmp_type, error):
+        """TPRELU rejects unsupported source dtypes and ranks."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", src_type, span)
+        slope = ir.Var("slope", src_type, span)
+        tmp = ir.Var("tmp", tmp_type, span)
+
+        with pytest.raises(ValueError, match=error):
+            tile.prelu(src, slope, tmp)
 
     def test_tile_not(self):
         """Test tile.not operator - element-wise bitwise NOT of a tile (int16/uint16 only)."""
@@ -4014,7 +4099,7 @@ class TestTileBitwiseArithmeticOps:
         assert "tile.lrelu" in ir_str
 
     def test_tile_sels(self):
-        """Test tile.sels operator - select between two tiles via integer scalar mode."""
+        """Test tile.sels operator - select between a tile and scalar via mask."""
 
         @pl.program
         class Program:
@@ -4022,17 +4107,194 @@ class TestTileBitwiseArithmeticOps:
             def main(
                 self,
                 a: pl.Tensor[[128, 128], pl.FP32],
-                b: pl.Tensor[[128, 128], pl.FP32],
                 output: pl.Tensor[[128, 128], pl.FP32],
             ) -> pl.Tensor[[128, 128], pl.FP32]:
                 tile_a: pl.Tile[[32, 32], pl.FP32] = pl.load(a, [0, 0], [32, 32])
-                tile_b: pl.Tile[[32, 32], pl.FP32] = pl.load(b, [0, 0], [32, 32])
-                tile_out: pl.Tile[[32, 32], pl.FP32] = pl.sels(tile_a, tile_b, 1)
+                mask: pl.Tile[[32, 32], pl.UINT8] = pl.cmps(tile_a, 0.0, cmp_type=4)
+                tmp: pl.Tile[[1, 32], pl.UINT8] = pl.tile.create([1, 32], dtype=pl.UINT8)
+                tile_out: pl.Tile[[32, 32], pl.FP32] = pl.sels(mask, tile_a, tmp, -1.0)
                 result: pl.Tensor[[128, 128], pl.FP32] = pl.store(tile_out, [0, 0], output)
                 return result
 
         ir_str = str(Program)
         assert "tile.sels" in ir_str
+        reparsed = pl.parse_program(ir_str)
+        ir.assert_structural_equal(Program, reparsed)
+
+    def test_tile_sels_preserves_src_type_and_valid_shape(self):
+        """TSELS result mirrors src rather than the packed mask or tmp."""
+        span = ir.Span.unknown()
+        mask = ir.Var(
+            "mask",
+            ir.TileType([16, 32], DataType.UINT8, tile_view=ir.TileView(valid_shape=[8, 2])),
+            span,
+        )
+        src = _partial_tile([16, 16], [8, 12], name="src")
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        result = tile.sels(mask, src, tmp, -2.5).type
+
+        assert isinstance(result, ir.TileType)
+        assert result.dtype == DataType.FP32
+        assert [dim.value for dim in result.shape if isinstance(dim, ir.ConstInt)] == [16, 16]
+        assert _valid_of(result) == [8, 12]
+
+    def test_tile_sels_retypes_constant_to_src_dtype(self):
+        """A parser-produced constant adopts the selected source dtype."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", ir.TileType([16, 32], DataType.UINT8), span)
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP16), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+        scalar = ir.ConstFloat(-1.0, DataType.FP32, span)
+
+        call = tile.sels(mask, src, tmp, scalar)
+
+        assert _operand_dtype(call.args[3]) == DataType.FP16
+
+    def test_tile_sels_rejects_fractional_constant_for_integer_src(self):
+        """Retyping a scalar must not silently truncate a fractional value."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", ir.TileType([16, 32], DataType.UINT8), span)
+        src = ir.Var("src", ir.TileType([16, 16], DataType.INT32), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        with pytest.raises(ValueError, match="non-integral"):
+            tile.sels(mask, src, tmp, -1.5)
+
+    def test_tile_sels_rejects_scalar_dtype_mismatch(self):
+        """A non-constant scalar expression must match the selected source dtype."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", ir.TileType([16, 32], DataType.UINT8), span)
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP16), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+        scalar = ir.Var("scalar", ir.ScalarType(DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="scalar dtype"):
+            tile.sels(mask, src, tmp, scalar)
+
+    @pytest.mark.parametrize(
+        "mask_type,error",
+        [
+            (ir.TileType([16, 32], DataType.FP32), "integer mask"),
+            (ir.TileType([32], DataType.UINT8), "rank-2 mask"),
+        ],
+    )
+    def test_tile_sels_rejects_invalid_mask(self, mask_type, error):
+        """TSELS requires a rank-2 packed integer predicate tile."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", mask_type, span)
+        src = ir.Var("src", ir.TileType([16, 16], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        with pytest.raises(ValueError, match=error):
+            tile.sels(mask, src, tmp, -1.0)
+
+    @pytest.mark.parametrize(
+        "mask_type,error",
+        [
+            (
+                ir.TileType([7, 64], DataType.UINT8),
+                "mask carrier rows",
+            ),
+            (
+                ir.TileType([8, 32], DataType.UINT8),
+                "each mask carrier row",
+            ),
+        ],
+    )
+    def test_tile_sels_rejects_mask_too_small_for_src_valid_shape(self, mask_type, error):
+        """A packed mask must cover every valid source row and column bit."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", mask_type, span)
+        src = ir.Var("src", ir.TileType([8, 257], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        with pytest.raises(ValueError, match=error):
+            tile.sels(mask, src, tmp, -1.0)
+
+    def test_tile_sels_accepts_provable_dynamic_mask_coverage(self):
+        """Shared symbolic rows and the exact packed-byte expression are provably safe."""
+        span = ir.Span.unknown()
+        valid_rows = ir.Var("valid_rows", ir.ScalarType(DataType.INDEX), span)
+        valid_cols = ir.Var("valid_cols", ir.ScalarType(DataType.INDEX), span)
+        packed_cols = (valid_cols + 7) // 8
+        mask = ir.Var(
+            "mask",
+            ir.TileType(
+                [16, 64],
+                DataType.UINT8,
+                tile_view=ir.TileView(valid_shape=[valid_rows, packed_cols]),
+            ),
+            span,
+        )
+        src = ir.Var(
+            "src",
+            ir.TileType(
+                [16, 512],
+                DataType.FP32,
+                tile_view=ir.TileView(valid_shape=[valid_rows, valid_cols]),
+            ),
+            span,
+        )
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        result = tile.sels(mask, src, tmp, -1.0)
+
+        assert isinstance(result.type, ir.TileType)
+
+    @pytest.mark.parametrize(
+        ("mask_dtype", "physical_cols", "valid_cols", "accepted"),
+        [
+            (DataType.INT16, 32, 16, False),
+            (DataType.INT16, 32, 17, True),
+            (DataType.UINT16, 32, 16, False),
+            (DataType.UINT16, 32, 17, True),
+            (DataType.INT32, 16, 8, False),
+            (DataType.INT32, 16, 9, True),
+            (DataType.UINT32, 16, 8, False),
+            (DataType.UINT32, 16, 9, True),
+        ],
+    )
+    def test_tile_sels_packed_mask_capacity_respects_carrier_width(
+        self, mask_dtype, physical_cols, valid_cols, accepted
+    ):
+        """Packed-mask capacity is measured in bytes for every integer carrier."""
+        span = ir.Span.unknown()
+        mask = ir.Var(
+            "mask",
+            ir.TileType(
+                [2, physical_cols],
+                mask_dtype,
+                tile_view=ir.TileView(valid_shape=[2, valid_cols]),
+            ),
+            span,
+        )
+        src = ir.Var("src", ir.TileType([2, 257], DataType.FP32), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        if accepted:
+            assert isinstance(tile.sels(mask, src, tmp, -1.0).type, ir.TileType)
+        else:
+            with pytest.raises(ValueError, match="each mask carrier row"):
+                tile.sels(mask, src, tmp, -1.0)
+
+    @pytest.mark.parametrize(
+        ("src_type", "tmp_type", "error"),
+        [
+            (ir.TileType([16, 16], DataType.BF16), ir.TileType([1, 32], DataType.UINT8), "src dtype"),
+            (ir.TileType([256], DataType.FP32), ir.TileType([1, 32], DataType.UINT8), "rank-2 src"),
+            (ir.TileType([16, 16], DataType.FP32), ir.TileType([32], DataType.UINT8), "rank-2 tmp"),
+        ],
+    )
+    def test_tile_sels_rejects_invalid_src_and_tmp_contract(self, src_type, tmp_type, error):
+        """TSELS rejects unsupported source dtypes and non-2D operands."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", ir.TileType([16, 32], DataType.UINT8), span)
+        src = ir.Var("src", src_type, span)
+        tmp = ir.Var("tmp", tmp_type, span)
+
+        with pytest.raises(ValueError, match=error):
+            tile.sels(mask, src, tmp, -1.0)
 
     def test_tile_sel(self):
         """Test tile.sel operator - per-element selection between two tiles via mask tile."""
@@ -4246,13 +4508,44 @@ class TestTileScalarOperandDtype:
         call = tile.lrelu(ir.Var("t", ir.TileType([32, 32], DataType.FP32), ir.Span.unknown()), 1)
         assert _operand_dtype(call.args[1]) == DataType.FP32
 
-    def test_sels_mode_stays_int32(self):
-        """tile.sels keeps its select-mode flag at INT32 and never index."""
+    @pytest.mark.parametrize(
+        "dtype,scalar,expected_dtype,expected_value",
+        [
+            (DataType.INT8, -2, DataType.INT8, -2),
+            (DataType.UINT8, 0x82, DataType.INT8, -126),
+            (DataType.INT16, -3, DataType.INT16, -3),
+            (DataType.UINT16, 0x8007, DataType.INT16, -32761),
+            (DataType.INT32, 7, DataType.INT32, 7),
+            (DataType.UINT32, 0x8000000B, DataType.INT32, -2147483637),
+            (DataType.FP16, -0.5, DataType.FP16, -0.5),
+            (DataType.FP32, 1.25, DataType.FP32, 1.25),
+        ],
+    )
+    def test_sels_scalar_adopts_ptoas_dtype(self, dtype, scalar, expected_dtype, expected_value):
+        """tile.sels uses signed bit-compatible scalars for unsigned sources."""
         span = ir.Span.unknown()
-        lhs = ir.Var("a", ir.TileType([32, 32], DataType.FP32), span)
-        rhs = ir.Var("b", ir.TileType([32, 32], DataType.FP32), span)
-        call = tile.sels(lhs, rhs, 1)
-        assert _operand_dtype(call.args[2]) == DataType.INT32
+        mask = ir.Var("mask", ir.TileType([32, 32], DataType.UINT8), span)
+        src = ir.Var("src", ir.TileType([32, 32], dtype), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+        call = tile.sels(mask, src, tmp, scalar)
+        scalar_arg = call.args[3]
+        assert isinstance(scalar_arg, (ir.ConstInt, ir.ConstFloat))
+        assert _operand_dtype(scalar_arg) == expected_dtype
+        assert scalar_arg.value == expected_value
+
+    def test_sels_unsigned_src_accepts_only_signed_same_width_scalar_expr(self):
+        """PTOAS scalar operands are signed even when the selected tile is unsigned."""
+        span = ir.Span.unknown()
+        mask = ir.Var("mask", ir.TileType([32, 32], DataType.UINT8), span)
+        src = ir.Var("src", ir.TileType([32, 32], DataType.UINT16), span)
+        tmp = ir.Var("tmp", ir.TileType([1, 32], DataType.UINT8), span)
+
+        call = tile.sels(mask, src, tmp, ir.Var("signed_scalar", ir.ScalarType(DataType.INT16), span))
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.dtype == DataType.UINT16
+
+        with pytest.raises(ValueError, match="requires scalar dtype int16 for src dtype uint16"):
+            tile.sels(mask, src, tmp, ir.Var("unsigned_scalar", ir.ScalarType(DataType.UINT16), span))
 
 
 class TestTileLoadOp:

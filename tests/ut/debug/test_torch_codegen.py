@@ -408,6 +408,33 @@ def test_bitwise_not_reference():
         assert "torch.bitwise_not(a)" in torch_codegen(func)
 
 
+def test_tile_sels_and_prelu():
+    """Selection and PReLU debug codegen must ignore scratch operands."""
+    mask = _tile_var("mask", [16, 32], DataType.UINT8)
+    src = _tile_var("src", [16, 16])
+    slope = _tile_var("slope", [16, 16])
+    sels_tmp = _tile_var("sels_tmp", [1, 32], DataType.UINT8)
+    prelu_tmp = _tile_var("prelu_tmp", [17, 32], DataType.UINT8)
+    sels_out = _tile_var("sels_out", [16, 16])
+    prelu_out = _tile_var("prelu_out", [16, 16])
+
+    sels_call = _op_call("tile.sels", [mask, src, sels_tmp, _float(-1.0)])
+    prelu_call = _op_call("tile.prelu", [src, slope, prelu_tmp])
+    body = ir.SeqStmts(
+        [
+            ir.AssignStmt(sels_out, sels_call, _span()),
+            ir.AssignStmt(prelu_out, prelu_call, _span()),
+        ],
+        _span(),
+    )
+    func = _simple_function("f", [mask, src, slope, sels_tmp, prelu_tmp], body)
+
+    code = torch_codegen(func)
+
+    assert "torch.where(mask, src, -1.0)" in code
+    assert "torch.where(src > 0, src, src * slope)" in code
+
+
 def test_tile_matmul_acc():
     """tile.matmul_acc should emit (acc + torch.matmul(lhs, rhs))."""
     acc = _tile_var("acc", [64, 64])

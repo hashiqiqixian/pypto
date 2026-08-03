@@ -15,6 +15,7 @@ each operation type, compiles them through the PassManager and PTOCodegen,
 and verifies the generated orchestration code.
 """
 
+import re
 import warnings
 
 import pypto.language as pl
@@ -736,6 +737,402 @@ class TestB01PrecisionAndRowExpandAddCodegen:
         three_operand_line = self._op_line(self._generate_mlir(WithTmpProg), "pto.trowexpandadd")
         assert self._ins_operand_count(two_operand_line) == 2
         assert self._ins_operand_count(three_operand_line) == 3
+
+
+class TestB02SelectionAndPreluCodegen:
+    """Exact PTOAS forms for TSELS and TPRELU."""
+
+    def _generate_mlir(self, program_cls, backend_type=BackendType.Ascend910B) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        funcs = list(optimized.functions.values())
+        assert funcs, "Program has no functions"
+        single = ir.Program([funcs[0]], funcs[0].name, optimized.span)
+        return codegen.PTOCodegen().generate(single)
+
+    @staticmethod
+    def _op_line(mlir: str, op_name: str) -> str:
+        line = next((line for line in mlir.splitlines() if op_name in line), "")
+        assert line, f"{op_name} not found in MLIR:\n{mlir}"
+        return line
+
+    @staticmethod
+    def _ins_outs_ssas(line: str) -> tuple[list[str], list[str]]:
+        match = re.fullmatch(r"\s*pto\.\w+\s+ins\((.*?)\)\s+outs\((.*?)\)\s*", line)
+        assert match, f"expected exact PTO ins(...)/outs(...) form, got: {line}"
+        ins = re.findall(r"%[\w.$-]+", match.group(1).split(":", 1)[0])
+        outs = re.findall(r"%[\w.$-]+", match.group(2).split(":", 1)[0])
+        return ins, outs
+
+    @staticmethod
+    def _assert_named_ssas(ssas: list[str], expected_names: list[str]) -> None:
+        assert len(ssas) == len(expected_names)
+        for ssa, expected_name in zip(ssas, expected_names, strict=True):
+            assert expected_name in ssa, f"expected {expected_name!r} SSA at this position, got {ssa!r}"
+
+    @staticmethod
+    def _alloc_addr_for_named_ssa(mlir: str, expected_name: str) -> str:
+        lines = [
+            line
+            for line in mlir.splitlines()
+            if "= pto.alloc_tile" in line and expected_name in line.split("=", 1)[0]
+        ]
+        assert len(lines) == 1, f"expected one alloc_tile for {expected_name!r}, got {lines}:\n{mlir}"
+        match = re.search(r"addr = (%[\w.$-]+)", lines[0])
+        assert match, f"expected a baked PyPTO address in: {lines[0]}"
+        return match.group(1)
+
+    def test_tsels_emits_mask_src_tmp_and_typed_scalar(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.INT32],
+                out: pl.Tensor[[16, 16], pl.INT32],
+            ) -> pl.Tensor[[16, 16], pl.INT32]:
+                src_tile: pl.Tile[[16, 16], pl.INT32] = pl.load(src, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=4)
+                tmp: pl.Tile[[1, 32], pl.UINT8] = pl.tile.create([1, 32], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.INT32] = pl.tile.sels(mask, src_tile, tmp, -3)
+                return pl.store(result, [0, 0], out)
+
+        for backend_type in (BackendType.Ascend910B, BackendType.Ascend950):
+            mlir = self._generate_mlir(Prog, backend_type)
+            line = self._op_line(mlir, "pto.tsels")
+            ins, outs = self._ins_outs_ssas(line)
+            scalar = re.search(r"^\s*(%[\w.$-]+)\s*=\s*arith\.constant -3 : i32\s*$", mlir, re.MULTILINE)
+            assert scalar
+            self._assert_named_ssas(ins[:3], ["mask", "src_tile", "tmp"])
+            assert ins[3:] == [scalar.group(1)]
+            self._assert_named_ssas(outs, ["result"])
+            assert "i32" in line
+
+    def test_tsels_unsigned_src_emits_signed_bit_compatible_scalar(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.UINT32],
+                out: pl.Tensor[[16, 16], pl.UINT32],
+            ) -> pl.Tensor[[16, 16], pl.UINT32]:
+                src_tile: pl.Tile[[16, 16], pl.UINT32] = pl.load(src, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=4)
+                tmp: pl.Tile[[1, 32], pl.UINT8] = pl.tile.create([1, 32], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.UINT32] = pl.tile.sels(mask, src_tile, tmp, 0x8000000B)
+                return pl.store(result, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        line = self._op_line(mlir, "pto.tsels")
+        ins, outs = self._ins_outs_ssas(line)
+        scalar = re.search(
+            r"^\s*(%[\w.$-]+)\s*=\s*arith\.constant -2147483637 : i32\s*$",
+            mlir,
+            re.MULTILINE,
+        )
+        assert scalar
+        self._assert_named_ssas(ins[:3], ["mask", "src_tile", "tmp"])
+        assert ins[3:] == [scalar.group(1)]
+        self._assert_named_ssas(outs, ["result"])
+        assert "ui32" in line
+        assert "i32" in line
+
+    def test_tsels_rejects_int8_on_a2a3(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.INT8],
+                out: pl.Tensor[[16, 16], pl.INT8],
+            ) -> pl.Tensor[[16, 16], pl.INT8]:
+                src_tile: pl.Tile[[16, 16], pl.INT8] = pl.load(src, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8] = pl.tile.cmps(src_tile, 0, cmp_type=4)
+                tmp: pl.Tile[[1, 1], pl.UINT8] = pl.tile.create([1, 1], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.INT8] = pl.tile.sels(mask, src_tile, tmp, -3)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="only supported on the 'a5' backend"):
+            self._generate_mlir(Prog)
+
+    def test_tsels_tmp_may_alias_src_only_on_a5(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mask_in: pl.Tensor[[2, 16], pl.INT32],
+                src: pl.Tensor[[2, 16], pl.INT32],
+                out: pl.Tensor[[2, 16], pl.INT32],
+            ) -> pl.Tensor[[2, 16], pl.INT32]:
+                mask: pl.Tile[[2, 16], pl.INT32] = pl.load(mask_in, [0, 0], [2, 16])
+                src_tile: pl.Tile[[2, 16], pl.INT32] = pl.load(src, [0, 0], [2, 16])
+                result: pl.Tile[[2, 16], pl.INT32] = pl.tile.sels(mask, src_tile, src_tile, -3)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="tmp overlaps src"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tsels")
+        ins, outs = self._ins_outs_ssas(line)
+        assert ins[1] == ins[2]
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tsels_tmp_may_alias_mask_only_on_a5(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mask_in: pl.Tensor[[2, 16], pl.INT32],
+                src: pl.Tensor[[2, 16], pl.INT32],
+                out: pl.Tensor[[2, 16], pl.INT32],
+            ) -> pl.Tensor[[2, 16], pl.INT32]:
+                mask: pl.Tile[[2, 16], pl.INT32] = pl.load(mask_in, [0, 0], [2, 16])
+                src_tile: pl.Tile[[2, 16], pl.INT32] = pl.load(src, [0, 0], [2, 16])
+                result: pl.Tile[[2, 16], pl.INT32] = pl.tile.sels(mask, src_tile, mask, -3)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="tmp overlaps mask"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tsels")
+        ins, outs = self._ins_outs_ssas(line)
+        assert ins[0] == ins[2]
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tsels_a2a3_rejects_overlapping_tmp_view(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mask_in: pl.Tensor[[2, 16], pl.INT32],
+                src: pl.Tensor[[2, 24], pl.INT32],
+                out: pl.Tensor[[2, 16], pl.INT32],
+            ) -> pl.Tensor[[2, 16], pl.INT32]:
+                mask: pl.Tile[[2, 16], pl.INT32] = pl.load(mask_in, [0, 0], [2, 16])
+                base: pl.Tile[[2, 24], pl.INT32] = pl.load(src, [0, 0], [2, 24])
+                src_view: pl.Tile[[2, 16], pl.INT32] = pl.tile.slice(base, [2, 16], [0, 0])
+                tmp_view: pl.Tile[[2, 16], pl.INT32] = pl.tile.slice(base, [2, 16], [0, 8])
+                result: pl.Tile[[2, 16], pl.INT32] = pl.tile.sels(mask, src_view, tmp_view, -3)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="tmp overlaps src"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        assert "pto.tsels" in self._generate_mlir(Prog, BackendType.Ascend950)
+
+    def test_tsels_tmp_may_alias_result_on_a2a3(self):
+        """A2/A3 consumes tmp through set_cmpmask before the first dst write."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mask_in: pl.Tensor[[2, 16], pl.INT32],
+                src_in: pl.Tensor[[2, 16], pl.INT32],
+                tmp_in: pl.Tensor[[2, 16], pl.INT32],
+                out: pl.Tensor[[2, 16], pl.INT32],
+            ) -> pl.Tensor[[2, 16], pl.INT32]:
+                mask: pl.Tile[[2, 16], pl.INT32] = pl.load(mask_in, [0, 0], [2, 16])
+                src: pl.Tile[[2, 16], pl.INT32] = pl.load(src_in, [0, 0], [2, 16])
+                tmp: pl.Tile[[2, 16], pl.INT32] = pl.load(tmp_in, [0, 0], [2, 16])
+                result: pl.Tile[[2, 16], pl.INT32] = pl.tile.sels(mask, src, tmp, -3)
+                keep_src_live: pl.Tile[[2, 16], pl.INT32] = pl.tile.add(src, result)
+                return pl.store(keep_src_live, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog, BackendType.Ascend910B)
+        line = self._op_line(mlir, "pto.tsels")
+        ins, outs = self._ins_outs_ssas(line)
+        self._assert_named_ssas(ins[:3], ["mask", "src", "tmp"])
+        self._assert_named_ssas(outs, ["result"])
+        tmp_addr = self._alloc_addr_for_named_ssa(mlir, "tmp")
+        result_addr = self._alloc_addr_for_named_ssa(mlir, "result")
+        assert tmp_addr == result_addr
+
+    def test_tprelu_emits_target_specific_exact_operands(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(slope, [0, 0], [16, 16])
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.tile.create([17, 32], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        a3_line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend910B), "pto.tprelu")
+        a3_ins, a3_outs = self._ins_outs_ssas(a3_line)
+        self._assert_named_ssas(a3_ins, ["src_tile", "slope_tile", "tmp"])
+        self._assert_named_ssas(a3_outs, ["result"])
+
+        a5_line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
+        a5_ins, a5_outs = self._ins_outs_ssas(a5_line)
+        self._assert_named_ssas(a5_ins, ["src_tile", "slope_tile", "tmp"])
+        self._assert_named_ssas(a5_outs, ["result"])
+
+    def test_tprelu_signed_scratch_is_a5_only(self):
+        """A2/A3 requires UINT8 scratch even though the pinned verifier accepts signed i8."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(slope, [0, 0], [16, 16])
+                tmp: pl.Tile[[17, 32], pl.INT8] = pl.tile.create([17, 32], dtype=pl.INT8)
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="A2/A3 requires UINT8 tmp scratch"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+        line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
+        ins, outs = self._ins_outs_ssas(line)
+        self._assert_named_ssas(ins, ["src_tile", "slope_tile", "tmp"])
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tprelu_a3_rejects_overlapping_views_but_a5_accepts_them(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 24], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                base: pl.Tile[[16, 24], pl.FP32] = pl.load(src, [0, 0], [16, 24])
+                src_view: pl.Tile[[16, 16], pl.FP32] = pl.tile.slice(base, [16, 16], [0, 0])
+                slope_view: pl.Tile[[16, 16], pl.FP32] = pl.tile.slice(base, [16, 16], [0, 8])
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.tile.create([17, 32], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_view, slope_view, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="src overlaps slope"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        mlir = self._generate_mlir(Prog, BackendType.Ascend950)
+        line = self._op_line(mlir, "pto.tprelu")
+        ins, outs = self._ins_outs_ssas(line)
+        subview_results = [
+            subview_line.split("=", 1)[0].strip()
+            for subview_line in mlir.splitlines()
+            if "= pto.subview " in subview_line
+        ]
+        assert ins[:2] == subview_results[:2]
+        self._assert_named_ssas(ins[2:], ["tmp"])
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tprelu_undersized_tmp_is_a3_only_validation(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(slope, [0, 0], [16, 16])
+                tmp: pl.Tile[[1, 1], pl.UINT8] = pl.tile.create([1, 1], dtype=pl.UINT8)
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="physical rows"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
+        ins, outs = self._ins_outs_ssas(line)
+        self._assert_named_ssas(ins, ["src_tile", "slope_tile", "tmp"])
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tprelu_a3_rejects_tmp_with_insufficient_valid_columns(self):
+        """Exercise the packed-column bound independently of the row bound."""
+
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[17, 32], pl.UINT8],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(slope, [0, 0], [16, 16])
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.load(tmp_in, [0, 0], [17, 32], valid_shape=[17, 1])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="valid columns"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+        line = self._op_line(self._generate_mlir(Prog, BackendType.Ascend950), "pto.tprelu")
+        ins, outs = self._ins_outs_ssas(line)
+        self._assert_named_ssas(ins, ["src_tile", "slope_tile", "tmp"])
+        self._assert_named_ssas(outs, ["result"])
+
+    def test_tprelu_a2a3_rejects_unproven_dynamic_tmp_rows(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[17, 32], pl.UINT8],
+                out: pl.Tensor[[16, 16], pl.FP32],
+                rows: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16], valid_shape=[rows, 16])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+                    slope, [0, 0], [16, 16], valid_shape=[rows, 16]
+                )
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.load(tmp_in, [0, 0], [17, 32])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="physical rows"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
+
+    def test_tprelu_a2a3_rejects_unproven_dynamic_tmp_columns(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 16], pl.FP32],
+                slope: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[17, 32], pl.UINT8],
+                out: pl.Tensor[[16, 16], pl.FP32],
+                cols: pl.Scalar[pl.INDEX],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(src, [0, 0], [16, 16], valid_shape=[16, cols])
+                slope_tile: pl.Tile[[16, 16], pl.FP32] = pl.load(
+                    slope, [0, 0], [16, 16], valid_shape=[16, cols]
+                )
+                tmp: pl.Tile[[17, 32], pl.UINT8] = pl.load(tmp_in, [0, 0], [17, 32], valid_shape=[17, 2])
+                result: pl.Tile[[16, 16], pl.FP32] = pl.tile.prelu(src_tile, slope_tile, tmp)
+                return pl.store(result, [0, 0], out)
+
+        with pytest.raises(ValueError, match="valid columns"):
+            self._generate_mlir(Prog, BackendType.Ascend910B)
 
 
 class TestTileReadWriteOffsetCodegen:

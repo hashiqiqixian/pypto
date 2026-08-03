@@ -3890,6 +3890,113 @@ class TestForbidOutputAlias:
             f"tile.sel output must not alias its tmp buffer, but both bind to {bases['dst']}"
         )
 
+    @pytest.mark.parametrize("backend_type", [BackendType.Ascend910B, BackendType.Ascend950])
+    def test_sels_output_may_reuse_dead_tmp(self, backend_type):
+        """TSELS consumes tmp before dst writes on A2/A3; A5 leaves tmp unread."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                a: pl.Tensor[[16, 16], pl.FP32],
+                b: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                t0: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(a, [0, 0], [16, 16])
+                dead: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(t0, t0)
+                src: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(b, [0, 0], [16, 16])
+                mask: pl.Tile[[16, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.cmps(dead, 0.0, cmp_type=4)
+                tmp: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [16, 16])
+                dst: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.sels(mask, src, tmp, -1.0)
+                keep_src_live: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(src, dst)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(keep_src_live, [0, 0], out)
+                return res
+
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dst", "src", "mask", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["dst"] == bases["tmp"]
+        assert bases["dst"] != bases["src"]
+        assert bases["dst"] != bases["mask"]
+
+    def test_prelu_output_does_not_alias_any_input(self):
+        """A2/A3 TPRELU reads src, slope, and tmp while writing dst."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                src_in: pl.Tensor[[16, 16], pl.FP32],
+                slope_in: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[17, 32], pl.UINT8],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(src_in, [0, 0], [16, 16])
+                slope: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(slope_in, [0, 0], [16, 16])
+                tmp: pl.Tile[[17, 32], pl.UINT8, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [17, 32])
+                dst: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.prelu(src, slope, tmp)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(dst, [0, 0], out)
+                return res
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend910B)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dst", "src", "slope", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["dst"] != bases["src"]
+        assert bases["dst"] != bases["slope"]
+        assert bases["dst"] != bases["tmp"]
+
+    def test_a5_prelu_output_may_reuse_dead_tmp(self):
+        """A5 retains unread TPRELU tmp, so dst may reuse it while src/slope stay live."""
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(
+                self,
+                src_in: pl.Tensor[[16, 16], pl.FP32],
+                slope_in: pl.Tensor[[16, 16], pl.FP32],
+                tmp_in: pl.Tensor[[16, 16], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                src: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(src_in, [0, 0], [16, 16])
+                slope: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(slope_in, [0, 0], [16, 16])
+                tmp: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.load(tmp_in, [0, 0], [16, 16])
+                dst: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.prelu(src, slope, tmp)
+                live_inputs: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(src, slope)
+                result: pl.Tile[[16, 16], pl.FP32, pl.MemorySpace.Vec] = pl.add(dst, live_inputs)
+                res: pl.Tensor[[16, 16], pl.FP32] = pl.store(result, [0, 0], out)
+                return res
+
+        backend.reset_for_testing()
+        backend.set_backend_type(BackendType.Ascend950)
+        try:
+            After = _run_pipeline(Before)
+        finally:
+            backend.reset_for_testing()
+
+        bases = _collect_tile_memref_bases(After)
+        for name in ("dst", "src", "slope", "tmp"):
+            assert name in bases, f"Expected {name} in After IR; got bases: {bases}"
+        assert bases["dst"] == bases["tmp"]
+        assert bases["dst"] != bases["src"]
+        assert bases["dst"] != bases["slope"]
+
     def test_row_sum_output_does_not_alias_input_or_tmp(self):
         """A row reduction output must not share a buffer with its input or tmp.
 
