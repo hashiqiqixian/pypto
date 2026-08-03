@@ -124,6 +124,7 @@ from .op.tile_ops import (
     aiv_shard,
     cmps,
     create_tile,
+    gatherb,
     gemv,
     gemv_acc,
     gemv_bias,
@@ -132,6 +133,7 @@ from .op.tile_ops import (
     matmul_bias,
     max,
     maximums,
+    mgather,
     min,
     minimums,
     move,
@@ -144,6 +146,7 @@ from .op.tile_ops import (
     store,
     subc,
     subsc,
+    tri,
 )
 from .op.tile_ops import (
     mscatter as mscatter,
@@ -393,6 +396,8 @@ __all__ = [
     "load",
     "store",
     "move",
+    "gatherb",
+    "mgather",
     "mscatter",
     "sqrt",
     "rsqrt",
@@ -433,6 +438,7 @@ __all__ = [
     "lrelu",
     "sel",
     "sels",
+    "tri",
     # Promoted system ops (cross-core)
     "AUTO",
     "tpush_to_aiv",

@@ -76,6 +76,7 @@ from .tile_ops import (
     aiv_shard,
     cmps,
     create_tile,
+    gatherb,
     gemv,
     gemv_acc,
     gemv_bias,
@@ -84,6 +85,7 @@ from .tile_ops import (
     matmul_bias,
     max,
     maximums,
+    mgather,
     min,
     minimums,
     move,
@@ -97,6 +99,7 @@ from .tile_ops import (
     store,
     subc,
     subsc,
+    tri,
 )
 
 # Unified dispatch (overlapping ops). Imported AFTER tile_ops so the
@@ -280,6 +283,8 @@ __all__ = [
     "shrs",
     "maximums",
     "minimums",
+    "gatherb",
+    "mgather",
     "mscatter",
     "prelu",
     "not_",
@@ -290,6 +295,7 @@ __all__ = [
     "lrelu",
     "sel",
     "sels",
+    "tri",
     # Promoted tensor-only
     "arange",
     "create_tensor",

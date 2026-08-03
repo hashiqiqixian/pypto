@@ -1182,10 +1182,16 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
   // a shape. Print it as a kwarg so the round-trip matches the Python signature.
   const bool gather_row_kw_valid =
       (IsOp(op, "tile.gather_row") || IsOp(op, "tensor.gather_row")) && op->args_.size() == 6;
+  const bool mgather = IsOp(op, "tile.mgather");
+  const int mgather_coalesce = mgather ? op->GetKwarg<int>("coalesce", 0) : 0;
+  const bool mgather_kw_scratch = mgather && mgather_coalesce == 1 && op->args_.size() >= 3;
+  const bool mgather_kw_valid = mgather && ((mgather_coalesce == 0 && op->args_.size() == 3) ||
+                                            (mgather_coalesce == 1 && op->args_.size() == 4));
 
   // Print positional arguments
   for (size_t i = 0; i < op->args_.size(); ++i) {
     if (gather_row_kw_valid && i == 5) continue;
+    if (mgather && i >= 2) continue;
     if (i > 0) stream_ << ", ";
 
     // Special handling for tile.alloc/tensor.alloc first argument (memory_space)
@@ -1207,6 +1213,16 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
   if (gather_row_kw_valid) {
     stream_ << ", valid_shape=";
     VisitExpr(op->args_[5]);
+    need_comma = true;
+  }
+  if (mgather_kw_scratch) {
+    stream_ << ", scratch=";
+    VisitExpr(op->args_[2]);
+    need_comma = true;
+  }
+  if (mgather_kw_valid) {
+    stream_ << ", valid_shape=";
+    VisitExpr(op->args_[mgather_coalesce == 1 ? 3 : 2]);
     need_comma = true;
   }
   if (IsOp(op, "system.task_dummy")) {

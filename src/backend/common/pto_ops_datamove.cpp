@@ -1062,8 +1062,44 @@ void RegisterDataMoveOps(Backend& backend, const std::unordered_set<std::string>
     mat_info.source_cols = source_cols_const ? source_cols_const->value_ : 0;
     mat_info.view_rows = rows_const->value_;
     mat_info.view_cols = cols_const->value_;
-    mat_info.const_offset = ir::As<ir::ConstInt>(offset_tuple->elements_[0]) != nullptr &&
-                            ir::As<ir::ConstInt>(offset_tuple->elements_[1]) != nullptr;
+    auto row_offset_const = ir::As<ir::ConstInt>(offset_tuple->elements_[0]);
+    auto col_offset_const = ir::As<ir::ConstInt>(offset_tuple->elements_[1]);
+    mat_info.const_offset = row_offset_const != nullptr && col_offset_const != nullptr;
+
+    // A subview's address is base + (row * source_cols + col) * element_bytes.
+    // Record whether that address is provably 32-byte aligned for every runtime
+    // offset. A dynamic row remains safe when the physical row stride is a
+    // multiple of 32 bytes; a dynamic column is conservatively unknown.
+    int64_t source_base_mod_32 = 0;
+    if (const auto* parent = codegen.GetSubviewMaterialization(src)) {
+      source_base_mod_32 = parent->byte_offset_mod_32;
+    } else if (source_tile_type->memref_.has_value()) {
+      auto source_byte_offset = ir::As<ir::ConstInt>((*source_tile_type->memref_)->byte_offset_);
+      if (source_byte_offset == nullptr) {
+        source_base_mod_32 = -1;
+      } else if (source_byte_offset->value_ >= 0) {
+        source_base_mod_32 = source_byte_offset->value_ % 32;
+      }
+    }
+    const int64_t element_bytes = static_cast<int64_t>(source_tile_type->dtype_.GetByte());
+    int64_t local_offset_mod_32 = -1;
+    if (col_offset_const != nullptr && element_bytes > 0) {
+      if (row_offset_const != nullptr) {
+        if (mat_info.source_cols > 0 || row_offset_const->value_ == 0) {
+          const int64_t row_bytes_mod =
+              ((row_offset_const->value_ % 32) * (mat_info.source_cols % 32) * (element_bytes % 32)) % 32;
+          const int64_t col_bytes_mod = ((col_offset_const->value_ % 32) * (element_bytes % 32)) % 32;
+          local_offset_mod_32 = (row_bytes_mod + col_bytes_mod) % 32;
+        }
+      } else if (mat_info.source_cols > 0) {
+        const int64_t row_stride_bytes_mod = (mat_info.source_cols % 32) * (element_bytes % 32) % 32;
+        const int64_t col_bytes_mod = ((col_offset_const->value_ % 32) * (element_bytes % 32)) % 32;
+        if (row_stride_bytes_mod == 0) local_offset_mod_32 = col_bytes_mod;
+      }
+    }
+    if (source_base_mod_32 >= 0 && local_offset_mod_32 >= 0) {
+      mat_info.byte_offset_mod_32 = (source_base_mod_32 + local_offset_mod_32) % 32;
+    }
     codegen.RegisterSubviewMaterialization(view_ssa, mat_info);
 
     // Bind the slice's result variable to the subview SSA; the pre-emitted

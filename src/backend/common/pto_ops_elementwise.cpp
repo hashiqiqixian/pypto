@@ -94,6 +94,8 @@ static bool RequiresRowMajorLayout(std::string_view op_name) {
       "tile.maximums",
       "tile.lrelu",
       "tile.sels",
+      // Gather operands and result are linearly addressed.
+      "tile.gatherb",
       // Ternary scalar ops (Tile x Scalar x Tile)
       "tile.addsc",
       "tile.subsc",
@@ -287,6 +289,64 @@ static std::string MakeCiCodegenPTO(const std::string& pto_op_name, const CallPt
   }
   oss << ") " << config_attr;
   codegen.Emit(oss.str());
+  return "";
+}
+
+// TTRI's upper/lower selector is only accepted through the generic MLIR form.
+// Shape and optional valid_shape operands are type-only and are not emitted.
+static std::string MakeTriCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CHECK(op->args_.size() == 2 || op->args_.size() == 3)
+      << "Operation:[pto.ttri] requires 2 or 3 arguments (diagonal, shape, [valid_shape]), but got "
+      << op->args_.size();
+  auto result_type = As<ir::TileType>(op->GetType());
+  INTERNAL_CHECK(result_type) << "tile.tri result must be a TileType";
+  const auto* handler = codegen.GetBackendHandler();
+  INTERNAL_CHECK(handler) << "tile.tri requires a backend handler";
+  if (handler->GetPtoTargetArch() == "a2a3") {
+    CHECK_SPAN(result_type->dtype_ != DataType::INT8 && result_type->dtype_ != DataType::UINT8 &&
+                   result_type->dtype_ != DataType::BF16,
+               op->span_)
+        << "tile.tri dtype " << result_type->dtype_.ToString()
+        << " is not supported on the 'a2a3' backend; use the A5 backend";
+  }
+  const bool upper = op->GetKwarg<bool>("upper", false);
+  const std::string diagonal = codegen.GetExprAsCode(op->args_[0]);
+  const std::string diagonal_type = codegen.GetExprTypeAnnotation(op->args_[0]);
+  const std::string dst = codegen.GetCurrentResultTarget();
+  const std::string dst_type = codegen.GetCurrentResultTileBufTypeString();
+
+  std::ostringstream oss;
+  oss << "\"pto.ttri\"(" << diagonal << ", " << dst << ") {upperOrLower = " << (upper ? 1 : 0)
+      << " : i32} : (" << diagonal_type << ", " << dst_type << ") -> ()";
+  codegen.Emit(oss.str());
+  return "";
+}
+
+static std::string MakeGatherbCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
+  auto& codegen = AsPto(codegen_base);
+  CheckArity(op, "pto.tgatherb", 2);
+  auto src = AsVarLike(op->args_[0]);
+  INTERNAL_CHECK(src) << "tile.gatherb src must be a Var or IterArg";
+  auto src_type = As<ir::TileType>(src->GetType());
+  INTERNAL_CHECK(src_type) << "tile.gatherb src must be a TileType";
+  const std::string src_ssa = codegen.GetExprAsCode(op->args_[0]);
+  if (const auto* subview = codegen.GetSubviewMaterialization(src_ssa)) {
+    CHECK_SPAN(subview->byte_offset_mod_32 == 0, op->span_)
+        << "tile.gatherb source subview byte offset must be provably 32-byte aligned";
+  }
+  if (src_type->memref_.has_value()) {
+    auto byte_offset = As<ir::ConstInt>((*src_type->memref_)->byte_offset_);
+    CHECK_SPAN(byte_offset, op->span_)
+        << "tile.gatherb source base byte offset must be statically known and 32-byte aligned";
+    // PtoAS memory planning deliberately keeps root-allocation offsets at the -1
+    // sentinel. Concrete offsets are assigned by the conventional planner.
+    if (byte_offset->value_ >= 0) {
+      CHECK_SPAN(byte_offset->value_ % 32 == 0, op->span_)
+          << "tile.gatherb source base byte offset must be 32-byte aligned";
+    }
+  }
+  codegen.Emit("pto.tgatherb " + GenerateInsOutsClause(op, codegen));
   return "";
 }
 
@@ -488,8 +548,6 @@ struct SimpleOpEntry {
 
 // clang-format off
 static const SimpleOpEntry kSimpleOps[] = {
-    // Memory operations
-    {"tile.mgather",         "pto.tmgather",         2},
     // Tile x Tile arithmetic operations
     {"tile.add",             "pto.tadd",             2},
     {"tile.sub",             "pto.tsub",             2},
@@ -593,7 +651,6 @@ static const SimpleOpEntry kSimpleOps[] = {
     // would emit the tuple as a PTO operand — not what pto.textract expects.
     // Gather/scatter operations
     {"tile.gather",          "pto.tgather",          3},
-    {"tile.gatherb",         "pto.tgatherb",         2},
     // tile.scatter and tile.scatter_mask are registered with custom codegen
     // handlers below (DPS — dst is `args_[0]`, aliased to the result via
     // set_output_reuses_input(0)).
@@ -834,10 +891,27 @@ void RegisterElementwiseOps(Backend& backend, const std::unordered_set<std::stri
   reg("tile.assign", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeAssignCodegenPTO("pto.tassign", op, codegen);
   });
+  if (exclude_ops.count("tile.gatherb") == 0) {
+    backend.RegisterOp("tile.gatherb")
+        .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+          return MakeGatherbCodegenPTO(op, codegen);
+        })
+        .set_input_layout(0, ir::TileLayout::row_major)
+        .set_input_layout(1, ir::TileLayout::row_major)
+        .set_output_layout(ir::TileLayout::row_major);
+  }
 
   reg("tile.ci", [](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
     return MakeCiCodegenPTO("pto.tci", op, codegen);
   });
+
+  if (exclude_ops.count("tile.tri") == 0) {
+    backend.RegisterOp("tile.tri")
+        .f_codegen([](const ir::CallPtr& op, codegen::CodegenBase& codegen) {
+          return MakeTriCodegenPTO(op, codegen);
+        })
+        .set_output_layout(ir::TileLayout::row_major);
+  }
 
   // tile.random (TRANDOM): output must be row_major per ISA
   if (exclude_ops.count("tile.random") == 0) {

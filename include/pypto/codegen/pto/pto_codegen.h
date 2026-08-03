@@ -413,6 +413,11 @@ class PTOCodegen : public CodegenBase {
     /// bare source base — so even a contiguous window would be extracted onto the
     /// source's row 0. See MaterializeSubviewOperandIfNeeded (#1640).
     bool const_offset = false;
+    /// Byte-address residue modulo 32 when it is statically known for every
+    /// runtime value of dynamic offsets; -1 means unknown. Keeping the residue
+    /// (rather than only an aligned flag) lets nested static subviews cancel a
+    /// parent's non-zero residue.
+    int64_t byte_offset_mod_32 = -1;
     bool emitted = false;
   };
   void RegisterSubviewMaterialization(const std::string& subview_ssa, const SubviewMaterializationInfo& info);
