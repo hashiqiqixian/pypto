@@ -292,6 +292,7 @@ def _normalize_scalar_operand(
     *,
     fallback_int_dtype: DataType = DataType.INT32,
     fallback_float_dtype: DataType = DataType.FP32,
+    retype_constants: bool = False,
 ) -> _ir.Expr:
     """Normalize an untyped scalar constant to the paired tile/tensor element dtype.
 
@@ -302,10 +303,13 @@ def _normalize_scalar_operand(
     treated as "dtype not yet decided" and re-stamped to the ``operand`` element
     dtype, alongside raw Python literals which carry no dtype at all.
 
-    Any constant that already carries a real dtype is left untouched -- an explicit
-    ``pl.const(42, pl.INT32)`` is a deliberate user annotation, not a placeholder.
-    A float literal paired with an integer operand keeps ``fallback_float_dtype``
-    so existing promotion semantics (``int32_tensor * 2.5 -> fp32``) are preserved.
+    Any constant that already carries a real dtype is normally left untouched -- an
+    explicit ``pl.const(42, pl.INT32)`` is a deliberate user annotation, not a
+    placeholder. Operators whose instruction contract requires immediate constants
+    to match the paired operand can opt into retyping all constants.
+    Unless ``retype_constants`` is enabled, a float literal paired with an integer
+    operand keeps ``fallback_float_dtype`` so existing promotion semantics
+    (``int32_tensor * 2.5 -> fp32``) are preserved.
 
     Args:
         operand: The tile/tensor the scalar is paired with.
@@ -313,6 +317,7 @@ def _normalize_scalar_operand(
         span: Span for any constant created here.
         fallback_int_dtype: Int dtype used when ``operand`` is not statically typed.
         fallback_float_dtype: Float dtype used when ``operand`` is not statically typed.
+        retype_constants: Restamp typed integer/float constants to the operand dtype.
 
     Returns:
         An expression whose dtype matches the operand element dtype where the rule
@@ -323,15 +328,24 @@ def _normalize_scalar_operand(
             ``_check_not_index_scalar``) -- convert it with ``pl.cast``.
     """
     target = _elem_dtype(operand)
-    value = _placeholder_value(scalar, target)
+    if retype_constants and isinstance(scalar, (_ir.ConstInt, _ir.ConstFloat)):
+        value = scalar.value
+    else:
+        value = _placeholder_value(scalar, target)
     if value is None:
         assert isinstance(scalar, _ir.Expr)  # _placeholder_value returns None only for exprs
         return scalar  # already-typed expr, kept as-is
 
     # Unknown operand type, or a float constant on an integer operand: fall back
     # to the literal-kind default so promotion behaviour is unchanged.
-    if target is None or (isinstance(value, float) and target.is_int()):
+    if target is None or (not retype_constants and isinstance(value, float) and target.is_int()):
         target = fallback_float_dtype if isinstance(value, float) else fallback_int_dtype
+
+    if retype_constants and target.is_int() and isinstance(value, float) and not value.is_integer():
+        raise ValueError(
+            f"Cannot retype non-integral floating-point constant {value} to integer dtype "
+            f"{target}; use an integral value or an explicit cast"
+        )
 
     if target.is_float() or target.is_int():
         return _const_at_dtype(value, target, span)

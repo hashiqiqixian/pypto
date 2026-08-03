@@ -2433,22 +2433,23 @@ def sel(mask: Tile, lhs: Tile, rhs: Tile, tmp: Tile) -> Tile:
     return Tile(expr=call_expr)
 
 
-def sels(lhs: Tile, rhs: Tile, select_mode: int | float | Expr | Scalar) -> Tile:
-    """Select between two tiles based on a scalar mode.
+def sels(mask: Tile, src: Tile, tmp: Tile, scalar: int | float | Expr | Scalar) -> Tile:
+    """Per-element selection between a source tile and a scalar.
 
-    Maps to the TSELS hardware intrinsic. The interpretation of select_mode values
-    is target-dependent and enforced by codegen.
+    For each element (i, j): dst[i,j] = src[i,j] if mask[i,j] is true,
+    else scalar. Maps to the TSELS hardware intrinsic.
 
     Args:
-        lhs: Source tile 0
-        rhs: Source tile 1
-        select_mode: Scalar select mode
+        mask: Predicate mask tile; encoding is target-defined
+        src: Source tile, selected where mask is true
+        tmp: Scratch tile required by TSELS
+        scalar: Scalar value, selected where mask is false
 
     Returns:
         Tile wrapping the sels operation
     """
-    select_mode_expr = select_mode.unwrap() if isinstance(select_mode, Scalar) else select_mode
-    call_expr = _ir_ops.sels(lhs.unwrap(), rhs.unwrap(), select_mode_expr)
+    scalar_expr = scalar.unwrap() if isinstance(scalar, Scalar) else scalar
+    call_expr = _ir_ops.sels(mask.unwrap(), src.unwrap(), tmp.unwrap(), scalar_expr)
     return Tile(expr=call_expr)
 
 

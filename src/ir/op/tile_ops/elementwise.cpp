@@ -43,6 +43,8 @@
 namespace pypto {
 namespace ir {
 
+constexpr int64_t kPackedPredicateBitsPerByte = 8;
+
 static ExprPtr MakeIndexConst(int64_t value, const Span& span = Span::unknown()) {
   return std::make_shared<ConstInt>(value, DataType::INDEX, span);
 }
@@ -73,24 +75,41 @@ static bool IsTSubsDataType(DataType dtype) {
          dtype == DataType::FP16 || dtype == DataType::FP32 || dtype == DataType::BF16;
 }
 
+static bool IsTSelsDataType(DataType dtype) {
+  return dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
+         dtype == DataType::UINT16 || dtype == DataType::INT32 || dtype == DataType::UINT32 ||
+         dtype == DataType::FP16 || dtype == DataType::FP32;
+}
+
+static DataType GetTSelsScalarDataType(DataType src_dtype) {
+  if (src_dtype == DataType::UINT8) return DataType::INT8;
+  if (src_dtype == DataType::UINT16) return DataType::INT16;
+  if (src_dtype == DataType::UINT32) return DataType::INT32;
+  return src_dtype;
+}
+
+static bool IsTSelsMaskDataType(DataType dtype) {
+  return dtype == DataType::INT8 || dtype == DataType::UINT8 || dtype == DataType::INT16 ||
+         dtype == DataType::UINT16 || dtype == DataType::INT32 || dtype == DataType::UINT32;
+}
+
 static std::shared_ptr<TileType> MakePackedPredicateTileType(
     const std::vector<ExprPtr>& logical_shape, const std::shared_ptr<const TileType>& source_tile_type) {
   INTERNAL_CHECK(!logical_shape.empty())
       << "tile.cmp/tile.cmps require a non-empty tile shape for packed predicate mask inference";
 
-  constexpr int64_t kA2A3PredicateBitsPerByte = 8;
   constexpr int64_t kA2A3PredicateColAlignment = 32;
 
   const size_t col_axis = logical_shape.size() - 1;
   std::vector<ExprPtr> mask_shape = logical_shape;
   mask_shape[col_axis] = MakeRoundUpIndex(
-      MakeCeilDivIndex(logical_shape[col_axis], kA2A3PredicateBitsPerByte), kA2A3PredicateColAlignment);
+      MakeCeilDivIndex(logical_shape[col_axis], kPackedPredicateBitsPerByte), kA2A3PredicateColAlignment);
 
   auto logical_valid_shape = GetValidShape(source_tile_type);
   TileView tile_view;
   tile_view.valid_shape = logical_valid_shape;
   tile_view.valid_shape[col_axis] =
-      MakeCeilDivIndex(logical_valid_shape[col_axis], kA2A3PredicateBitsPerByte);
+      MakeCeilDivIndex(logical_valid_shape[col_axis], kPackedPredicateBitsPerByte);
   InheritTileViewLayout(tile_view, source_tile_type);
   return std::make_shared<TileType>(mask_shape, DataType::UINT8, std::nullopt, tile_view);
 }
@@ -842,6 +861,70 @@ REGISTER_OP("tile.xors")
       return DeduceTileOpXorScalarType(args, kwargs, "tile.xors");
     });
 
+// Type deduction for tile.prelu (Src x Slope x Tmp -> Tile).
+// TPRELU requires src, slope, and dst to share their dtype, physical shape, and
+// valid region. Target-specific tmp and alias rules are checked during codegen.
+TypePtr DeduceTilePreluType(const std::vector<ExprPtr>& args,
+                            const std::vector<std::pair<std::string, std::any>>& kwargs,
+                            const std::string& op_name) {
+  CHECK(args.size() == 3) << "The operator " << op_name << " requires exactly 3 arguments, but got "
+                          << args.size();
+
+  auto src_type = As<TileType>(args[0]->GetType());
+  auto slope_type = As<TileType>(args[1]->GetType());
+  auto tmp_type = As<TileType>(args[2]->GetType());
+  CHECK_SPAN(src_type, args[0]->span_)
+      << "The operator " << op_name << " requires src to be a TileType, but got "
+      << args[0]->GetType()->TypeName();
+  CHECK_SPAN(slope_type, args[1]->span_)
+      << "The operator " << op_name << " requires slope to be a TileType, but got "
+      << args[1]->GetType()->TypeName();
+  CHECK_SPAN(tmp_type, args[2]->span_)
+      << "The operator " << op_name << " requires tmp to be a TileType, but got "
+      << args[2]->GetType()->TypeName();
+
+  CHECK_SPAN(src_type->dtype_ == DataType::FP16 || src_type->dtype_ == DataType::FP32, args[0]->span_)
+      << "The operator " << op_name << " requires src dtype in {FP16, FP32}, but got "
+      << src_type->dtype_.ToString();
+  CHECK_SPAN(slope_type->dtype_ == src_type->dtype_, args[1]->span_)
+      << "The operator " << op_name << " requires slope dtype to match src dtype, but got "
+      << slope_type->dtype_.ToString() << " and " << src_type->dtype_.ToString();
+  CHECK_SPAN(src_type->shape_.size() == 2, args[0]->span_)
+      << "The operator " << op_name << " requires a rank-2 src tile, but got rank "
+      << src_type->shape_.size();
+  CHECK_SPAN(slope_type->shape_.size() == src_type->shape_.size(), args[1]->span_)
+      << "The operator " << op_name << " requires slope and src to have the same rank, but got "
+      << slope_type->shape_.size() << " and " << src_type->shape_.size();
+  for (size_t i = 0; i < src_type->shape_.size(); ++i) {
+    CHECK_SPAN(DimensionsEqual(src_type->shape_[i], slope_type->shape_[i]), args[1]->span_)
+        << "The operator " << op_name
+        << " requires slope and src to have the same physical shape, but dimension " << i
+        << " differs; got slope shape " << FormatShape(slope_type->shape_) << " and src shape "
+        << FormatShape(src_type->shape_);
+  }
+
+  const auto src_valid_shape = GetValidShape(src_type);
+  const auto slope_valid_shape = GetValidShape(slope_type);
+  CHECK_SPAN(slope_valid_shape.size() == src_valid_shape.size(), args[1]->span_)
+      << "The operator " << op_name << " requires slope and src to have the same valid_shape rank";
+  for (size_t i = 0; i < src_valid_shape.size(); ++i) {
+    CHECK_SPAN(ProveValidExtentEqual(src_valid_shape[i], slope_valid_shape[i]) == ProofResult::kTrue,
+               args[1]->span_)
+        << "The operator " << op_name << " requires slope and src to have the same valid_shape, but "
+        << "dimension " << i << " differs; got slope valid_shape " << FormatShape(slope_valid_shape)
+        << " and src valid_shape " << FormatShape(src_valid_shape);
+  }
+
+  CHECK_SPAN(tmp_type->shape_.size() == 2, args[2]->span_)
+      << "The operator " << op_name << " requires a rank-2 tmp tile, but got rank "
+      << tmp_type->shape_.size();
+
+  TileView tile_view;
+  tile_view.valid_shape = src_valid_shape;
+  InheritTileViewLayout(tile_view, src_type);
+  return std::make_shared<TileType>(src_type->shape_, src_type->dtype_, std::nullopt, tile_view);
+}
+
 REGISTER_OP("tile.prelu")
     .set_op_category("TileOp")
     .set_description("Element-wise parametric ReLU of a tile with slope tile and temporary buffer")
@@ -852,9 +935,10 @@ REGISTER_OP("tile.prelu")
     .set_input_memory(1, MemorySpace::Vec)
     .set_input_memory(2, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
+    .not_inplace_safe()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTileOpTernaryType(args, kwargs, "tile.prelu");
+      return DeduceTilePreluType(args, kwargs, "tile.prelu");
     });
 
 REGISTER_OP("tile.addc")
@@ -995,55 +1079,94 @@ REGISTER_OP("tile.sel")
       return DeduceTileSelType(args, kwargs, "tile.sel");
     });
 
-// Type deduction for tile.sels (Tile x Tile x Scalar -> Tile)
-TypePtr DeduceTileSelScalarType(const std::vector<ExprPtr>& args,
-                                const std::vector<std::pair<std::string, std::any>>& kwargs,
-                                const std::string& op_name) {
-  CHECK(args.size() == 3) << "The operator " << op_name << " requires exactly 3 arguments, but got "
+// Type deduction for tile.sels (Mask x Src x Tmp x Scalar -> Tile).
+// dst[i,j] = mask[i,j] ? src[i,j] : scalar; the result mirrors src.
+TypePtr DeduceTileSelsType(const std::vector<ExprPtr>& args,
+                           const std::vector<std::pair<std::string, std::any>>& kwargs,
+                           const std::string& op_name) {
+  CHECK(args.size() == 4) << "The operator " << op_name << " requires exactly 4 arguments, but got "
                           << args.size();
 
-  auto tile_type1 = As<TileType>(args[0]->GetType());
-  auto tile_type2 = As<TileType>(args[1]->GetType());
-  CHECK(tile_type1) << "The operator " << op_name
-                    << " requires first argument (lhs) to be a TileType, but got "
-                    << args[0]->GetType()->TypeName();
-  CHECK(tile_type2) << "The operator " << op_name
-                    << " requires second argument (rhs) to be a TileType, but got "
-                    << args[1]->GetType()->TypeName();
-
-  CHECK(As<ScalarType>(args[2]->GetType()))
-      << "The operator " << op_name << " requires third argument (select_mode) to be a ScalarType, but got "
+  auto mask_type = As<TileType>(args[0]->GetType());
+  auto src_type = As<TileType>(args[1]->GetType());
+  auto tmp_type = As<TileType>(args[2]->GetType());
+  auto scalar_type = As<ScalarType>(args[3]->GetType());
+  CHECK_SPAN(mask_type, args[0]->span_)
+      << "The operator " << op_name << " requires mask to be a TileType, but got "
+      << args[0]->GetType()->TypeName();
+  CHECK_SPAN(src_type, args[1]->span_)
+      << "The operator " << op_name << " requires src to be a TileType, but got "
+      << args[1]->GetType()->TypeName();
+  CHECK_SPAN(tmp_type, args[2]->span_)
+      << "The operator " << op_name << " requires tmp to be a TileType, but got "
       << args[2]->GetType()->TypeName();
+  CHECK_SPAN(scalar_type, args[3]->span_)
+      << "The operator " << op_name << " requires scalar to be a ScalarType, but got "
+      << args[3]->GetType()->TypeName();
 
-  auto result_dtype = PromoteDataTypes(tile_type1->dtype_, tile_type2->dtype_);
-  CHECK(result_dtype) << "The operator " << op_name << " requires compatible data types, but got "
-                      << tile_type1->dtype_.ToString() << " and " << tile_type2->dtype_.ToString();
+  CHECK_SPAN(mask_type->shape_.size() == 2, args[0]->span_)
+      << "The operator " << op_name << " requires a rank-2 mask tile, but got rank "
+      << mask_type->shape_.size();
+  CHECK_SPAN(IsTSelsMaskDataType(mask_type->dtype_), args[0]->span_)
+      << "The operator " << op_name << " requires an 8-, 16-, or 32-bit integer mask, but got "
+      << mask_type->dtype_.ToString();
+  CHECK_SPAN(src_type->shape_.size() == 2, args[1]->span_)
+      << "The operator " << op_name << " requires a rank-2 src tile, but got rank "
+      << src_type->shape_.size();
+  CHECK_SPAN(IsTSelsDataType(src_type->dtype_), args[1]->span_)
+      << "The operator " << op_name
+      << " requires src dtype in {INT8, UINT8, INT16, UINT16, INT32, UINT32, FP16, FP32}, but got "
+      << src_type->dtype_.ToString();
+  CHECK_SPAN(tmp_type->shape_.size() == 2, args[2]->span_)
+      << "The operator " << op_name << " requires a rank-2 tmp tile, but got rank "
+      << tmp_type->shape_.size();
+  const DataType expected_scalar_dtype = GetTSelsScalarDataType(src_type->dtype_);
+  CHECK_SPAN(scalar_type->dtype_ == expected_scalar_dtype, args[3]->span_)
+      << "The operator " << op_name << " requires scalar dtype " << expected_scalar_dtype.ToString()
+      << " for src dtype " << src_type->dtype_.ToString() << ", but got " << scalar_type->dtype_.ToString();
 
-  auto broadcast_result = BroadcastShapes(tile_type1->shape_, tile_type2->shape_);
-  CHECK(broadcast_result.success) << "The operator " << op_name << " requires compatible shapes, but got "
-                                  << FormatShape(tile_type1->shape_) << " and "
-                                  << FormatShape(tile_type2->shape_);
+  const auto mask_valid_shape = GetValidShape(mask_type);
+  const auto src_valid_shape = GetValidShape(src_type);
+  CHECK_SPAN(ProveValidExtentLessEqual(src_valid_shape[0], mask_valid_shape[0]) == ProofResult::kTrue,
+             args[0]->span_)
+      << "The operator " << op_name
+      << " requires mask carrier rows to cover src valid rows, but got mask valid_shape "
+      << FormatShape(mask_valid_shape) << " and src valid_shape " << FormatShape(src_valid_shape);
+  const auto required_mask_bytes = MakeCeilDivIndex(src_valid_shape[1], kPackedPredicateBitsPerByte);
+  const auto mask_row_bytes = MakeMul(
+      mask_valid_shape[1], MakeIndexConst(static_cast<int64_t>(mask_type->dtype_.GetByte()), args[0]->span_),
+      args[0]->span_);
+  CHECK_SPAN(ProveValidExtentLessEqual(required_mask_bytes, mask_row_bytes) == ProofResult::kTrue,
+             args[0]->span_)
+      << "The operator " << op_name
+      << " requires each mask carrier row to hold at least ceil(src valid columns / 8) packed bytes, "
+         "but got mask valid_shape "
+      << FormatShape(mask_valid_shape) << " with dtype " << mask_type->dtype_.ToString()
+      << " and src valid_shape " << FormatShape(src_valid_shape);
 
-  // TODO(YunjiQin): assumes both src tiles have the same valid_shape; may need refinement
-  // for cases where lhs and rhs have different valid_shape values (e.g. after broadcasting).
   TileView tile_view;
-  tile_view.valid_shape = GetValidShape(tile_type1);
-  InheritTileViewLayout(tile_view, tile_type1);
-  return std::make_shared<TileType>(broadcast_result.shape, *result_dtype, std::nullopt, tile_view);
+  tile_view.valid_shape = src_valid_shape;
+  InheritTileViewLayout(tile_view, src_type);
+  return std::make_shared<TileType>(src_type->shape_, src_type->dtype_, std::nullopt, tile_view);
 }
 
 REGISTER_OP("tile.sels")
     .set_op_category("TileOp")
-    .set_description("Select between two tiles based on a scalar mode. Maps to the TSELS hardware intrinsic.")
-    .add_argument("lhs", "Source tile 0 (TileType)")
-    .add_argument("rhs", "Source tile 1 (TileType)")
-    .add_argument("select_mode", "Scalar select mode (ScalarType)")
+    .set_description(
+        "Per-element selection between a source tile and a scalar using a predicate mask tile. "
+        "dst[i,j] = mask[i,j] ? src[i,j] : scalar. Maps to the TSELS hardware intrinsic.")
+    .add_argument("mask", "Predicate mask tile; encoding is target-defined (TileType)")
+    .add_argument("src", "Source tile, selected where mask is true (TileType)")
+    .add_argument("tmp", "Scratch tile required by TSELS (TileType)")
+    .add_argument("scalar", "Scalar value, selected where mask is false (ScalarType)")
     .set_input_memory(0, MemorySpace::Vec)
     .set_input_memory(1, MemorySpace::Vec)
+    .set_input_memory(2, MemorySpace::Vec)
     .set_output_memory(MemorySpace::Vec)
+    .forbid_output_alias(0)
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) {
-      return DeduceTileSelScalarType(args, kwargs, "tile.sels");
+      return DeduceTileSelsType(args, kwargs, "tile.sels");
     });
 
 // Type deduction for tile.cmp and tile.cmps (comparison operations)

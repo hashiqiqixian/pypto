@@ -77,6 +77,28 @@ def _create_tile_binary_call(
     return _ir_core.create_op_call(tile_op_name, [lhs, rhs_expr], {}, span)
 
 
+def _normalize_sels_scalar_operand(src: Expr, scalar: int | float | Expr, span: Span) -> Expr:
+    """Normalize TSELS scalar constants to the PTOAS-compatible element dtype."""
+    scalar_expr = _normalize_scalar_operand(src, scalar, span, retype_constants=True)
+    src_type = src.type
+    if not isinstance(src_type, _ir_core.TileType) or not isinstance(scalar_expr, ConstInt):
+        return scalar_expr
+
+    signed_dtype_and_bits = {
+        DataType.UINT8: (DataType.INT8, 8),
+        DataType.UINT16: (DataType.INT16, 16),
+        DataType.UINT32: (DataType.INT32, 32),
+    }.get(src_type.dtype)
+    if signed_dtype_and_bits is None:
+        return scalar_expr
+
+    signed_dtype, bits = signed_dtype_and_bits
+    value = scalar_expr.value
+    if value >= 1 << (bits - 1):
+        value -= 1 << bits
+    return ConstInt(value, signed_dtype, span)
+
+
 # ============================================================================
 # Memory Operations
 # ============================================================================
@@ -1306,25 +1328,33 @@ def sel(mask: Expr, lhs: Expr, rhs: Expr, tmp: Expr, span: Span | None = None) -
     return _ir_core.create_op_call("tile.sel", [mask, lhs, rhs, tmp], {}, actual_span)
 
 
-def sels(lhs: Expr, rhs: Expr, select_mode: int | float | Expr, span: Span | None = None) -> Call:
-    """Select between two tiles based on a scalar mode.
+def sels(
+    mask: Expr,
+    src: Expr,
+    tmp: Expr,
+    scalar: int | float | Expr,
+    span: Span | None = None,
+) -> Call:
+    """Per-element selection between a source tile and a scalar.
 
-    Maps to the TSELS hardware intrinsic. The interpretation of select_mode values
-    is target-dependent and enforced by codegen.
+    For each element (i, j): dst[i,j] = src[i,j] if mask[i,j] is true,
+    else scalar. Maps to the TSELS hardware intrinsic.
 
     Args:
-        lhs: Source tile 0 (TileType)
-        rhs: Source tile 1 (TileType)
-        select_mode: Scalar select mode
+        mask: Predicate mask tile (TileType); encoding is target-defined
+        src: Source tile, selected where mask is true (TileType)
+        tmp: Scratch tile required by TSELS (TileType)
+        scalar: Scalar value, selected where mask is false. For an unsigned
+            integer src, constants use the same-width signed PTOAS scalar type
+            while preserving their bit pattern.
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
-        Call expression for tile select
+        Call expression for per-element tile/scalar selection
     """
     actual_span = _get_span_or_capture(span)
-    # select_mode is a mode flag interpreted by codegen, not a tile element value.
-    select_mode_expr = _normalize_const_to_dtype(select_mode, DataType.INT32, actual_span)
-    return _ir_core.create_op_call("tile.sels", [lhs, rhs, select_mode_expr], {}, actual_span)
+    scalar_expr = _normalize_sels_scalar_operand(src, scalar, actual_span)
+    return _ir_core.create_op_call("tile.sels", [mask, src, tmp, scalar_expr], {}, actual_span)
 
 
 def muls(lhs: Expr, rhs: int | float | Expr, span: Span | None = None) -> Call:
