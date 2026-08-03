@@ -104,7 +104,7 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.texp | TEXP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tlog | TLOG | tile+tensor | ✅ | ✅ | ✅ | ✅ | — | A2/A3 真机已验证；A5 真机待验证 |
 | pto.tsqrt | TSQRT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.ttri | TTRI | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
+| pto.ttri | TTRI | tile | ✅ | ✅ | ❌ | ✅ | — | 前端 + 精确 codegen + 同名 ST；A2/A3 真机 10/10 通过；A5 真机待验证 |
 | pto.trsqrt | TRSQRT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.trecip | TRECIP | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.trelu | TRELU | tile | ✅ | ✅ | ❌ | ✅ | — |  |
@@ -168,9 +168,9 @@ lowering/compiler plumbing 使用的额外内部 op 未纳入，也不列 VPTO�
 | pto.tconcat | TCONCAT | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tconcatidx | TCONCAT (indexed) | tile | ✅ | ❌ | ❌ | ❌ | — | MISSING：缺完整前端/codegen/ST 链路 |
 | pto.tgather | TGATHER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.tgatherb | TGATHERB | tile | ✅ | ❌ | ❌ | ❌ | — | 已有 backend hook，缺 IR/Python 前端与 ST |
+| pto.tgatherb | TGATHERB | tile | ✅ | ✅ | ❌ | ✅ | — | 32-byte 块偏移前端 + 精确 codegen + 同名 ST；A2/A3 真机 8/8 通过；A5 真机待验证 |
 | pto.tscatter | TSCATTER | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
-| pto.mgather | MGATHER | tile | ✅ | ❌ | ❌ | ❌ | — | 当前 backend 发旧名 `pto.tmgather` |
+| pto.mgather | MGATHER | tile | ✅ | ✅ | ❌ | ✅ | — | 规范 Vec/Mat overload，并显式携带 row/elem coalesce；Vec 子集已通过 A2/A3 真机，扩展后的 Vec/Mat 矩阵待验证 |
 | pto.mscatter | MSCATTER | tile | ✅ | ✅ | ❌ | ✅ | — |  |
 | pto.treshape | TRESHAPE | tile+tensor | ✅ | ✅ | ✅ | ✅ | — |  |
 | pto.tinsert | TINSERT | tile | ✅ | ❌ | ❌ | ✅ | — | 由 `tile.assemble` / auto matmul lowering 发射 |
