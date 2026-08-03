@@ -73,6 +73,8 @@ program_optimized = reuse_pass(program)
   | `tile.fmod`、`tile.fmods` | `not_inplace_safe` | `TFMOD`/`TFMODS` 按 `a - trunc(a/b)*b` 计算，先用 `dst = a/b` 覆盖输出，再重新读取原始 `src0`（`a`）做最后的减法；当 `dst == src0` 时该减法读到的是已被覆盖的商，导致每个元素都算成 `0` |
   | `tile.transpose` | `not_inplace_safe` | `pto.ttrans` 非 in-place 安全：a2a3 非对齐标量路径直接从 `src` 写 `dst`（不经 tmp 暂存），`dst == src` 会边写边读损坏数据。输出始终分配新 buffer（InitMemRef 也不会为其继承输入的 buffer）。 |
   | `tile.sel` | `forbid_output_alias(0)`（mask）、`(3)`（tmp） | `TSEL` 在写 `dst` 时读取 mask + tmp scratch |
+  | `tile.sels` | 感知 target | `TSELS` 始终要求 `dst` 与 predicate mask 分离，并允许复用 `src` 或 `tmp`；A2/A3 会先将 scalar 写入 `tmp`，再通过 `set_cmpmask` 读取它，之后才写 `dst`，因此 `tmp` 可以 alias `dst`，但不得与 mask/src 重叠；A5 保留但不读取 ABI 中的 `tmp`，允许其 alias 任一操作数 |
+  | `tile.prelu` | 感知 target | A2/A3 的 `TPRELU` 在写 `dst` 时读取 `src`、`slope` 与 `tmp`，因此是 `not_inplace_safe`；A5 保留 ABI 要求的 `tmp` 操作数但不读取它，所以 `dst` 可复用 `tmp`，但不可复用仍参与运算的 `src`/`slope` |
   | `tile.{row,col}_expand{,_mul,_add,_sub,_div}` | `forbid_output_alias(1)`（广播向量） | 行/列向量（arg 1）会被**每个**输出行/列重读,输出若 alias 它则在第一行/列后被覆盖 |
   | `tile.cast`（仅升精度） | 输出 ≠ 输入缓冲区（条件式,在 `ForbidAliasCollector`） | 更宽的输出写指针超前于读指针（见上） |
 
@@ -237,6 +239,8 @@ passes.def("memory_reuse", &pass::MemoryReuse, "Memory reuse optimization");
 - 测试 no-alias 守护（`TestForbidOutputAlias` + `TestInplaceOps`），上表每条约束一个用例：
   - `tile.recip` / `tile.rsqrt` / `tile.row_sum` —— 输出不得 alias 输入（`not_inplace_safe`）
   - `tile.sel` —— 输出不得 alias mask / tmp（`forbid_output_alias`）
+  - `tile.sels` —— 输出始终不得 alias mask；A2/A3 与 A5 均允许 tmp/输出 alias，但 A2/A3 backend 仍会拒绝 tmp 与 mask/src 重叠
+  - `tile.prelu` —— A2/A3 输出不得 alias 任一输入；A5 输出仅可 alias 未使用的 `tmp`
   - `tile.col_expand_mul` —— 输出不得 alias 广播向量
   - 升精度 `tile.cast` —— 输出不得 alias（更窄的）输入
   - 经 VIEW 间接到达的禁止操作数也被遵守（物理缓冲区解析）

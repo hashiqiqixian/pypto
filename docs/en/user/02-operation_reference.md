@@ -235,7 +235,7 @@ scratch tile to materialize numeric results on A2/A3.
 | `cmp` | `(lhs: Tile, rhs: Tile, cmp_type: int = 0) -> Tile` | Compare two tiles |
 | `cmps` | `(lhs: Tile, rhs: int \| float \| Scalar, cmp_type: int = 0) -> Tile` | Compare tile with scalar |
 | `sel` | `(mask: Tile, lhs: Tile, rhs: Tile, tmp: Tile) -> Tile` | Select: `lhs if mask else rhs`; `tmp` is TSEL scratch |
-| `sels` | `(lhs: Tile, rhs: Tile, select_mode: int \| float \| Scalar) -> Tile` | Select by scalar mode |
+| `sels` | `(mask: Tile, src: Tile, tmp: Tile, scalar: int \| float \| Scalar) -> Tile` | Select `src` where `mask` is true, otherwise `scalar`; `mask` must have enough valid rows and packed bytes per row to cover `src`; A2/A3 supports signed/unsigned 16/32-bit integers plus FP16/FP32, requires `tmp` not to overlap mask/src, and permits `tmp` to alias the result; A5 also supports signed/unsigned 8-bit integers and retains an unread `tmp` ABI operand that may alias any operand |
 
 ## Bitwise (`pl.tensor.*`)
 
@@ -303,7 +303,7 @@ normalize it.
 | ---- | --------- | ----------- |
 | `relu` | `(tile: Tile) -> Tile` | ReLU: `max(0, x)` |
 | `lrelu` | `(tile: Tile, slope: int \| float \| Scalar) -> Tile` | Leaky ReLU with scalar slope |
-| `prelu` | `(tile: Tile, slope: Tile, tmp: Tile) -> Tile` | Parametric ReLU (requires tmp) |
+| `prelu` | `(tile: Tile, slope: Tile, tmp: Tile) -> Tile` | FP16/FP32 parametric ReLU; A2/A3 requires pairwise non-overlapping `tile`/`slope`/`tmp`/result regions and UINT8 packed-mask scratch; A5 retains the ABI-required but unread `tmp`, permits `tile`/`slope` overlap and `tmp`/result aliasing, but keeps the result disjoint from the active inputs |
 
 ## Shape Operations (`pl.tile.*`)
 
