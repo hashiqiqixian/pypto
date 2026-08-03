@@ -3710,5 +3710,730 @@ class TestCacheInvalidCodegen:
         assert "partition_tensor_view" not in cmo_line
 
 
+class TestB03TriAndGatherCodegen:
+    """Exact PTOAS spellings and attributes for the B03 operators."""
+
+    @staticmethod
+    def _generate_mlir(program_cls, backend_type=BackendType.Ascend910B) -> str:
+        backend.reset_for_testing()
+        backend.set_backend_type(backend_type)
+        optimized = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(program_cls)
+        funcs = list(optimized.functions.values())
+        assert funcs
+        target = next((func for func in funcs if ir.is_incore_type(func.func_type)), funcs[0])
+        single = ir.Program([target], target.name, optimized.span)
+        return codegen.PTOCodegen().generate(single)
+
+    @staticmethod
+    def _ssa_pattern(logical: str) -> re.Pattern[str]:
+        name = logical.removeprefix("%")
+        suffix = ""
+        for candidate in ("_pview", "_view"):
+            if name.endswith(candidate):
+                name = name[: -len(candidate)]
+                suffix = candidate
+                break
+        return re.compile(rf"%{re.escape(name)}(?:__ssa_v\d+)?{re.escape(suffix)}")
+
+    @classmethod
+    def _resolve_ssa(cls, mlir: str, logical: str) -> str:
+        matches = cls._ssa_pattern(logical).findall(mlir)
+        assert matches, f"SSA corresponding to {logical} not found"
+        return matches[0]
+
+    @classmethod
+    def _alloc_tile_type(cls, mlir: str, ssa: str) -> str:
+        actual_ssa = cls._resolve_ssa(mlir, ssa)
+        line = next(
+            line.strip()
+            for line in mlir.splitlines()
+            if line.strip().startswith(f"{actual_ssa} = pto.alloc_tile")
+        )
+        return line.rsplit(" : ", 1)[1]
+
+    @classmethod
+    def _assert_partition_view(
+        cls,
+        mlir: str,
+        *,
+        result: str,
+        source: str,
+        result_type: str,
+    ) -> None:
+        actual_result = cls._resolve_ssa(mlir, result)
+        actual_source = cls._resolve_ssa(mlir, source)
+        line = next(
+            line.strip()
+            for line in mlir.splitlines()
+            if line.strip().startswith(f"{actual_result} = pto.partition_view")
+        )
+        assert line.startswith(f"{actual_result} = pto.partition_view {actual_source}, offsets = [")
+        assert line.endswith(f" -> {result_type}")
+
+    @classmethod
+    def _assert_mgather(
+        cls,
+        mlir: str,
+        *,
+        operands: list[str],
+        operand_types: list[str],
+        result: str,
+        result_type: str,
+        attributes: str,
+    ) -> None:
+        line = next(line.strip() for line in mlir.splitlines() if "pto.mgather" in line)
+        actual_operands = [cls._resolve_ssa(mlir, operand) for operand in operands]
+        actual_result = cls._resolve_ssa(mlir, result)
+        expected = (
+            f"pto.mgather ins({', '.join(actual_operands)} : {', '.join(operand_types)}) "
+            f"outs({actual_result} : {result_type}) {{{attributes}}}"
+        )
+        assert line == expected
+
+    def test_ttri_emits_upper_selector_and_partial_destination(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                mask: pl.Tile[[16, 32], pl.FP32] = pl.tile.tri(
+                    1, [16, 32], valid_shape=[9, 21], dtype=pl.FP32, upper=True
+                )
+                return pl.store(mask, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        mask_ssa = self._resolve_ssa(mlir, "%mask")
+        mask_type = self._alloc_tile_type(mlir, "%mask")
+        line = next(line.strip() for line in mlir.splitlines() if '"pto.ttri"' in line)
+        assert "%c1_i32 = arith.constant 1 : i32" in mlir
+        assert line == (
+            f'"pto.ttri"(%c1_i32, {mask_ssa}) {{upperOrLower = 1 : i32}} : (i32, {mask_type}) -> ()'
+        )
+        alloc = next(
+            line.strip()
+            for line in mlir.splitlines()
+            if line.strip().startswith(f"{mask_ssa} = pto.alloc_tile")
+        )
+        assert " valid_row = %c9_index valid_col = %c21_index : " in alloc
+
+    @pytest.mark.parametrize("dtype", [pl.INT8, pl.UINT8, pl.BF16])
+    def test_ttri_rejects_a5_only_dtypes_on_a2a3(self, dtype):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, out: pl.Tensor[[16, 32], dtype]):
+                mask: pl.Tile[[16, 32], dtype] = pl.tile.tri(0, [16, 32], valid_shape=[9, 21], dtype=dtype)
+                pl.store(mask, [0, 0], out)
+
+        with pytest.raises(ValueError, match="not supported on the 'a2a3' backend"):
+            self._generate_mlir(Prog)
+
+    @pytest.mark.parametrize("dtype", [pl.INT8, pl.UINT8, pl.BF16])
+    def test_ttri_accepts_extended_dtypes_on_a5(self, dtype):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(self, out: pl.Tensor[[16, 32], dtype]):
+                mask: pl.Tile[[16, 32], dtype] = pl.tile.tri(0, [16, 32], valid_shape=[9, 21], dtype=dtype)
+                pl.store(mask, [0, 0], out)
+
+        assert '"pto.ttri"' in self._generate_mlir(Prog, BackendType.Ascend950)
+
+    def test_tgatherb_emits_exact_two_input_name(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 128], pl.FP16],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, 128], pl.FP16],
+            ) -> pl.Tensor[[8, 128], pl.FP16]:
+                src_tile: pl.Tile[[16, 128], pl.FP16] = pl.load(src, [0, 0], [16, 128])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8], valid_shape=[5, 5])
+                gathered: pl.Tile[[8, 128], pl.FP16] = pl.tile.gatherb(src_tile, offset_tile)
+                return pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        src_type = self._alloc_tile_type(mlir, "%src_tile")
+        offset_type = self._alloc_tile_type(mlir, "%offset_tile")
+        gathered_type = self._alloc_tile_type(mlir, "%gathered")
+        src_ssa = self._resolve_ssa(mlir, "%src_tile")
+        offset_ssa = self._resolve_ssa(mlir, "%offset_tile")
+        gathered_ssa = self._resolve_ssa(mlir, "%gathered")
+        line = next(line.strip() for line in mlir.splitlines() if "pto.tgatherb" in line)
+        assert line == (
+            f"pto.tgatherb ins({src_ssa}, {offset_ssa} : {src_type}, {offset_type}) "
+            f"outs({gathered_ssa} : {gathered_type})"
+        )
+
+    @pytest.mark.parametrize(
+        ("dtype", "output_cols", "column", "accepted"),
+        [
+            (pl.UINT8, 256, 31, False),
+            (pl.UINT8, 256, 32, True),
+            (pl.FP16, 128, 15, False),
+            (pl.FP16, 128, 16, True),
+            (pl.FP32, 64, 7, False),
+            (pl.FP32, 64, 8, True),
+        ],
+    )
+    def test_tgatherb_requires_32_byte_aligned_source_subview(self, dtype, output_cols, column, accepted):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 256], dtype],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, output_cols], dtype],
+            ):
+                src_tile: pl.Tile[[16, 256], dtype] = pl.load(src, [0, 0], [16, 256])
+                src_view: pl.Tile[[16, 128], dtype] = pl.tile.slice(src_tile, [16, 128], [0, column])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8])
+                gathered: pl.Tile[[8, output_cols], dtype] = pl.tile.gatherb(src_view, offset_tile)
+                pl.store(gathered, [0, 0], out)
+
+        if accepted:
+            assert "pto.tgatherb" in self._generate_mlir(Prog)
+        else:
+            with pytest.raises(ValueError, match="32-byte aligned"):
+                self._generate_mlir(Prog)
+
+    def test_tgatherb_rejects_dynamic_column_subview_alignment(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 256], pl.FP16],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, 128], pl.FP16],
+                column: pl.Scalar[pl.INDEX],
+            ):
+                src_tile: pl.Tile[[16, 256], pl.FP16] = pl.load(src, [0, 0], [16, 256])
+                src_view: pl.Tile[[16, 128], pl.FP16] = pl.tile.slice(src_tile, [16, 128], [0, column])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8])
+                gathered: pl.Tile[[8, 128], pl.FP16] = pl.tile.gatherb(src_view, offset_tile)
+                pl.store(gathered, [0, 0], out)
+
+        with pytest.raises(ValueError, match="provably 32-byte aligned"):
+            self._generate_mlir(Prog)
+
+    @pytest.mark.parametrize(
+        ("dtype", "output_cols"),
+        [
+            (pl.UINT8, 256),
+            (pl.FP16, 128),
+            (pl.FP32, 64),
+        ],
+    )
+    def test_tgatherb_accepts_dynamic_row_subview_with_aligned_stride(self, dtype, output_cols):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[32, 256], dtype],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, output_cols], dtype],
+                row: pl.Scalar[pl.INDEX],
+            ):
+                src_tile: pl.Tile[[32, 256], dtype] = pl.load(src, [0, 0], [32, 256])
+                src_view: pl.Tile[[16, 128], dtype] = pl.tile.slice(src_tile, [16, 128], [row, 0])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8])
+                gathered: pl.Tile[[8, output_cols], dtype] = pl.tile.gatherb(src_view, offset_tile)
+                pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        subview_line = next(line for line in mlir.splitlines() if "pto.subview" in line)
+        gather_line = next(line for line in mlir.splitlines() if "pto.tgatherb" in line)
+        subview_ssa = subview_line.split("=", maxsplit=1)[0].strip()
+        assert subview_ssa in gather_line
+
+    @pytest.mark.parametrize(
+        ("dtype", "output_cols"),
+        [
+            (pl.UINT8, 256),
+            (pl.FP16, 128),
+            (pl.FP32, 64),
+        ],
+    )
+    def test_tgatherb_rejects_dynamic_row_subview_with_unaligned_stride(self, dtype, output_cols):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[32, 255], dtype],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, output_cols], dtype],
+                row: pl.Scalar[pl.INDEX],
+            ):
+                src_tile: pl.Tile[[32, 255], dtype] = pl.load(src, [0, 0], [32, 255])
+                src_view: pl.Tile[[16, 128], dtype] = pl.tile.slice(src_tile, [16, 128], [row, 0])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8])
+                gathered: pl.Tile[[8, output_cols], dtype] = pl.tile.gatherb(src_view, offset_tile)
+                pl.store(gathered, [0, 0], out)
+
+        with pytest.raises(ValueError, match="provably 32-byte aligned"):
+            self._generate_mlir(Prog)
+
+    def test_tgatherb_rejects_nested_dynamic_column_subview_alignment(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 256], pl.FP16],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, 128], pl.FP16],
+                column: pl.Scalar[pl.INDEX],
+            ):
+                src_tile: pl.Tile[[16, 256], pl.FP16] = pl.load(src, [0, 0], [16, 256])
+                outer: pl.Tile[[16, 128], pl.FP16] = pl.tile.slice(src_tile, [16, 128], [0, column])
+                inner: pl.Tile[[16, 128], pl.FP16] = pl.tile.slice(outer, [16, 128], [0, 0])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8])
+                gathered: pl.Tile[[8, 128], pl.FP16] = pl.tile.gatherb(inner, offset_tile)
+                pl.store(gathered, [0, 0], out)
+
+        with pytest.raises(ValueError, match="provably 32-byte aligned"):
+            self._generate_mlir(Prog)
+
+    def test_tgatherb_accepts_nested_static_offsets_with_aligned_total(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[16, 256], pl.FP16],
+                offset: pl.Tensor[[8, 8], pl.UINT32],
+                out: pl.Tensor[[8, 128], pl.FP16],
+            ):
+                src_tile: pl.Tile[[16, 256], pl.FP16] = pl.load(src, [0, 0], [16, 256])
+                outer: pl.Tile[[16, 240], pl.FP16] = pl.tile.slice(src_tile, [16, 240], [0, 1])
+                inner: pl.Tile[[16, 128], pl.FP16] = pl.tile.slice(outer, [16, 128], [0, 15])
+                offset_tile: pl.Tile[[8, 8], pl.UINT32] = pl.load(offset, [0, 0], [8, 8])
+                gathered: pl.Tile[[8, 128], pl.FP16] = pl.tile.gatherb(inner, offset_tile)
+                pl.store(gathered, [0, 0], out)
+
+        assert "pto.tgatherb" in self._generate_mlir(Prog)
+
+    def test_mgather_row_emits_correct_name_and_explicit_coalesce(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], pl.FP32],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                idx_tile: pl.Tile[[1, 16], pl.INT32] = pl.load(idx, [0, 0], [1, 16])
+                gathered: pl.Tile[[16, 32], pl.FP32] = pl.tile.mgather(mem, idx_tile, coalesce="row")
+                return pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        assert "pto.tmgather" not in mlir
+        mem_type = "!pto.partition_tensor_view<64x32xf32>"
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_tile"],
+            operand_types=[mem_type, self._alloc_tile_type(mlir, "%idx_tile")],
+            result="%gathered",
+            result_type=self._alloc_tile_type(mlir, "%gathered"),
+            attributes="coalesce = #pto<coalesce row>",
+        )
+
+    def test_mgather_elem_emits_explicit_coalesce(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[256], pl.FP32],
+                idx: pl.Tensor[[8, 32], pl.INT32],
+                out: pl.Tensor[[8, 32], pl.FP32],
+            ) -> pl.Tensor[[8, 32], pl.FP32]:
+                idx_tile: pl.Tile[[8, 32], pl.INT32] = pl.load(idx, [0, 0], [8, 32])
+                gathered: pl.Tile[[8, 32], pl.FP32] = pl.tile.mgather(mem, idx_tile, coalesce="elem")
+                return pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        mem_type = "!pto.partition_tensor_view<256xf32>"
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_tile"],
+            operand_types=[mem_type, self._alloc_tile_type(mlir, "%idx_tile")],
+            result="%gathered",
+            result_type=self._alloc_tile_type(mlir, "%gathered"),
+            attributes="coalesce = #pto<coalesce elem>",
+        )
+
+    def test_mgather_a2a3_rejects_column_vector_row_indices(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], pl.FP16],
+                idx: pl.Tensor[[16, 1], pl.INT32],
+                out: pl.Tensor[[16, 32], pl.FP16],
+            ):
+                idx_tile: pl.Tile[[16, 1], pl.INT32] = pl.load(idx, [0, 0], [16, 1])
+                gathered: pl.Tile[[16, 32], pl.FP16] = pl.tile.mgather(mem, idx_tile, coalesce="row")
+                pl.store(gathered, [0, 0], out)
+
+        with pytest.raises(ValueError, match=r"requires idx shape \[1, R\]"):
+            self._generate_mlir(Prog)
+        assert "pto.mgather" in self._generate_mlir(Prog, BackendType.Ascend950)
+
+    def test_mgather_a2a3_requires_aligned_vec_rows(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 17], pl.FP16],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                out: pl.Tensor[[16, 17], pl.FP16],
+            ):
+                idx_tile: pl.Tile[[1, 16], pl.INT32] = pl.load(idx, [0, 0], [1, 16])
+                gathered: pl.Tile[[16, 17], pl.FP16] = pl.tile.mgather(mem, idx_tile, coalesce="row")
+                pl.store(gathered, [0, 0], out)
+
+        with pytest.raises(ValueError, match="32-byte aligned"):
+            self._generate_mlir(Prog)
+        assert "pto.mgather" in self._generate_mlir(Prog, BackendType.Ascend950)
+
+    def test_mgather_a2a3_requires_nd_source_for_vec_output(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[32, 64], pl.FP16],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                out: pl.Tensor[[16, 32], pl.FP16],
+            ):
+                mem_dn: pl.Tensor[
+                    [64, 32],
+                    pl.FP16,
+                    pl.TensorView(stride=[1, 64], layout=pl.TensorLayout.DN),
+                ] = pl.tensor.view(mem, layout=pl.TensorLayout.DN)
+                idx_tile: pl.Tile[[1, 16], pl.INT32] = pl.load(idx, [0, 0], [1, 16])
+                gathered: pl.Tile[[16, 32], pl.FP16] = pl.tile.mgather(mem_dn, idx_tile, coalesce="row")
+                pl.store(gathered, [0, 0], out)
+
+        with pytest.raises(ValueError, match="requires an ND source tensor"):
+            self._generate_mlir(Prog)
+
+    def test_mgather_emits_nondefault_out_of_bounds_mode(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], pl.FP32],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                idx_tile: pl.Tile[[1, 16], pl.INT32] = pl.load(idx, [0, 0], [1, 16])
+                gathered: pl.Tile[[16, 32], pl.FP32] = pl.tile.mgather(
+                    mem, idx_tile, coalesce="row", gather_oob="zero"
+                )
+                return pl.store(gathered, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        mem_type = "!pto.partition_tensor_view<64x32xf32>"
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_tile"],
+            operand_types=[mem_type, self._alloc_tile_type(mlir, "%idx_tile")],
+            result="%gathered",
+            result_type=self._alloc_tile_type(mlir, "%gathered"),
+            attributes=("coalesce = #pto<coalesce row>, gatherOob = #pto<gather_oob zero>"),
+        )
+
+    def test_mgather_mat_row_emits_gm_index_partition(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], pl.FP16],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                eye: pl.Tensor[[16, 16], pl.FP16],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                gathered: pl.Tile[[16, 32], pl.FP16] = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="row",
+                    gather_oob="zero",
+                    target_memory=pl.MemorySpace.Mat,
+                    valid_shape=[9, 21],
+                )
+                eye_tile: pl.Tile[[16, 16], pl.FP16] = pl.load(
+                    eye,
+                    [0, 0],
+                    [16, 16],
+                    valid_shape=[16, 9],
+                    target_memory=pl.MemorySpace.Mat,
+                )
+                product: pl.Tile[[16, 32], pl.FP32] = pl.matmul(eye_tile, gathered)
+                return pl.store(product, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        mem_type = "!pto.partition_tensor_view<64x32xf16>"
+        idx_type = "!pto.partition_tensor_view<1x16xi32>"
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_partition_view(mlir, result="%idx_pview", source="%idx_view", result_type=idx_type)
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_pview"],
+            operand_types=[mem_type, idx_type],
+            result="%gathered",
+            result_type=self._alloc_tile_type(mlir, "%gathered"),
+            attributes=("coalesce = #pto<coalesce row>, gatherOob = #pto<gather_oob zero>"),
+        )
+        gathered_alloc = next(
+            line for line in mlir.splitlines() if "pto.alloc_tile" in line and "%gathered" in line
+        )
+        assert "loc=mat" in self._alloc_tile_type(mlir, "%gathered")
+        assert "valid_row = %c9_index" in gathered_alloc
+        assert "valid_col = %c21_index" in gathered_alloc
+
+    @pytest.mark.parametrize(
+        ("dtype", "dtype_text"),
+        [
+            (pl.FP8E4M3FN, "f8E4M3FN"),
+            (pl.FP8E5M2, "f8E5M2"),
+            (pl.HF8, "!pto.hif8"),
+        ],
+    )
+    def test_mgather_a5_low_precision_reaches_mat_codegen(self, dtype, dtype_text):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], dtype],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                eye: pl.Tensor[[16, 16], dtype],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                gathered: pl.Tile[[16, 32], dtype] = pl.tile.mgather(
+                    mem,
+                    idx,
+                    target_memory=pl.MemorySpace.Mat,
+                )
+                eye_tile: pl.Tile[[16, 16], dtype] = pl.load(
+                    eye, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                product: pl.Tile[[16, 32], pl.FP32] = pl.matmul(eye_tile, gathered)
+                return pl.store(product, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog, BackendType.Ascend950)
+        mem_type = f"!pto.partition_tensor_view<64x32x{dtype_text}>"
+        idx_type = "!pto.partition_tensor_view<1x16xi32>"
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_partition_view(mlir, result="%idx_pview", source="%idx_view", result_type=idx_type)
+        gathered_type = self._alloc_tile_type(mlir, "%gathered")
+        assert "loc=mat" in gathered_type
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_pview"],
+            operand_types=[mem_type, idx_type],
+            result="%gathered",
+            result_type=gathered_type,
+            attributes="coalesce = #pto<coalesce row>",
+        )
+
+    @pytest.mark.parametrize(
+        ("dtype", "dtype_text"),
+        [
+            (pl.FP8E4M3FN, "f8E4M3FN"),
+            (pl.FP8E5M2, "f8E5M2"),
+            (pl.HF8, "!pto.hif8"),
+        ],
+    )
+    def test_mgather_a5_low_precision_reaches_mat_elem_codegen(self, dtype, dtype_text):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[512], dtype],
+                idx: pl.Tensor[[16, 32], pl.INT32],
+                scratch: pl.Tensor[[512], dtype],
+                out: pl.Tensor[[16, 32], dtype],
+            ) -> pl.Tensor[[16, 32], dtype]:
+                gathered: pl.Tile[[16, 32], dtype] = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="elem",
+                    target_memory=pl.MemorySpace.Mat,
+                    scratch=scratch,
+                )
+                gathered_vec: pl.Tile[[16, 32], dtype] = pl.move(gathered, target_memory=pl.MemorySpace.Vec)
+                return pl.store(gathered_vec, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog, BackendType.Ascend950)
+        mem_type = f"!pto.partition_tensor_view<512x{dtype_text}>"
+        idx_type = "!pto.partition_tensor_view<16x32xi32>"
+        scratch_type = mem_type
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_partition_view(mlir, result="%idx_pview", source="%idx_view", result_type=idx_type)
+        self._assert_partition_view(
+            mlir,
+            result="%scratch_pview",
+            source="%scratch_view",
+            result_type=scratch_type,
+        )
+        gathered_type = self._alloc_tile_type(mlir, "%gathered")
+        assert "loc=mat" in gathered_type
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_pview", "%scratch_pview"],
+            operand_types=[mem_type, idx_type, scratch_type],
+            result="%gathered",
+            result_type=gathered_type,
+            attributes="coalesce = #pto<coalesce elem>",
+        )
+
+    @pytest.mark.parametrize("dtype", [pl.FP8E4M3FN, pl.FP8E5M2, pl.HF8])
+    def test_mgather_rejects_a5_only_dtypes_on_a2a3(self, dtype):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[64, 32], dtype],
+                idx: pl.Tensor[[1, 16], pl.INT32],
+                eye: pl.Tensor[[16, 16], dtype],
+                out: pl.Tensor[[16, 32], pl.FP32],
+            ):
+                gathered: pl.Tile[[16, 32], dtype] = pl.tile.mgather(
+                    mem, idx, target_memory=pl.MemorySpace.Mat
+                )
+                eye_tile: pl.Tile[[16, 16], dtype] = pl.load(
+                    eye, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                product: pl.Tile[[16, 32], pl.FP32] = pl.matmul(eye_tile, gathered)
+                pl.store(product, [0, 0], out)
+
+        with pytest.raises(ValueError, match="not supported on the 'a2a3' backend"):
+            self._generate_mlir(Prog)
+
+    def test_mgather_mat_elem_emits_gm_scratch_partition(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[256], pl.FP16],
+                idx: pl.Tensor[[16, 16], pl.INT32],
+                scratch: pl.Tensor[[256], pl.FP16],
+                eye: pl.Tensor[[16, 16], pl.FP16],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ) -> pl.Tensor[[16, 16], pl.FP32]:
+                gathered: pl.Tile[[16, 16], pl.FP16] = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="elem",
+                    gather_oob="wrap",
+                    target_memory=pl.MemorySpace.Mat,
+                    scratch=scratch,
+                )
+                eye_tile: pl.Tile[[16, 16], pl.FP16] = pl.load(
+                    eye, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                product: pl.Tile[[16, 16], pl.FP32] = pl.matmul(eye_tile, gathered)
+                return pl.store(product, [0, 0], out)
+
+        mlir = self._generate_mlir(Prog)
+        mem_type = "!pto.partition_tensor_view<256xf16>"
+        idx_type = "!pto.partition_tensor_view<16x16xi32>"
+        scratch_type = "!pto.partition_tensor_view<256xf16>"
+        self._assert_partition_view(mlir, result="%mem_pview", source="%mem_view", result_type=mem_type)
+        self._assert_partition_view(mlir, result="%idx_pview", source="%idx_view", result_type=idx_type)
+        self._assert_partition_view(
+            mlir,
+            result="%scratch_pview",
+            source="%scratch_view",
+            result_type=scratch_type,
+        )
+        gathered_type = self._alloc_tile_type(mlir, "%gathered")
+        assert "loc=mat" in gathered_type
+        self._assert_mgather(
+            mlir,
+            operands=["%mem_pview", "%idx_pview", "%scratch_pview"],
+            operand_types=[mem_type, idx_type, scratch_type],
+            result="%gathered",
+            result_type=gathered_type,
+            attributes=("coalesce = #pto<coalesce elem>, gatherOob = #pto<gather_oob wrap>"),
+        )
+
+    def test_mgather_mat_elem_rejects_overlapping_scratch_view(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[16, 16], pl.FP16],
+                idx: pl.Tensor[[16, 16], pl.INT32],
+                eye: pl.Tensor[[16, 16], pl.FP16],
+                out: pl.Tensor[[16, 16], pl.FP32],
+            ):
+                scratch: pl.Tensor[[256], pl.FP16] = pl.tensor.view(mem, [256])
+                gathered: pl.Tile[[16, 16], pl.FP16] = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="elem",
+                    target_memory=pl.MemorySpace.Mat,
+                    scratch=scratch,
+                )
+                eye_tile: pl.Tile[[16, 16], pl.FP16] = pl.load(
+                    eye, [0, 0], [16, 16], target_memory=pl.MemorySpace.Mat
+                )
+                product: pl.Tile[[16, 16], pl.FP32] = pl.matmul(eye_tile, gathered)
+                pl.store(product, [0, 0], out)
+
+        with pytest.raises(ValueError, match="scratch must not overlap mem"):
+            self._generate_mlir(Prog)
+
+    def test_mgather_mat_elem_rejects_scratch_view_overlapping_idx(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                mem: pl.Tensor[[256], pl.INT32],
+                idx: pl.Tensor[[16, 16], pl.INT32],
+                out: pl.Tensor[[16, 16], pl.INT32],
+            ):
+                scratch: pl.Tensor[[256], pl.INT32] = pl.tensor.view(idx, [256])
+                gathered: pl.Tile[[16, 16], pl.INT32] = pl.tile.mgather(
+                    mem,
+                    idx,
+                    coalesce="elem",
+                    target_memory=pl.MemorySpace.Mat,
+                    scratch=scratch,
+                )
+                gathered_vec: pl.Tile[[16, 16], pl.INT32] = pl.move(
+                    gathered, target_memory=pl.MemorySpace.Vec
+                )
+                pl.store(gathered_vec, [0, 0], out)
+
+        with pytest.raises(ValueError, match="scratch must not overlap idx"):
+            self._generate_mlir(Prog)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

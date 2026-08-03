@@ -1080,6 +1080,96 @@ class TestPreprocessPtoasOutput:
         result = _preprocess_ptoas_output(SAMPLE_PTOAS_OUTPUT)
         assert "ptoas_bitcast" in result
 
+    def test_mgather_preprocess_fast_path_preserves_unrelated_content(self):
+        source = "AICORE void kernel() {\n  TSTORE(v3);\n}\n"
+
+        assert _preprocess_ptoas_output(source) == "static __aicore__ void kernel() {\n  TSTORE(v3);\n}\n"
+
+    def test_restores_mgather_wrapper_operands(self):
+        result = _preprocess_ptoas_output(
+            "AICORE void kernel() {\n"
+            "  Tile<TileType::Vec, float, 8, 16> dst_tile;\n"
+            "  __ubuf__ float* dst_ptr = dst_tile.data();\n"
+            "  GlobalTensor<float, Shape, Stride> table;\n"
+            "  __gm__ float* table_ptr = (__gm__ float*) table;\n"
+            "  Tile<TileType::Vec, int32_t, 1, 8> idx_tile;\n"
+            "  __ubuf__ int32_t* idx_ptr = idx_tile.data();\n"
+            "  MGATHER<pto::Coalesce::Row>(dst_ptr, table_ptr, idx_ptr);\n"
+            "}\n"
+        )
+
+        assert "MGATHER<pto::Coalesce::Row>(dst_tile, table, idx_tile);" in result
+        assert "dst_ptr" not in result
+        assert "table_ptr" not in result
+        assert "idx_ptr" not in result
+
+    def test_leaves_mgather_with_non_unique_pointer_alias_unchanged(self):
+        source = (
+            "AICORE void kernel() {\n"
+            "  __ubuf__ float* dst_ptr = dst_tile.data();\n"
+            "  __gm__ float* table_ptr = (__gm__ float*) table;\n"
+            "  __ubuf__ int32_t* idx_ptr = idx_tile.data();\n"
+            "  consume(dst_ptr);\n"
+            "  MGATHER(dst_ptr, table_ptr, idx_ptr);\n"
+            "}\n"
+        )
+
+        result = _preprocess_ptoas_output(source)
+
+        assert "consume(dst_ptr);" in result
+        assert "MGATHER(dst_ptr, table_ptr, idx_ptr);" in result
+        assert "__gm__ float* table_ptr = (__gm__ float*) table;" in result
+
+    def test_restores_four_operand_mat_elem_mgather(self):
+        result = _preprocess_ptoas_output(
+            "AICORE void kernel() {\n"
+            "  __cbuf__ float* dst_ptr = dst_tile.data();\n"
+            "  __gm__ float* table_ptr = (__gm__ float*) table;\n"
+            "  __gm__ int32_t* idx_ptr = (__gm__ int32_t*) indices;\n"
+            "  __gm__ float* scratch_ptr = (__gm__ float*) scratch;\n"
+            "  MGATHER<pto::Coalesce::Elem>(dst_ptr, table_ptr, idx_ptr, scratch_ptr);\n"
+            "}\n"
+        )
+
+        assert "MGATHER<pto::Coalesce::Elem>(dst_tile, table, indices, scratch);" in result
+        assert "_ptr" not in result
+
+    def test_restores_mat_elem_with_direct_scratch_wrapper(self):
+        result = _preprocess_ptoas_output(
+            "AICORE void kernel() {\n"
+            "  __cbuf__ float* dst_ptr = dst_tile.data();\n"
+            "  __gm__ float* table_ptr = (__gm__ float*) table;\n"
+            "  __gm__ int32_t* idx_ptr = (__gm__ int32_t*) indices;\n"
+            "  GlobalTensor<float, Shape, Stride> scratch;\n"
+            "  MGATHER<pto::Coalesce::Elem>(dst_ptr, table_ptr, idx_ptr, scratch);\n"
+            "}\n"
+        )
+
+        assert "MGATHER<pto::Coalesce::Elem>(dst_tile, table, indices, scratch);" in result
+        assert "dst_ptr" not in result
+        assert "table_ptr" not in result
+        assert "idx_ptr" not in result
+        assert "GlobalTensor<float, Shape, Stride> scratch;" in result
+
+    def test_restores_reused_local_names_in_multiple_functions(self):
+        def make_function(function_name):
+            return (
+                f"AICORE void {function_name}() {{\n"
+                f"  __ubuf__ float* v1 = {function_name}_dst.data();\n"
+                f"  __gm__ float* v2 = (__gm__ float*) {function_name}_table;\n"
+                f"  __ubuf__ int32_t* v3 = {function_name}_idx.data();\n"
+                "  MGATHER(v1, v2, v3);\n"
+                "}\n"
+            )
+
+        source = make_function("first") + make_function("second")
+
+        result = _preprocess_ptoas_output(source)
+
+        assert "MGATHER(first_dst, first_table, first_idx);" in result
+        assert "MGATHER(second_dst, second_table, second_idx);" in result
+        assert "__gm__ float* v2" not in result
+
 
 class TestGenerateArgUnpacking:
     """Tests for _generate_arg_unpacking."""
