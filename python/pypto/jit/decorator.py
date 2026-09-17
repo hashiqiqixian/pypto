@@ -1652,7 +1652,6 @@ class JITFunction:
         ) = None
         self._cache: dict[CacheKey, Any] = {}  # CacheKey → CompiledProgram
         self._source_hash: str | None = None
-        self._dep_layouts: tuple[tuple[str, str, str], ...] | None = None
 
         # Preserve function metadata
         self.__name__ = func.__name__
@@ -1686,26 +1685,34 @@ class JITFunction:
         them in the key, rebinding ``L`` would hand the second call the first
         one's artifact.
 
-        Computed once and memoized: the key is rebuilt on every call including
-        cache hits, and re-deriving it runs ``inspect.signature`` (plus ``eval``
-        for postponed annotations) per dep. A dep's declarations cannot change
-        over this ``JITFunction``'s lifetime, so the cost is paid once — same
-        reasoning as ``_get_dep_graph`` / ``_get_source_hash``.
+        Re-read the declarations on every call, including cache hits, so a
+        rebound module-level layout in a postponed annotation is reflected in
+        the key. The dependency graph itself remains cached.
+
+        Keyed by the *generated* name, not ``dep.__name__``: the triples are
+        sorted, so position is not carried, and two same-named deps swapping
+        layouts (``helper`` from two modules going ``NZ``/``ND`` -> ``ND``/``NZ``)
+        would otherwise produce the same sorted set and hand the second call the
+        first one's artifact. The generated name is the disambiguator the
+        emitted signatures already carry.
 
         Returns:
-            Sorted ``(dep name, parameter, layout)`` triples — a stable,
-            hashable component for the cache key
+            Sorted ``(generated dep name, parameter, layout)`` triples for the
+            cache key.
         """
-        if self._dep_layouts is None:
-            deps, _, _, _ = self._get_dep_graph()
-            self._dep_layouts = tuple(
-                sorted(
-                    (dep.__name__, param, str(layout))
-                    for dep in deps
-                    for param, layout in _param_layouts(dep._func, dep.__name__).items()
-                )
+        deps, _, _, _ = self._get_dep_graph()
+        # Same list ``_build_contexts`` allocates from, so the names agree with
+        # the ones the generated program actually uses.
+        gen_names = _allocate_generated_names(self, deps)
+        return tuple(
+            sorted(
+                (gen_names[id(dep._func)], param, str(layout))
+                for dep in deps
+                # ``dep.__name__`` here is the diagnostic name only — a layout
+                # error should name the user's own function.
+                for param, layout in _param_layouts(dep._func, dep.__name__).items()
             )
-        return self._dep_layouts
+        )
 
     def _folded_closure_constants(self) -> tuple[tuple[str, str, str], ...]:
         """Closure constants that fold into the generated source, for the cache key.
@@ -1717,21 +1724,26 @@ class JITFunction:
         without this component the next call would be handed the previous
         value's artifact. Same shape of problem as ``_dep_declared_layouts``.
 
-        Deliberately **not** memoized, unlike ``_dep_declared_layouts`` and
-        ``_get_source_hash``: a closure cell can be rebound over this
-        ``JITFunction``'s lifetime, which is exactly the case this guards.
+        Deliberately **not** memoized, unlike ``_get_source_hash``: a closure
+        cell can be rebound over this ``JITFunction``'s lifetime, which is
+        exactly the case this guards.
 
         Every foldable free variable is reported, not only those the body
         actually references. That is a superset, so it can split the cache more
         finely than strictly required — the safe direction — and it avoids
         re-deriving which names survive folding.
 
+        Use generated function names, as ``_dep_declared_layouts`` does, so
+        swapping constants between distinct same-named deps changes the key.
+
         Returns:
-            Sorted ``(function name, free variable, repr of value)`` triples
+            Sorted ``(generated function name, free variable, repr of value)`` triples
         """
+        deps = self._get_deps()
+        gen_names = _allocate_generated_names(self, deps)
         collected: list[tuple[str, str, str]] = []
-        for func_obj in (self._func, *(dep._func for dep in self._get_deps())):
-            func_name = getattr(func_obj, "__name__", "<unknown>")
+        for func_obj in (self._func, *(dep._func for dep in deps)):
+            func_name = gen_names[id(func_obj)]
             co_freevars = getattr(getattr(func_obj, "__code__", None), "co_freevars", ())
             closure = getattr(func_obj, "__closure__", None) or ()
             for fv_name, cell in zip(co_freevars, closure, strict=True):
@@ -2615,17 +2627,25 @@ class JITFunction:
             ],
         ] = {id(self._func): (tensor_meta, scalar_values, scalar_dtypes)}
 
+        # One generated ``@pl.function`` name per JIT function, unique across
+        # the program. Two distinct deps may share a ``__name__`` (two modules
+        # each defining ``helper``, or two kernels from the same factory);
+        # emitting both as ``def helper`` made the parser reject the program
+        # with a bare ``Duplicate function name "helper"``.
+        gen_names = _allocate_generated_names(self, deps_topo)
+
         # Walk caller-first (reverse of leaf-first topo order) so each dep's
         # caller metadata is already resolved when we get to it; collect
         # contexts caller-first, then reverse to restore leaf-first emit
         # order.
         # Per caller, ``call name → generated function name``. They differ
-        # under an aliased import: the body calls ``kern(...)`` while the
-        # generated ``@pl.function`` is named after ``dep.__name__``.
+        # under an aliased import (the body calls ``kern(...)`` while the
+        # generated ``@pl.function`` is named after ``dep.__name__``) and
+        # under a uniquified name (``helper`` → ``helper__2``).
         dep_func_names_by_caller: dict[int, dict[str, str]] = {}
         for dep in deps_topo:
             for caller_func, call_name in callers_by_id.get(id(dep._func), ()):
-                dep_func_names_by_caller.setdefault(id(caller_func), {})[call_name] = dep.__name__
+                dep_func_names_by_caller.setdefault(id(caller_func), {})[call_name] = gen_names[id(dep._func)]
 
         dep_contexts: list[SpecializeContext] = []
         for dep in reversed(deps_topo):
@@ -2650,7 +2670,7 @@ class JITFunction:
             dep_contexts.append(
                 build_specialize_context(
                     func=dep._func,
-                    func_name=dep.__name__,
+                    func_name=gen_names[id(dep._func)],
                     func_type=dep._func_type,
                     level=dep._level,
                     tensor_meta=dep_meta,
@@ -2670,7 +2690,7 @@ class JITFunction:
 
         entry_ctx = build_specialize_context(
             func=self._func,
-            func_name=self.__name__,
+            func_name=gen_names[id(self._func)],
             func_type=self._func_type,
             level=self._level,
             tensor_meta=tensor_meta,
@@ -2753,6 +2773,53 @@ def _discover_deps(func: Any, caller_func_type: str = "orchestration") -> list[J
     caller's source must use the bindings instead — see ``_DepBinding``.
     """
     return [binding.dep for binding in _discover_dep_bindings(func, caller_func_type)]
+
+
+def _generated_names_for(jit_func: JITFunction, base: str) -> tuple[str, ...]:
+    """Every generated ``@pl.function`` name ``jit_func`` would occupy as ``base``.
+
+    A single method for everything except an ``@pl.jit.extern`` mixed kernel,
+    which the specializer renders as an AIC member, an AIV member, and a Group
+    wrapper — three names derived from the same base.
+    """
+    if jit_func._func_type == "extern" and jit_func._external_core_type == "mixed":
+        return (base, f"{base}_aic", f"{base}_aiv")
+    return (base,)
+
+
+def _allocate_generated_names(entry: JITFunction, deps: list[JITFunction]) -> dict[int, str]:
+    """Map ``id(jit_func._func)`` → the unique name its ``@pl.function`` gets.
+
+    A generated ``@pl.program`` holds one method per JIT function, so their
+    names must be distinct — but two distinct deps may legitimately share a
+    ``__name__`` (two modules each defining ``helper``, or two kernels built by
+    the same factory). A clash is resolved by suffixing the later claimant
+    ``__2``, ``__3``, … so both specializations survive instead of the parser
+    rejecting the program with ``Duplicate function name "helper"``.
+
+    The entry is named first, so a clash never moves the name the user called;
+    deps follow in ``deps`` order, which is derived from source order, so the
+    same call graph always yields the same names.
+    """
+    used: set[str] = set()
+    names: dict[int, str] = {}
+    # Highest suffix already handed out per base name, so N functions sharing a
+    # base cost O(N) probes overall rather than rescanning from 2 each time.
+    next_suffix: dict[str, int] = {}
+    for jit_func in [entry, *deps]:
+        key = id(jit_func._func)
+        if key in names:
+            continue
+        base = jit_func.__name__
+        candidate = base
+        suffix = next_suffix.get(base, 2)
+        while not used.isdisjoint(_generated_names_for(jit_func, candidate)):
+            candidate = f"{base}__{suffix}"
+            suffix += 1
+        next_suffix[base] = suffix
+        names[key] = candidate
+        used.update(_generated_names_for(jit_func, candidate))
+    return names
 
 
 # ---------------------------------------------------------------------------
