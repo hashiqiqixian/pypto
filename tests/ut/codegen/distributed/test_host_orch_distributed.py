@@ -415,7 +415,9 @@ def test_comm_signal_and_payload_never_share_cache_lines(world_size):
             ready = pld.window(ready_buf, [NRANKS], dtype=pl.INT32)
             partial = pld.window(partial_buf, [32, 5120], dtype=pl.FP32)
             reduced = pld.window(reduced_buf, [NRANKS], dtype=pl.INT32)
-            return self.chip_orch(gathered, ready, partial, reduced, device=0)
+            for rank in pl.range(pld.world_size()):
+                self.chip_orch(gathered, ready, partial, reduced, device=rank)
+            return partial  # type: ignore[return-value]
 
     tree = ast.parse(_lower(Prog))
     domain = next(node for node in ast.walk(tree) if isinstance(node, ast.With))
