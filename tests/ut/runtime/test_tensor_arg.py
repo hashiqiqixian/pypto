@@ -25,6 +25,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from pypto.runtime import DeviceTensor
+from pypto.runtime import task_interface  # noqa: F401 - imported before patch() resolves the lazy module
+from simpler_setup import torch_interop  # noqa: F401 - imported before patch() resolves the lazy module
 
 # ``task_interface`` eagerly imports the optional ``simpler`` runtime package;
 # skip the module when simpler is unavailable (same pattern as
