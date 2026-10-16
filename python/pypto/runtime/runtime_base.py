@@ -244,6 +244,35 @@ class Worker(ABC):
     # DeviceTensor conveniences — shared.
     # ------------------------------------------------------------------
 
+    def view_tensor(
+        self,
+        parent: DeviceTensor,
+        shape: Sequence[int],
+        *,
+        byte_offset: int = 0,
+        dtype: torch.dtype | None = None,
+        worker_id: int | None = None,
+    ) -> DeviceTensor:
+        """Create a contiguous non-owning view within a live resident tensor.
+
+        The offset is relative to the parent view. Free the original allocation,
+        not the returned view; dispatch rejects the view after its owner is freed.
+        """
+        self._require_owned_resident_tensor(parent, "view_tensor parent", worker_id=worker_id)
+        if type(byte_offset) is not int or byte_offset < 0:
+            raise ValueError(f"view_tensor byte_offset must be nonnegative, got {byte_offset!r}")
+        view_dtype = parent.dtype if dtype is None else dtype
+        view = DeviceTensor(
+            parent.data_ptr,
+            shape,
+            view_dtype,
+            buffer=parent.buffer,
+            byte_offset=parent.byte_offset + byte_offset,
+        )
+        if byte_offset + view.nbytes > parent.nbytes:
+            raise ValueError("view_tensor view exceeds its parent tensor")
+        return view
+
     def alloc_tensor(
         self,
         shape: Sequence[int],

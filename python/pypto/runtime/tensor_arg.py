@@ -187,7 +187,10 @@ def make_tensor_arg(worker: Any, arg: Any) -> Any:
             dtype = task_interface.torch_dtype_to_datatype(arg.dtype)
         except KeyError as e:
             raise ValueError(f"Unsupported DeviceTensor dtype: {arg.dtype}") from e
-        wire = arg.buffer.tensor(shapes=arg.shape, dtype=dtype)
+        if arg.byte_offset:
+            wire = arg.buffer.tensor(shapes=arg.shape, dtype=dtype, byte_offset=arg.byte_offset)
+        else:
+            wire = arg.buffer.tensor(shapes=arg.shape, dtype=dtype)
         object.__setattr__(arg, _WIRE_TENSOR_ATTR, wire)
         return wire
     return torch_interop.make_tensor_arg(worker, arg)

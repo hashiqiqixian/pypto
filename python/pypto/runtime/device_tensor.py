@@ -59,6 +59,7 @@ class DeviceTensor:
     shape: tuple[int, ...]
     dtype: torch.dtype
     buffer: Any | None = field(default=None, repr=False, compare=False, hash=False)
+    byte_offset: int = 0
 
     def __init__(
         self,
@@ -67,6 +68,7 @@ class DeviceTensor:
         dtype: torch.dtype,
         *,
         buffer: Any | None = None,
+        byte_offset: int = 0,
     ) -> None:
         # bool is an int subclass — exclude it explicitly so True/False can't pose as a pointer or dim.
         if isinstance(data_ptr, bool) or not isinstance(data_ptr, int) or data_ptr <= 0:
@@ -82,6 +84,11 @@ class DeviceTensor:
         shape_t = raw_shape
         if not isinstance(dtype, torch.dtype):
             raise TypeError(f"DeviceTensor.dtype must be torch.dtype, got {type(dtype).__name__}")
+        if type(byte_offset) is not int or byte_offset < 0:
+            raise ValueError("DeviceTensor.byte_offset must be a nonnegative integer")
+        element_size = torch.empty((), dtype=dtype).element_size()
+        if byte_offset % element_size:
+            raise ValueError("DeviceTensor.byte_offset must be aligned to its dtype")
         if buffer is not None:
             try:
                 buffer_base = int(buffer.base)
@@ -93,10 +100,13 @@ class DeviceTensor:
                 )
             if not callable(getattr(buffer, "tensor", None)):
                 raise TypeError("DeviceTensor.buffer must provide buffer.tensor(shapes, dtype)")
+            if byte_offset and byte_offset + torch.Size(shape_t).numel() * element_size > int(buffer.nbytes):
+                raise ValueError("DeviceTensor view exceeds its owning Buffer")
         object.__setattr__(self, "data_ptr", data_ptr)
         object.__setattr__(self, "shape", shape_t)
         object.__setattr__(self, "dtype", dtype)
         object.__setattr__(self, "buffer", buffer)
+        object.__setattr__(self, "byte_offset", byte_offset)
 
     @property
     def nbytes(self) -> int:
@@ -108,7 +118,10 @@ class DeviceTensor:
         return n * elem
 
     def __repr__(self) -> str:
-        return f"DeviceTensor(data_ptr=0x{self.data_ptr:x}, shape={self.shape}, dtype={self.dtype})"
+        return (
+            f"DeviceTensor(data_ptr=0x{self.data_ptr:x}, byte_offset={self.byte_offset}, "
+            f"shape={self.shape}, dtype={self.dtype})"
+        )
 
 
 @dataclass(frozen=True)

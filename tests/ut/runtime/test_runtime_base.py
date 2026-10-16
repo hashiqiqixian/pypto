@@ -318,6 +318,30 @@ class _OwnershipProbe:
         pass
 
     _require_owned_resident_tensor = Worker._require_owned_resident_tensor
+    view_tensor = Worker.view_tensor
+
+
+def test_view_tensor_keeps_owner_and_checks_parent_bounds():
+    buffer = _OwnedBuffer(0x2000, owner_worker_id=3)
+    buffer.nbytes = 32
+    probe = _OwnershipProbe({(3, buffer.base): buffer})
+    parent = DeviceTensor(buffer.base, (8,), torch.float32, buffer=buffer)
+
+    view = probe.view_tensor(parent, (2,), byte_offset=8, worker_id=3)
+    assert view.data_ptr == parent.data_ptr
+    assert view.buffer is parent.buffer
+    assert view.byte_offset == 8
+    nested = probe.view_tensor(view, (1,), byte_offset=4, worker_id=3)
+    assert nested.byte_offset == 12
+    with pytest.raises(ValueError, match="parent tensor"):
+        probe.view_tensor(view, (2,), byte_offset=4, worker_id=3)
+    with pytest.raises(ValueError, match="aligned"):
+        probe.view_tensor(parent, (1,), byte_offset=1, worker_id=3)
+    with pytest.raises(ValueError, match="not a live allocation"):
+        probe.view_tensor(parent, (1,), worker_id=2)
+    del probe._device_buffers[(3, buffer.base)]
+    with pytest.raises(ValueError, match="not a live allocation"):
+        probe.view_tensor(parent, (1,), worker_id=3)
 
 
 def test_ownership_check_never_scans_the_buffer_table():

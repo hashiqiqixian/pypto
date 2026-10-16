@@ -93,6 +93,24 @@ def test_device_tensor_derives_wire_tensor_from_retained_buffer():
     assert dtype == "<dtype:torch.float16>"
 
 
+def test_device_tensor_view_passes_byte_offset_to_wire():
+    class ViewBuffer(_RecordingBuffer):
+        nbytes = 256
+
+        def tensor(self, *, shapes, dtype, byte_offset=0):
+            self.tensor_calls.append((tuple(shapes), dtype, byte_offset))
+            return MagicMock(name="view_wire")
+
+    buffer = ViewBuffer()
+    view = DeviceTensor(buffer.base, (8,), torch.float16, buffer=buffer, byte_offset=32)
+    from pypto.runtime.tensor_arg import make_tensor_arg  # noqa: PLC0415
+
+    with patch("pypto.runtime.task_interface.torch_dtype_to_datatype", return_value="fp16"):
+        wire = make_tensor_arg(_worker(3), view)
+        assert make_tensor_arg(_worker(3), view) is wire
+    assert buffer.tensor_calls == [((8,), "fp16", 32)]
+
+
 def test_wire_tensor_is_built_once_per_device_tensor():
     """A stable handle re-dispatched every step must not rebuild its descriptor.
 
