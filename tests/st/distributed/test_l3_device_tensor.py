@@ -131,6 +131,32 @@ class TestL3DeviceTensorReuse:
             finally:
                 rt.free_tensor(weight)
 
+    def test_resident_view_reads_selected_offset(self, test_config, device_ids):
+        if not device_ids:
+            pytest.skip("L3 DeviceTensor view test needs one device")
+
+        compiled = ir.compile(
+            L3AddProgram,
+            platform=test_config.platform,
+            distributed_config=DistributedConfig(
+                device_ids=device_ids[:1], num_sub_workers=0, aicpu_thread_num=4,
+            ),
+        )
+        host_a = torch.full((128, 128), 2.0, dtype=torch.float32).share_memory_()
+        host_out = torch.zeros_like(host_a).share_memory_()
+        host_bank = torch.stack((
+            torch.full_like(host_a, 3.0), torch.full_like(host_a, 7.0),
+        )).share_memory_()
+
+        with compiled.prepare() as rt:
+            bank = rt.alloc_tensor(host_bank.shape, host_bank.dtype, init=host_bank)
+            try:
+                selected = rt.view_tensor(bank, host_a.shape, byte_offset=host_a.numel() * host_a.element_size())
+                rt.run(compiled, host_a, selected, host_out)
+                torch.testing.assert_close(host_out, torch.full_like(host_out, 9.0), rtol=1e-5, atol=1e-5)
+            finally:
+                rt.free_tensor(bank)
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", *sys.argv[1:]])
