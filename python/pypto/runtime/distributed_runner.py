@@ -3049,7 +3049,13 @@ class DistributedWorker(Worker):
         for i, (shard, w) in enumerate(zip(stacked.shards, stacked.worker_ids, strict=True)):
             # The public raw-pointer API targets the parent view; copy_from
             # handles the child-visible POSIX-shm staging internally.
-            self.copy_from(host[i].data_ptr(), shard.data_ptr, shard.nbytes, worker_id=w)
+            self.copy_from(
+                host[i].data_ptr(),
+                shard.data_ptr - shard.byte_offset,
+                shard.nbytes,
+                src_offset=shard.byte_offset,
+                worker_id=w,
+            )
 
     # ------------------------------------------------------------------
     # Dispatch
